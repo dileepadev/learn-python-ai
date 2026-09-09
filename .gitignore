@@ -1,5 +1,20 @@
+# Python
 .venv/
 __pycache__/
 *.py[cod]
 *$py.class
 .ipynb_checkpoints/
+
+# Node / Astro
+node_modules/
+dist/
+.astro/
+*.tsbuildinfo
+
+# Environment and editor
+.env
+.env.*
+!.env.example
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
