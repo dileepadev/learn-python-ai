@@ -1,18 +1,18 @@
 # Contributing to learn-python
 
-Thank you for your interest in contributing to [learn-python](https://github.com/dileepadev/learn-python)! We welcome contributions, including bug fixes, feature enhancements, documentation improvements, and other general improvements.
+Thank you for your interest in contributing to [learn-python-ai](https://github.com/dileepadev/learn-python-ai)! We welcome contributions, including bug fixes, feature enhancements, documentation improvements, and other general improvements.
 
 ## Getting Started
 
 1. **Fork the repository**  
    Fork this repository to your GitHub account. This creates a copy of the repository in your account, allowing you to make changes without affecting the original repository.  
-   To fork the repository, click the **Fork** button in the top right corner of this page or click [here to fork the repository](https://github.com/dileepadev/learn-python/fork).
+   To fork the repository, click the **Fork** button in the top right corner of this page or click [here to fork the repository](https://github.com/dileepadev/learn-python-ai/fork).
 
 2. **Clone your fork**  
    Clone your forked repository to your local machine using the following command:
 
    ```bash
-   git clone https://github.com/<your-username>/learn-python.git
+   git clone https://github.com/<your-username>/learn-python-ai.git
    ```
 
 3. **Create a new branch**  
@@ -51,7 +51,7 @@ Thank you for your interest in contributing to [learn-python](https://github.com
 - Ensure all tests pass before submitting your changes.
 - Keep your pull request focused and avoid unrelated changes.
 - Refer to the following templates and guidelines before submitting your changes:
-  - [learn-python/](./) - Root directory of the repository
+  - [learn-python-ai/](./) - Root directory of the repository
     - [.github/](./.github) - GitHub-specific files (workflows, templates, etc.)
       - [ISSUE_TEMPLATE/](./.github/ISSUE_TEMPLATE) - Contains all issue templates
         - [bug_report.md](./.github/ISSUE_TEMPLATE/bug_report.md) - Template for reporting bugs
