@@ -1,0 +1,70 @@
+---
+import "../styles/global.css";
+import Header from "../components/Header.astro";
+import Footer from "../components/Footer.astro";
+import { SITE, withBase } from "../lib/paths";
+
+interface Props {
+  title?: string;
+  description?: string;
+  /** Lesson pages manage their own full-width shell. */
+  bare?: boolean;
+}
+
+const { title, description = SITE.description, bare = false } = Astro.props;
+const pageTitle = title ? `${title} · ${SITE.title}` : `${SITE.title} — ${SITE.tagline}`;
+const canonical = new URL(Astro.url.pathname, Astro.site);
+---
+
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{pageTitle}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" href={withBase("/favicon.svg")} type="image/svg+xml" />
+    <link rel="sitemap" href={withBase("/sitemap-index.xml")} />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={pageTitle} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta name="twitter:card" content="summary_large_image" />
+
+    <!-- Preconnect to the Pyodide CDN: the runtime download starts early. -->
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+
+    <!-- Resolve the theme before first paint so there is no light-mode flash. -->
+    <script is:inline>
+      (() => {
+        try {
+          const stored = localStorage.getItem("lpai:theme");
+          const dark = stored ? stored === "dark" : window.matchMedia("(prefers-color-scheme: dark)").matches;
+          document.documentElement.classList.toggle("dark", dark);
+        } catch {
+          document.documentElement.classList.add("dark");
+        }
+      })();
+    </script>
+  </head>
+
+  <body class="min-h-screen">
+    <a
+      href="#main"
+      class="sr-only rounded-lg px-4 py-2 focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50"
+      style="background: var(--accent); color: var(--accent-contrast)"
+    >
+      Skip to content
+    </a>
+
+    <Header />
+
+    <main id="main" class={bare ? "" : "mx-auto w-full max-w-6xl px-5 py-12"}>
+      <slot />
+    </main>
+
+    <Footer />
+  </body>
+</html>

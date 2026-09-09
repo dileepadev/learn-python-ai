@@ -1,0 +1,256 @@
+---
+title: Repeating work
+description: for and while loops, range, enumerate and zip — and the three keywords that let you steer a loop from the inside.
+module: foundations
+order: 9
+level: beginner
+minutes: 15
+objectives:
+  - Loop over any sequence with for
+  - Generate number sequences with range
+  - Use enumerate and zip instead of manual index arithmetic
+  - Control flow inside a loop with break, continue and else
+  - Know when a while loop is the right choice
+---
+
+A `for` loop runs a block once for each item in a sequence. This is the loop you will write
+almost every time.
+
+<Run id="f-loop-1" code={`fruits = ["apple", "banana", "cherry"]
+
+for fruit in fruits:
+    print(fruit)`} />
+
+Notice there is no counter and no index. Python hands you each item directly. The same loop
+works on anything iterable:
+
+<Run id="f-loop-2" code={`for char in "abc":
+    print(char)
+
+for key in {"a": 1, "b": 2}:
+    print(key)
+
+for name, score in {"tuned": 0.88, "base": 0.71}.items():
+    print(name, score)`} />
+
+## `range` for counting
+
+When you genuinely need numbers, `range` produces them.
+
+<Run id="f-loop-3" code={`for i in range(5):
+    print(i, end=" ")
+print()
+
+for i in range(2, 8):        # start, stop (stop excluded)
+    print(i, end=" ")
+print()
+
+for i in range(0, 20, 5):    # start, stop, step
+    print(i, end=" ")
+print()
+
+for i in range(5, 0, -1):    # counting down
+    print(i, end=" ")
+print()`} />
+
+`range` is lazy — it does not build a list, it produces numbers one at a time. `range(10**9)`
+costs nothing until you iterate it.
+
+## `enumerate` when you need the position too
+
+The beginner reflex is to loop over indices. Resist it.
+
+<Run id="f-loop-4" code={`models = ["baseline", "tuned", "ensemble"]
+
+# What people write first:
+for i in range(len(models)):
+    print(i, models[i])
+
+print()
+
+# What Python wants:
+for i, name in enumerate(models):
+    print(i, name)
+
+print()
+
+# Start counting from 1 for human-facing output:
+for rank, name in enumerate(models, start=1):
+    print(f"{rank}. {name}")`} />
+
+## `zip` to walk two sequences together
+
+<Run id="f-loop-5" code={`names = ["baseline", "tuned", "ensemble"]
+scores = [0.71, 0.88, 0.93]
+latency = [12, 48, 190]
+
+for name, score, ms in zip(names, scores, latency):
+    print(f"{name:<10} {score:>6.0%} {ms:>5} ms")`} />
+
+`zip` stops at the shortest sequence, which is usually what you want and occasionally a silent
+bug — pass `strict=True` to make a length mismatch raise instead.
+
+<Run id="f-loop-6" code={`a = [1, 2, 3]
+b = ["x", "y"]
+
+print(list(zip(a, b)))          # silently drops the 3
+print(list(zip(a, b, strict=True)))  # raises instead`} />
+
+## Steering a loop from inside
+
+**`break`** leaves the loop immediately.
+
+<Run id="f-loop-7" code={`scores = [0.42, 0.61, 0.88, 0.93, 0.51]
+
+for i, score in enumerate(scores):
+    if score >= 0.85:
+        print(f"first acceptable score {score} at position {i}")
+        break
+    print(f"  {score} is too low, continuing")`} />
+
+**`continue`** skips to the next iteration.
+
+<Run id="f-loop-8" code={`rows = ["ok", "", "ok", None, "ok"]
+
+kept = 0
+for row in rows:
+    if not row:
+        continue          # skip empty and None rows
+    kept += 1
+print(f"kept {kept} of {len(rows)} rows")`} />
+
+**`else` on a loop** runs only if the loop finished *without* breaking. It is unusual, but it
+is exactly right for search loops:
+
+<Run id="f-loop-9" code={`scores = [0.42, 0.61, 0.51]
+
+for score in scores:
+    if score >= 0.85:
+        print("found one")
+        break
+else:
+    print("nothing reached the bar")`} />
+
+<Callout type="tip">
+Read `for ... else` as "for ... *then*, if nothing broke out". It saves the
+`found = False` flag variable that search loops otherwise need.
+</Callout>
+
+## `while` for "until something changes"
+
+Use `while` when you do not know how many iterations you need in advance.
+
+<Run id="f-loop-10" code={`# Exponential backoff — a real pattern for retrying an API call.
+attempt = 0
+delay = 1.0
+
+while attempt < 5:
+    attempt += 1
+    print(f"attempt {attempt}: would wait {delay:.1f}s before retrying")
+    delay *= 2
+
+print("giving up")`} />
+
+The danger with `while` is forgetting to change the condition:
+
+<Run id="f-loop-11" code={`# This never ends. Press Run, then press Stop.
+n = 0
+while n < 5:
+    print(n)
+    # n never increases`} />
+
+Press **Stop** — the interpreter is restarted and the page stays responsive. On your own
+machine this is `Ctrl+C`.
+
+## Accumulating results
+
+The pattern behind almost every data script:
+
+<Run id="f-loop-12" code={`runs = [
+    {"model": "baseline", "score": 0.71, "tokens": 400},
+    {"model": "tuned", "score": 0.88, "tokens": 950},
+    {"model": "ensemble", "score": 0.93, "tokens": 2100},
+]
+
+total_tokens = 0
+best = None
+
+for run in runs:
+    total_tokens += run["tokens"]
+    if best is None or run["score"] > best["score"]:
+        best = run
+
+print(f"total tokens: {total_tokens:,}")
+print(f"best model:   {best['model']} at {best['score']:.0%}")
+print(f"mean score:   {sum(r['score'] for r in runs) / len(runs):.3f}")`} />
+
+That last line is a **generator expression** — a comprehension without the brackets, computing
+values one at a time instead of building a list first.
+
+<Callout type="ai" title="Why this matters for AI">
+Processing a dataset, streaming tokens from a model, retrying a failed call, running an
+evaluation over a hundred prompts — every one of them is a loop with an accumulator. Getting
+comfortable with <code>enumerate</code>, <code>zip</code> and generator expressions now will
+save you from a great deal of index arithmetic later.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="f-loop-ex1"
+  title="Exercise 1"
+  brief="Print a numbered leaderboard, highest score first, in the form <code>1. ensemble 93%</code> — one line per model."
+  code={`scores = {"baseline": 0.71, "ensemble": 0.93, "tuned": 0.88}
+
+# Sort by score descending, then number the lines from 1.
+`}
+  hint="sorted(scores.items(), key=lambda kv: kv[1], reverse=True) then enumerate(..., start=1)."
+  solution={`scores = {"baseline": 0.71, "ensemble": 0.93, "tuned": 0.88}
+
+ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+for rank, (name, score) in enumerate(ranked, start=1):
+    print(f"{rank}. {name} {score:.0%}")`}
+  tests={`expected = ["1. ensemble 93%", "2. tuned 88%", "3. baseline 71%"]
+assert _lines == expected, f"Expected:\\n{expected}\\nGot:\\n{_lines}"`}
+/>
+
+<Exercise
+  id="f-loop-ex2"
+  title="Exercise 2"
+  brief="Find the position of the first score at or above 0.85 and store it in <code>found_at</code>. If there is none, leave it as <code>-1</code>."
+  code={`scores = [0.42, 0.61, 0.88, 0.93, 0.51]
+
+found_at = -1
+# Use a for loop with enumerate and break.
+
+print(found_at)`}
+  hint="Loop with enumerate, and break as soon as the condition holds."
+  solution={`scores = [0.42, 0.61, 0.88, 0.93, 0.51]
+
+found_at = -1
+for i, score in enumerate(scores):
+    if score >= 0.85:
+        found_at = i
+        break
+
+print(found_at)`}
+  tests={`assert found_at == 2, f"The first score at or above 0.85 is 0.88, at index 2. Got {found_at}."`}
+/>
+
+<Quiz
+  question="What does list(range(1, 10, 3)) produce?"
+  choices={[
+    { text: "[1, 4, 7]", correct: true, why: "Start at 1, step by 3, stop before 10 — so 1, 4, 7." },
+    { text: "[1, 4, 7, 10]", why: "The stop value is exclusive, so 10 is not included." },
+    { text: "[1, 2, 3]", why: "The third argument is the step, not a count of items." },
+    { text: "[3, 6, 9]", why: "That would be range(3, 10, 3) — the first argument is where it starts." },
+  ]}
+/>
+
+## Recap
+
+- `for item in sequence` is the default loop; you rarely need indices.
+- `range(start, stop, step)` counts lazily, with `stop` excluded.
+- `enumerate` gives you position and item; `zip` walks several sequences together.
+- `break` exits, `continue` skips, and `else` on a loop runs only if nothing broke out.
+- Use `while` when the number of iterations depends on something that changes.

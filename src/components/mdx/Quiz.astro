@@ -1,0 +1,13 @@
+---
+import QuizIsland from "../Quiz.tsx";
+import type { QuizChoice } from "../Quiz.tsx";
+
+interface Props {
+  question: string;
+  choices: QuizChoice[];
+}
+
+const { question, choices } = Astro.props;
+---
+
+<QuizIsland client:visible question={question} choices={choices} />

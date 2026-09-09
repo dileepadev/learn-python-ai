@@ -1,0 +1,24 @@
+---
+import { SITE, withBase } from "../lib/paths";
+const year = new Date().getFullYear();
+---
+
+<footer class="mt-24 border-t" style="border-color: var(--border)">
+  <div class="mx-auto flex w-full max-w-6xl flex-col gap-4 px-5 py-10 text-sm sm:flex-row sm:items-center">
+    <p style="color: var(--text-faint)">
+      © {year} <a href={`https://github.com/${SITE.author}`} class="hover:underline" style="color: var(--text-muted)">{SITE.author}</a>.
+      Released under the MIT licence.
+    </p>
+    <nav class="flex flex-wrap gap-4 sm:ml-auto" style="color: var(--text-muted)">
+      <a href={withBase("/curriculum")} class="hover:underline">Curriculum</a>
+      <a href={withBase("/playground")} class="hover:underline">Playground</a>
+      <a href={`${SITE.repo}/blob/main/CONTRIBUTING.md`} class="hover:underline">Contribute</a>
+      <a href={SITE.repo} class="hover:underline">Source</a>
+    </nav>
+  </div>
+  <p class="mx-auto w-full max-w-6xl px-5 pb-8 text-xs" style="color: var(--text-faint)">
+    Python runs locally in your browser via
+    <a href="https://pyodide.org" class="underline" rel="noopener noreferrer" target="_blank">Pyodide</a> —
+    your code is never uploaded anywhere.
+  </p>
+</footer>

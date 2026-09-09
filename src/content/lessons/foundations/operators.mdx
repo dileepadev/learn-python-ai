@@ -1,0 +1,228 @@
+---
+title: Operators and expressions
+description: Arithmetic, comparison, logic and assignment — plus the integer division and truthiness rules that surprise people.
+module: foundations
+order: 4
+level: beginner
+minutes: 12
+objectives:
+  - Use arithmetic operators including floor division and modulo
+  - Compare and combine values with comparison and boolean operators
+  - Understand truthiness and short-circuit evaluation
+  - Know when to use `is` instead of `==`
+---
+
+An **expression** is anything that produces a value. `2 + 2` is an expression; so is
+`name.upper()` and `score > 0.9`. Operators are how you build them.
+
+## Arithmetic
+
+<Run id="f-op-1" code={`a = 11
+b = 5
+
+print("a + b  =", a + b)
+print("a - b  =", a - b)
+print("a * b  =", a * b)
+print("a / b  =", a / b)    # true division -> always a float
+print("a // b =", a // b)   # floor division -> drops the remainder
+print("a %  b  =", a % b)   # modulo -> the remainder
+print("a ** b =", a ** b)   # exponent`} />
+
+Two of those deserve attention.
+
+**`/` always returns a float**, even when the answer is whole. `10 / 2` is `5.0`, not `5`.
+Use `//` when you want an integer result.
+
+**`%` (modulo) gives the remainder**, and it is more useful than it looks:
+
+<Run id="f-op-2" code={`for n in range(1, 11):
+    kind = "even" if n % 2 == 0 else "odd"
+    print(n, kind)
+
+print()
+# Modulo also wraps values around a range — useful for cycling.
+colours = ["red", "green", "blue"]
+for i in range(7):
+    print(i, colours[i % len(colours)])`} />
+
+<Callout type="ai">
+Batching is modulo arithmetic. Splitting 1,000 documents into batches of 32 gives
+<code>1000 // 32</code> full batches and <code>1000 % 32</code> left over — exactly the
+calculation every data loader makes.
+</Callout>
+
+### Operators on strings and lists
+
+`+` and `*` also work on sequences, where they mean "join" and "repeat":
+
+<Run id="f-op-3" code={`print("Hello" + " " + "World")
+print("ab" * 3)
+print([1, 2] + [3, 4])
+print([0] * 5)
+print("-" * 40)`} />
+
+## Comparison
+
+Comparisons produce `True` or `False`.
+
+<Run id="f-op-4" code={`x, y = 10, 20
+
+print(x == y)   # equal
+print(x != y)   # not equal
+print(x > y, x < y)
+print(x >= 10, y <= 20)
+
+# Python lets you chain them, and it reads exactly as it looks.
+score = 0.85
+print(0.8 <= score < 0.9)`} />
+
+That chained form is genuinely Python-specific and worth using — `0.8 <= score < 0.9` is
+clearer than `score >= 0.8 and score < 0.9`.
+
+## Boolean logic
+
+<Run id="f-op-5" code={`p, q = True, False
+
+print("and:", p and q)
+print("or: ", p or q)
+print("not:", not p)`} />
+
+### Truthiness
+
+Every value can be used where a boolean is expected. Empty things are falsy; everything else is
+truthy.
+
+<Run id="f-op-6" code={`falsy = [False, None, 0, 0.0, "", [], {}, set()]
+
+for value in falsy:
+    print(f"{repr(value):<8} -> {bool(value)}")
+
+print()
+print(bool("0"), bool([0]), bool(" "))  # non-empty, so all True`} />
+
+<Callout type="warning">
+Note `bool("0")` is `True` — a non-empty string is truthy regardless of what is in it. This is
+a classic bug when a config value arrives as text: <code>if enabled:</code> where
+<code>enabled == "false"</code> passes happily.
+</Callout>
+
+### Short-circuiting
+
+`and` and `or` stop as soon as the answer is known, and they return one of the *operands*, not
+a boolean.
+
+<Run id="f-op-7" code={`def expensive():
+    print("  (expensive was called)")
+    return True
+
+print("A:")
+result = False and expensive()   # expensive never runs
+print(" ->", result)
+
+print("B:")
+result = True or expensive()     # expensive never runs
+print(" ->", result)
+
+print()
+# Because they return an operand, 'or' makes a neat default:
+user_input = ""
+name = user_input or "anonymous"
+print(name)`} />
+
+That last pattern — `value or fallback` — is idiomatic Python for "use this unless it's empty".
+
+## `==` versus `is`
+
+`==` asks "are these equal?". `is` asks "are these the same object?". They are not the same
+question.
+
+<Run id="f-op-8" code={`a = [1, 2, 3]
+b = [1, 2, 3]
+c = a
+
+print(a == b)   # same contents
+print(a is b)   # different objects
+print(a is c)   # same object
+
+c.append(4)
+print(a)        # a changed too, because c IS a`} />
+
+The rule in practice: use `==` for values, and use `is` only with `None`, `True` and `False`.
+
+<Run id="f-op-9" code={`value = None
+
+print(value is None)      # correct
+print(value == None)      # works, but not idiomatic`} />
+
+## Compound assignment
+
+<Run id="f-op-10" code={`c = 10
+c += 5;  print("+= 5  ->", c)
+c -= 3;  print("-= 3  ->", c)
+c *= 2;  print("*= 2  ->", c)
+c /= 4;  print("/= 4  ->", c)   # note: now a float
+c //= 2; print("//= 2 ->", c)
+c **= 3; print("**= 3 ->", c)`} />
+
+Watch the type: `/=` turns an int into a float and it never turns back.
+
+## Try it yourself
+
+<Exercise
+  id="f-op-ex1"
+  title="Exercise 1"
+  brief="A job has 1,000 items processed in batches of 32. Print the number of full batches and the size of the final partial batch, on two lines."
+  code={`items = 1000
+batch_size = 32
+
+# Line 1: "full batches: N"
+# Line 2: "remainder: N"
+`}
+  hint="// gives whole batches, % gives what is left over."
+  solution={`items = 1000
+batch_size = 32
+
+print(f"full batches: {items // batch_size}")
+print(f"remainder: {items % batch_size}")`}
+  tests={`assert _lines == ["full batches: 31", "remainder: 8"], (
+    f"Expected 31 full batches and a remainder of 8. Got: {_lines}"
+)`}
+/>
+
+<Exercise
+  id="f-op-ex2"
+  title="Exercise 2"
+  brief="Set <code>label</code> to the display name: use <code>nickname</code> if it has anything in it, otherwise <code>full_name</code>."
+  code={`nickname = ""
+full_name = "Ada Lovelace"
+
+label = None
+print(label)`}
+  hint="'or' returns its first truthy operand — that is the whole answer."
+  solution={`nickname = ""
+full_name = "Ada Lovelace"
+
+label = nickname or full_name
+print(label)`}
+  tests={`assert label == "Ada Lovelace", f"Expected 'Ada Lovelace', got {label!r}."
+nickname2, full2 = "Ada", "Ada Lovelace"
+assert (nickname2 or full2) == "Ada", "Your approach should prefer a non-empty nickname."`}
+/>
+
+<Quiz
+  question="What is the value of 7 // 2 + 7 % 2?"
+  choices={[
+    { text: "3.5", why: "Neither // nor % produces a fraction here; both operands are ints." },
+    { text: "4", correct: true, why: "7 // 2 is 3 and 7 % 2 is 1, so the sum is 4." },
+    { text: "3", why: "That is just 7 // 2; the remainder still has to be added." },
+    { text: "7", why: "That would be 7 // 2 * 2 + 7 % 2 — a different expression." },
+  ]}
+/>
+
+## Recap
+
+- `/` always gives a float; `//` floors to an int; `%` gives the remainder.
+- Comparisons chain: `0 <= x < 1` is valid and readable.
+- Empty values are falsy; every other value is truthy — including the string `"0"`.
+- `and`/`or` short-circuit and return an operand, which makes `value or default` idiomatic.
+- Use `==` for values and reserve `is` for `None`, `True` and `False`.

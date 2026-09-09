@@ -1,0 +1,32 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import Playground from "../components/Playground.tsx";
+import Callout from "../components/mdx/Callout.astro";
+---
+
+<BaseLayout
+  title="Playground"
+  description="A full Python environment in your browser — standard library, NumPy, pandas and scikit-learn, with nothing to install."
+>
+  <header class="mb-8 max-w-3xl">
+    <h1 class="text-3xl font-bold sm:text-4xl">Playground</h1>
+    <p class="mt-4 text-[17px] leading-relaxed" style="color: var(--text-muted)">
+      A scratch file with a real CPython interpreter behind it. Import from the standard library
+      immediately; scientific packages are fetched from the CDN the first time you import them.
+    </p>
+  </header>
+
+  <Playground client:load />
+
+  <Callout type="note" title="What runs here, and what doesn't">
+    <p>
+      This is CPython compiled to WebAssembly, so pure-Python code behaves exactly as it does on your
+      machine. What is missing is the operating system: no sockets, no threads, no subprocesses, and
+      no filesystem beyond a virtual one that disappears when you close the tab.
+    </p>
+    <p>
+      <code>input()</code> needs its lines up front — put them in the Stdin panel under the editor.
+      An accidental <code>while True:</code> is safe: press Stop and the interpreter restarts.
+    </p>
+  </Callout>
+</BaseLayout>

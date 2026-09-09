@@ -1,6 +1,6 @@
 # Security Policy
 
-The [learn-python](https://github.com/dileepadev/learn-python) project team takes security issues very seriously. We appreciate your efforts to responsibly disclose any security vulnerabilities you find.
+The [learn-python-ai](https://github.com/dileepadev/learn-python-ai) project team takes security issues very seriously. We appreciate your efforts to responsibly disclose any security vulnerabilities you find.
 
 ## Reporting a Vulnerability
 
@@ -36,4 +36,4 @@ Maintainers are responsible for the security of the project. This includes:
 - We will release a fix as soon as possible, depending on the complexity of the issue.
 - We will communicate the vulnerability and any patches or workarounds to our users.
 
-Thank you for your help in making the [learn-python](https://github.com/dileepadev/learn-python) project a more secure place.
+Thank you for your help in making the [learn-python-ai](https://github.com/dileepadev/learn-python-ai) project a more secure place.

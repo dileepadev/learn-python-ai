@@ -1,0 +1,36 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import { withBase } from "../lib/paths";
+import { allLessons } from "../lib/lessons";
+import { lessonHref } from "../lib/paths";
+
+const first = (await allLessons())[0];
+---
+
+<BaseLayout title="Page not found">
+  <div class="mx-auto max-w-lg py-20 text-center">
+    <p class="font-mono text-sm" style="color: var(--text-faint)">Traceback (most recent call last):</p>
+    <h1 class="mt-3 text-3xl font-bold">PageNotFoundError: 404</h1>
+    <p class="mt-4" style="color: var(--text-muted)">
+      That page isn't part of the course — at least not yet.
+    </p>
+    <div class="mt-8 flex flex-wrap justify-center gap-3">
+      <a
+        href={withBase("/")}
+        class="rounded-xl px-5 py-2.5 text-sm font-semibold"
+        style="background: var(--accent); color: var(--accent-contrast)">Back home</a
+      >
+      {
+        first && (
+          <a
+            href={lessonHref(first.id)}
+            class="rounded-xl border px-5 py-2.5 text-sm font-semibold"
+            style="border-color: var(--border-strong); color: var(--text)"
+          >
+            Start the course
+          </a>
+        )
+      }
+    </div>
+  </div>
+</BaseLayout>

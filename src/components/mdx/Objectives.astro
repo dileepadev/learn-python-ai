@@ -1,0 +1,25 @@
+---
+interface Props {
+  items: string[];
+  minutes: number;
+}
+const { items, minutes } = Astro.props;
+---
+
+{
+  items.length > 0 && (
+    <section class="mb-8 rounded-xl2 border p-4" style="background: var(--bg-sunken); border-color: var(--border)">
+      <p class="mb-2 text-[11px] font-bold uppercase tracking-wider" style="color: var(--text-faint)">
+        In this lesson · {minutes} min
+      </p>
+      <ul class="space-y-1.5 text-[14.5px]" style="color: var(--text-muted)">
+        {items.map((item) => (
+          <li class="flex gap-2.5">
+            <span style="color: var(--accent)">→</span>
+            <span>{item}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
+}

@@ -1,0 +1,273 @@
+---
+title: Making decisions
+description: if, elif and else — plus indentation, the conditional expression, and the guard-clause pattern that keeps code flat.
+module: foundations
+order: 8
+level: beginner
+minutes: 12
+objectives:
+  - Branch with if, elif and else
+  - Understand how indentation defines a block
+  - Use conditional expressions for simple choices
+  - Flatten nested conditions with guard clauses
+---
+
+Up to now every program has run straight through. `if` is how a program takes different paths.
+
+<Run id="f-cond-1" code={`age = 18
+
+if age >= 18:
+    print("You are an adult.")
+
+print("This runs either way.")`} />
+
+Two things define the structure: the **colon** at the end of the `if` line, and the
+**indentation** of the lines that follow it.
+
+## Indentation is the syntax
+
+Other languages use braces. Python uses indentation, and it is not optional.
+
+<Run id="f-cond-2" code={`temperature = 35
+
+if temperature > 30:
+    print("It is hot.")
+    print("Both of these lines are inside the if.")
+print("This one is not — it always runs.")`} />
+
+Get it wrong and Python tells you immediately:
+
+<Run id="f-cond-3" code={`x = 5
+
+if x > 0:
+print("positive")`} />
+
+<Callout type="tip">
+Use four spaces per level. Never mix tabs and spaces in one file — Python will reject it, and
+the error (`TabError`) is harder to see than it should be because the difference is invisible.
+</Callout>
+
+## `else` and `elif`
+
+<Run id="f-cond-4" code={`age = 16
+
+if age >= 18:
+    print("You are an adult.")
+else:
+    print("You are a minor.")`} />
+
+`elif` chains further tests. Python checks them top to bottom and takes the **first** one that
+is true — the rest are skipped entirely.
+
+<Run id="f-cond-5" code={`score = 85
+
+if score >= 90:
+    grade = "A"
+elif score >= 80:
+    grade = "B"
+elif score >= 70:
+    grade = "C"
+elif score >= 60:
+    grade = "D"
+else:
+    grade = "F"
+
+print(f"Grade: {grade}")`} />
+
+Because only the first match runs, the order matters. Try reversing those branches — putting
+`score >= 60` first — and everything above 60 becomes a D.
+
+<Run id="f-cond-6" code={`# The same logic in the wrong order.
+score = 85
+
+if score >= 60:
+    grade = "D"     # this catches everything
+elif score >= 90:
+    grade = "A"     # unreachable
+else:
+    grade = "F"
+
+print(f"Grade: {grade}   <- wrong, and Python will not warn you")`} />
+
+## Combining conditions
+
+<Run id="f-cond-7" code={`score = 0.87
+latency_ms = 120
+
+if score > 0.85 and latency_ms < 200:
+    print("ship it")
+
+if score > 0.95 or latency_ms < 50:
+    print("exceptional")
+else:
+    print("good, not exceptional")
+
+if not (score > 0.9):
+    print("below the 0.9 bar")
+
+# Chained comparison — clearer than two conditions joined by 'and'.
+if 0.8 <= score < 0.9:
+    print("in the 0.8-0.9 band")`} />
+
+## The conditional expression
+
+When a whole `if`/`else` exists only to pick between two values, collapse it into one line:
+
+<Run id="f-cond-8" code={`n = 7
+
+# The long form:
+if n % 2 == 0:
+    kind = "even"
+else:
+    kind = "odd"
+print(kind)
+
+# The same thing as an expression:
+kind = "even" if n % 2 == 0 else "odd"
+print(kind)`} />
+
+Read it as "*this value* if *condition* else *that value*". Use it for simple choices only —
+nesting them gets unreadable fast.
+
+## Guard clauses
+
+Nested conditions get hard to follow quickly:
+
+<Run id="f-cond-9" code={`def describe(response):
+    if response is not None:
+        if "content" in response:
+            if len(response["content"]) > 0:
+                return response["content"][0]["text"]
+            else:
+                return "empty content"
+        else:
+            return "no content field"
+    else:
+        return "no response"
+
+print(describe({"content": [{"text": "Hello"}]}))
+print(describe({}))
+print(describe(None))`} />
+
+The same logic, flattened by handling each failure and returning immediately:
+
+<Run id="f-cond-10" code={`def describe(response):
+    if response is None:
+        return "no response"
+    if "content" not in response:
+        return "no content field"
+    if not response["content"]:
+        return "empty content"
+    return response["content"][0]["text"]
+
+print(describe({"content": [{"text": "Hello"}]}))
+print(describe({}))
+print(describe(None))`} />
+
+Same behaviour, one level of indentation, and each rule is visible on its own line. This is
+called a **guard clause**, and it is one of the highest-value habits you can build early.
+
+<Callout type="ai" title="Why this matters for AI">
+Code that handles model output is mostly validation: did the call succeed, is the field
+present, is the JSON parseable, is the value in range. Written as nested <code>if</code>s it
+becomes unreadable within a week. Written as guard clauses it stays flat no matter how many
+checks you add.
+</Callout>
+
+## `match` for dispatching on a value
+
+When you are branching on *what something is* rather than *whether something is true*, Python
+has `match`:
+
+<Run id="f-cond-11" code={`def handle(block):
+    match block["type"]:
+        case "text":
+            return f"text: {block['text']}"
+        case "tool_use":
+            return f"calling tool: {block['name']}"
+        case "image":
+            return "an image"
+        case _:
+            return f"unknown block type: {block['type']}"
+
+print(handle({"type": "text", "text": "hi"}))
+print(handle({"type": "tool_use", "name": "search"}))
+print(handle({"type": "video"}))`} />
+
+`case _` is the catch-all. Reach for `match` when you have several cases on one value; stick
+with `if`/`elif` otherwise.
+
+## Try it yourself
+
+<Exercise
+  id="f-cond-ex1"
+  title="Exercise 1"
+  brief="Print one line describing the latency: <code>fast</code> under 50 ms, <code>ok</code> under 200 ms, otherwise <code>slow</code>."
+  code={`latency_ms = 143
+
+# Print exactly one of: fast, ok, slow
+`}
+  hint="An if/elif/else chain — and remember the order matters."
+  solution={`latency_ms = 143
+
+if latency_ms < 50:
+    print("fast")
+elif latency_ms < 200:
+    print("ok")
+else:
+    print("slow")`}
+  tests={`assert _lines == ["ok"], f"143 ms falls in the 'ok' band. Got: {_lines}"`}
+/>
+
+<Exercise
+  id="f-cond-ex2"
+  title="Exercise 2"
+  brief="Rewrite the function using guard clauses so it never nests more than one level deep. It must behave identically."
+  code={`def status(score):
+    if score is not None:
+        if score >= 0:
+            if score >= 0.85:
+                return "pass"
+            else:
+                return "fail"
+        else:
+            return "invalid"
+    else:
+        return "missing"
+
+for value in (0.9, 0.4, -1, None):
+    print(status(value))`}
+  hint="Handle 'missing' first, then 'invalid', then the pass/fail decision."
+  solution={`def status(score):
+    if score is None:
+        return "missing"
+    if score < 0:
+        return "invalid"
+    return "pass" if score >= 0.85 else "fail"
+
+for value in (0.9, 0.4, -1, None):
+    print(status(value))`}
+  tests={`assert status(0.9) == "pass", "0.9 should be 'pass'."
+assert status(0.85) == "pass", "0.85 is exactly on the boundary and should be 'pass'."
+assert status(0.4) == "fail", "0.4 should be 'fail'."
+assert status(-1) == "invalid", "A negative score should be 'invalid'."
+assert status(None) == "missing", "None should be 'missing'."`}
+/>
+
+<Quiz
+  question="How many of these branches run when score is 95?"
+  choices={[
+    { text: "Only the first matching branch", correct: true, why: "An if/elif chain stops at the first true condition; the rest are never evaluated." },
+    { text: "Every branch whose condition is true", why: "That would be the behaviour of separate if statements, not an elif chain." },
+    { text: "All of them, in order", why: "Conditions are checked, not blindly executed." },
+    { text: "None — 95 is out of range", why: "There is nothing out of range about 95; the first condition it satisfies wins." },
+  ]}
+/>
+
+## Recap
+
+- A colon opens a block; indentation (four spaces) says what is inside it.
+- `elif` chains stop at the first true condition, so order the branches carefully.
+- `value_a if condition else value_b` is the one-line form, for simple choices only.
+- Guard clauses — check and return early — keep validation code flat and readable.
+- `match` is for dispatching on what a value *is*, when there are several cases.

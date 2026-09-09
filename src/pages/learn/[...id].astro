@@ -1,0 +1,25 @@
+---
+import { render } from "astro:content";
+import LessonLayout from "../../layouts/LessonLayout.astro";
+import { allLessons, neighbours } from "../../lib/lessons";
+import Run from "../../components/mdx/Run.astro";
+import Exercise from "../../components/mdx/Exercise.astro";
+import Quiz from "../../components/mdx/Quiz.astro";
+import Callout from "../../components/mdx/Callout.astro";
+
+export async function getStaticPaths() {
+  const lessons = await allLessons();
+  return lessons.map((lesson) => ({
+    params: { id: lesson.id },
+    props: { lesson },
+  }));
+}
+
+const { lesson } = Astro.props;
+const { Content, headings } = await render(lesson);
+const nav = await neighbours(lesson.id);
+---
+
+<LessonLayout lesson={lesson} nav={nav} headings={headings}>
+  <Content components={{ Run, Exercise, Quiz, Callout }} />
+</LessonLayout>

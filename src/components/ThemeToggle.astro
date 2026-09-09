@@ -1,0 +1,25 @@
+---
+import { Sun, Moon } from "./icons";
+---
+
+<button
+  id="theme-toggle"
+  type="button"
+  class="rounded-lg p-2 transition-colors"
+  style="color: var(--text-muted)"
+  aria-label="Toggle dark mode"
+>
+  <span class="hidden dark:inline"><Sun width={17} height={17} /></span>
+  <span class="inline dark:hidden"><Moon width={17} height={17} /></span>
+</button>
+
+<script>
+  document.getElementById("theme-toggle")?.addEventListener("click", () => {
+    const dark = document.documentElement.classList.toggle("dark");
+    try {
+      localStorage.setItem("lpai:theme", dark ? "dark" : "light");
+    } catch {
+      // Theme choice just won't persist across visits.
+    }
+  });
+</script>

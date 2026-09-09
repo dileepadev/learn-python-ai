@@ -1,0 +1,29 @@
+---
+interface Props {
+  type?: "note" | "tip" | "warning" | "ai";
+  title?: string;
+}
+
+const { type = "note", title } = Astro.props;
+
+const STYLES = {
+  note: { accent: "#6366f1", label: "Note" },
+  tip: { accent: "#22c55e", label: "Tip" },
+  warning: { accent: "#f59e0b", label: "Watch out" },
+  ai: { accent: "#22d3ee", label: "Why this matters for AI" },
+} as const;
+
+const { accent, label } = STYLES[type];
+---
+
+<aside
+  class="my-6 rounded-xl2 border-l-[3px] px-4 py-3.5"
+  style={`border-left-color: ${accent}; background: color-mix(in oklab, ${accent} 8%, var(--bg-elevated)); border-top: 1px solid var(--border); border-right: 1px solid var(--border); border-bottom: 1px solid var(--border);`}
+>
+  <p class="mb-1 text-[11px] font-bold uppercase tracking-wider" style={`color: ${accent}`}>
+    {title ?? label}
+  </p>
+  <div class="text-[14.5px] leading-relaxed [&>*+*]:mt-2" style="color: var(--text-muted)">
+    <slot />
+  </div>
+</aside>

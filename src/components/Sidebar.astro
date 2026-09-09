@@ -1,0 +1,69 @@
+---
+import { MODULES } from "../lib/curriculum";
+import { lessonsByModule } from "../lib/lessons";
+import { lessonHref, withBase } from "../lib/paths";
+import ProgressRing from "./ProgressRing.tsx";
+import { Lock } from "./icons";
+
+interface Props {
+  currentId?: string;
+}
+const { currentId } = Astro.props;
+
+const grouped = await lessonsByModule();
+const allSlugs = [...grouped.values()].flat().map((lesson) => lesson.id);
+---
+
+<nav aria-label="Course contents" class="text-[13.5px]">
+  <div class="mb-5 flex items-center gap-3 rounded-xl2 border p-3" style="background: var(--bg-sunken); border-color: var(--border)">
+    <ProgressRing client:load total={allSlugs.length} slugs={allSlugs} />
+  </div>
+
+  {
+    MODULES.map((module, index) => {
+      const lessons = grouped.get(module.slug) ?? [];
+      const published = lessons.length > 0;
+      return (
+        <section class="mb-5">
+          <p class="mb-1.5 flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider" style="color: var(--text-faint)">
+            <span
+              class="grid h-4 w-4 place-items-center rounded text-[9px]"
+              style="background: var(--bg-sunken); color: var(--text-faint)"
+            >
+              {index + 1}
+            </span>
+            {module.title}
+            {!published && <Lock width={11} height={11} />}
+          </p>
+
+          {published ? (
+            <ul class="space-y-px border-l pl-0" style="border-color: var(--border)">
+              {lessons.map((lesson) => {
+                const active = lesson.id === currentId;
+                return (
+                  <li>
+                    <a
+                      href={lessonHref(lesson.id)}
+                      class="-ml-px block border-l-2 py-1.5 pl-3.5 transition-colors"
+                      style={`border-left-color: ${active ? "var(--accent)" : "transparent"}; color: ${active ? "var(--text)" : "var(--text-muted)"}; font-weight: ${active ? 600 : 400}`}
+                    >
+                      {lesson.data.title}
+                    </a>
+                  </li>
+                );
+              })}
+            </ul>
+          ) : (
+            <a
+              href={`${withBase("/curriculum")}#${module.slug}`}
+              class="hover-nav -ml-px block border-l-2 border-transparent py-1.5 pl-3.5 text-[12.5px]"
+              style="color: var(--text-faint)"
+            >
+              {(module.plannedLessons ?? []).length} lessons planned →
+            </a>
+          )}
+        </section>
+      );
+    })
+  }
+</nav>
