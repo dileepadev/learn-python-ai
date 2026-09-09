@@ -1,0 +1,140 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import ProgressRing from "../components/ProgressRing.tsx";
+import { MODULES, LEVELS, type Level } from "../lib/curriculum";
+import { allLessons, lessonsByModule } from "../lib/lessons";
+import { lessonHref } from "../lib/paths";
+import { MODULE_ICONS, ChevronRight, Lock } from "../components/icons";
+
+const lessons = await allLessons();
+const grouped = await lessonsByModule();
+const allSlugs = lessons.map((l) => l.id);
+
+const plannedCount = MODULES.reduce((sum, m) => sum + (m.plannedLessons?.length ?? 0), 0);
+
+const LEVEL_ORDER: Level[] = ["beginner", "intermediate", "advanced", "expert"];
+---
+
+<BaseLayout
+  title="Curriculum"
+  description="The full Learn Python for AI curriculum: eight modules from your first print statement to production AI systems."
+>
+  <header class="mb-12 max-w-3xl">
+    <h1 class="text-3xl font-bold sm:text-4xl">Curriculum</h1>
+    <p class="mt-4 text-[17px] leading-relaxed" style="color: var(--text-muted)">
+      One path, four levels, {MODULES.length} modules. Each lesson is a page you read and a program you
+      run — the code on every page is editable and executes in your browser.
+    </p>
+    <div class="mt-6 flex flex-wrap items-center gap-6">
+      <ProgressRing client:load total={allSlugs.length} slugs={allSlugs} />
+      <p class="text-sm" style="color: var(--text-faint)">
+        {lessons.length} lessons published · {plannedCount} on the roadmap
+      </p>
+    </div>
+  </header>
+
+  <!-- Level legend -->
+  <div class="mb-12 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+    {
+      LEVEL_ORDER.map((level, i) => (
+        <div class="rounded-xl2 border p-3.5" style="border-color: var(--border)">
+          <p class="flex items-center gap-2 text-[13px] font-semibold" style="color: var(--text)">
+            <span
+              class="h-1.5 w-1.5 rounded-full"
+              style={`background: color-mix(in oklab, var(--accent) ${30 + i * 23}%, var(--text-faint))`}
+            />
+            {LEVELS[level].label}
+          </p>
+          <p class="mt-1 text-[12.5px]" style="color: var(--text-faint)">
+            {LEVELS[level].blurb}
+          </p>
+        </div>
+      ))
+    }
+  </div>
+
+  <div class="space-y-6">
+    {
+      MODULES.map((module, index) => {
+        const Icon = MODULE_ICONS[module.icon as keyof typeof MODULE_ICONS];
+        const moduleLessons = grouped.get(module.slug) ?? [];
+        const live = moduleLessons.length > 0;
+        return (
+          <section id={module.slug} class="card overflow-hidden scroll-mt-24">
+            <div class="flex flex-wrap items-start gap-4 border-b p-5" style="border-color: var(--border)">
+              <span
+                class="grid h-11 w-11 shrink-0 place-items-center rounded-xl"
+                style={`background: ${live ? "color-mix(in oklab, var(--accent) 15%, transparent)" : "var(--bg-sunken)"}; color: ${live ? "var(--accent)" : "var(--text-faint)"}`}
+              >
+                <Icon width={19} height={19} />
+              </span>
+
+              <div class="min-w-0 flex-1">
+                <p class="text-[11px] font-mono uppercase tracking-wider" style="color: var(--text-faint)">
+                  Module {String(index + 1).padStart(2, "0")} · {LEVELS[module.level].label}
+                </p>
+                <h2 class="mt-0.5 text-xl font-semibold" style="color: var(--text)">
+                  {module.title}
+                </h2>
+                <p class="mt-2 max-w-3xl text-[14.5px] leading-relaxed" style="color: var(--text-muted)">
+                  {module.description}
+                </p>
+              </div>
+
+              <span
+                class="rounded-full px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide"
+                style={
+                  live
+                    ? "background: color-mix(in oklab, #22c55e 15%, transparent); color: #16a34a"
+                    : "background: var(--bg-sunken); color: var(--text-faint)"
+                }
+              >
+                {live ? "Available" : "Planned"}
+              </span>
+            </div>
+
+            {live ? (
+              <ol class="divide-y" style="border-color: var(--border)">
+                {moduleLessons.map((lesson, i) => (
+                  <li>
+                    <a href={lessonHref(lesson.id)} class="hover-row flex items-center gap-4 px-5 py-3 transition-colors">
+                      <span class="w-6 shrink-0 font-mono text-[12px]" style="color: var(--text-faint)">
+                        {String(i + 1).padStart(2, "0")}
+                      </span>
+                      <span class="min-w-0 flex-1">
+                        <span class="block text-[14.5px] font-medium" style="color: var(--text)">
+                          {lesson.data.title}
+                        </span>
+                        <span class="block text-[13px]" style="color: var(--text-muted)">
+                          {lesson.data.description}
+                        </span>
+                      </span>
+                      <span class="hidden shrink-0 text-[12px] sm:block" style="color: var(--text-faint)">
+                        {lesson.data.minutes} min
+                      </span>
+                      <span style="color: var(--text-faint)"><ChevronRight width={15} height={15} /></span>
+                    </a>
+                  </li>
+                ))}
+              </ol>
+            ) : (
+              <ul class="grid gap-x-6 gap-y-1.5 p-5 sm:grid-cols-2">
+                {(module.plannedLessons ?? []).map((title, i) => (
+                  <li class="flex items-baseline gap-3 text-[14px]" style="color: var(--text-faint)">
+                    <span class="font-mono text-[11px]">{String(i + 1).padStart(2, "0")}</span>
+                    <span>{title}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        );
+      })
+    }
+  </div>
+
+  <p class="mt-10 flex items-center justify-center gap-2 text-sm" style="color: var(--text-faint)">
+    <Lock width={13} height={13} />
+    Planned modules are written in order. Watch the repository to be notified when each lands.
+  </p>
+</BaseLayout>

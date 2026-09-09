@@ -1,0 +1,226 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import CodeRunner from "../components/CodeRunner.tsx";
+import ProgressRing from "../components/ProgressRing.tsx";
+import { MODULES, LEVELS } from "../lib/curriculum";
+import { allLessons, lessonsByModule } from "../lib/lessons";
+import { lessonHref, withBase, SITE } from "../lib/paths";
+import { MODULE_ICONS, ChevronRight, Bolt, Lock, Check } from "../components/icons";
+
+const lessons = await allLessons();
+const grouped = await lessonsByModule();
+const allSlugs = lessons.map((l) => l.id);
+const first = lessons[0];
+
+const HERO_CODE = `# This is real Python, running in your browser.
+# Edit anything, then press Run.
+
+model_scores = {"baseline": 0.71, "tuned": 0.88, "ensemble": 0.91}
+
+best = max(model_scores, key=model_scores.get)
+
+for name, score in sorted(model_scores.items(), key=lambda kv: -kv[1]):
+    bar = "#" * round(score * 30)
+    print(f"{name:<10} {bar} {score:.0%}")
+
+print(f"\\nBest model: {best}")
+`;
+
+const PILLARS = [
+  {
+    title: "Nothing to install",
+    body: "A real CPython interpreter is compiled to WebAssembly and runs inside your tab. No Anaconda, no PATH problems, no 'works on my machine'.",
+  },
+  {
+    title: "Built for AI engineering",
+    body: "Every concept is taught with the destination in mind — arrays before tensors, dicts before JSON payloads, generators before streaming responses.",
+  },
+  {
+    title: "You write the code",
+    body: "Exercises are checked by real assertions running against your actual program, not by matching your text against an answer key.",
+  },
+];
+---
+
+<BaseLayout bare>
+  <!-- Hero -->
+  <section class="aurora relative overflow-hidden">
+    <div class="bg-grid absolute inset-0 -z-10" aria-hidden="true"></div>
+
+    <div class="relative mx-auto grid w-full max-w-7xl items-center gap-12 px-5 pb-20 pt-16 lg:grid-cols-[1fr_minmax(0,560px)] lg:pt-24">
+      <div>
+        <span
+          class="inline-flex items-center gap-2 rounded-full border px-3 py-1 text-[12px] font-medium"
+          style="border-color: var(--border-strong); background: var(--bg-elevated); color: var(--text-muted)"
+        >
+          <Bolt width={13} height={13} /> Free · open source · runs offline after first load
+        </span>
+
+        <h1 class="mt-5 text-4xl font-bold leading-[1.08] tracking-tight sm:text-5xl lg:text-6xl">
+          Learn Python for
+          <span class="gradient-text"> AI engineering</span>
+        </h1>
+
+        <p class="mt-5 max-w-xl text-[17px] leading-relaxed sm:text-lg" style="color: var(--text-muted)">
+          Start at <code class="rounded px-1 py-0.5 font-mono text-[15px]" style="background: var(--code-bg)">print("Hello")</code>
+          and finish shipping retrieval pipelines and agent loops. Eight modules, every one of them
+          hands-on, every example editable and runnable right here.
+        </p>
+
+        <div class="mt-8 flex flex-wrap items-center gap-3">
+          {
+            first && (
+              <a
+                href={lessonHref(first.id)}
+                class="inline-flex items-center gap-2 rounded-xl px-5 py-3 text-[15px] font-semibold transition-transform active:scale-95"
+                style="background: var(--accent); color: var(--accent-contrast)"
+              >
+                Start with lesson 1 <ChevronRight width={16} height={16} />
+              </a>
+            )
+          }
+          <a
+            href={withBase("/curriculum")}
+            class="inline-flex items-center gap-2 rounded-xl border px-5 py-3 text-[15px] font-semibold"
+            style="border-color: var(--border-strong); color: var(--text)"
+          >
+            See the full curriculum
+          </a>
+        </div>
+
+        <div class="mt-8 flex flex-wrap items-center gap-6 text-sm" style="color: var(--text-faint)">
+          <ProgressRing client:load total={allSlugs.length} slugs={allSlugs} />
+          <span>{MODULES.length} modules · beginner → expert</span>
+        </div>
+      </div>
+
+      <!-- Live hero editor -->
+      <div class="relative">
+        <div
+          class="absolute -inset-4 -z-10 rounded-[28px] opacity-60 blur-2xl"
+          style="background: radial-gradient(60% 60% at 50% 40%, var(--glow), transparent 70%)"
+          aria-hidden="true"
+        >
+        </div>
+        <CodeRunner client:load id="home-hero" code={HERO_CODE} label="Try it now" minHeight={230} />
+      </div>
+    </div>
+  </section>
+
+  <!-- Pillars -->
+  <section class="mx-auto w-full max-w-7xl px-5 py-4">
+    <div class="grid gap-4 sm:grid-cols-3">
+      {
+        PILLARS.map((pillar) => (
+          <div class="card p-5">
+            <h3 class="text-[15px] font-semibold" style="color: var(--text)">
+              {pillar.title}
+            </h3>
+            <p class="mt-2 text-[14px] leading-relaxed" style="color: var(--text-muted)">
+              {pillar.body}
+            </p>
+          </div>
+        ))
+      }
+    </div>
+  </section>
+
+  <!-- Module grid -->
+  <section class="mx-auto w-full max-w-7xl px-5 py-20">
+    <div class="mb-8 flex flex-wrap items-end gap-4">
+      <div>
+        <h2 class="text-2xl font-bold sm:text-3xl">The path</h2>
+        <p class="mt-2 max-w-2xl" style="color: var(--text-muted)">
+          Each module assumes only what came before it. Take them in order, or jump to the one you need.
+        </p>
+      </div>
+      <a href={withBase("/curriculum")} class="ml-auto text-sm font-medium hover:underline" style="color: var(--accent)">
+        Full lesson list →
+      </a>
+    </div>
+
+    <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+      {
+        MODULES.map((module, index) => {
+          const Icon = MODULE_ICONS[module.icon as keyof typeof MODULE_ICONS];
+          const moduleLessons = grouped.get(module.slug) ?? [];
+          const live = moduleLessons.length > 0;
+          const target = live ? lessonHref(moduleLessons[0]!.id) : withBase(`/curriculum#${module.slug}`);
+          return (
+            <a
+              href={target}
+              class="card hover-card relative flex flex-col p-5 transition-all duration-200 hover:-translate-y-0.5"
+              style={`border-color: ${live ? "color-mix(in oklab, var(--accent) 30%, var(--border))" : "var(--border)"}`}
+            >
+              <div class="mb-3 flex items-center justify-between">
+                <span
+                  class="grid h-9 w-9 place-items-center rounded-lg"
+                  style={`background: ${live ? "color-mix(in oklab, var(--accent) 15%, transparent)" : "var(--bg-sunken)"}; color: ${live ? "var(--accent)" : "var(--text-faint)"}`}
+                >
+                  <Icon width={17} height={17} />
+                </span>
+                <span class="text-[11px] font-mono" style="color: var(--text-faint)">
+                  {String(index + 1).padStart(2, "0")}
+                </span>
+              </div>
+
+              <h3 class="text-[15px] font-semibold" style="color: var(--text)">
+                {module.title}
+              </h3>
+              <p class="mt-1.5 flex-1 text-[13.5px] leading-relaxed" style="color: var(--text-muted)">
+                {module.tagline}
+              </p>
+
+              <p class="mt-4 flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide" style="color: var(--text-faint)">
+                {live ? (
+                  <>
+                    <Check width={12} height={12} /> {moduleLessons.length} lessons ready
+                  </>
+                ) : (
+                  <>
+                    <Lock width={11} height={11} /> {(module.plannedLessons ?? []).length} lessons planned
+                  </>
+                )}
+                <span class="ml-auto" style="color: var(--text-faint)">
+                  {LEVELS[module.level].label}
+                </span>
+              </p>
+            </a>
+          );
+        })
+      }
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="mx-auto w-full max-w-7xl px-5 pb-8">
+    <div
+      class="relative overflow-hidden rounded-[22px] border p-8 sm:p-12"
+      style="border-color: var(--border); background: linear-gradient(120deg, color-mix(in oklab, var(--accent) 12%, var(--bg-elevated)), var(--bg-elevated) 60%)"
+    >
+      <h2 class="max-w-xl text-2xl font-bold sm:text-3xl">Open a blank editor and just try something.</h2>
+      <p class="mt-3 max-w-xl" style="color: var(--text-muted)">
+        The playground gives you a full Python environment with NumPy, pandas, matplotlib and
+        scikit-learn one import away — all running locally in this tab.
+      </p>
+      <div class="mt-6 flex flex-wrap gap-3">
+        <a
+          href={withBase("/playground")}
+          class="inline-flex items-center gap-2 rounded-xl px-5 py-3 text-[15px] font-semibold"
+          style="background: var(--accent); color: var(--accent-contrast)"
+        >
+          Open the playground <ChevronRight width={16} height={16} />
+        </a>
+        <a
+          href={SITE.repo}
+          class="inline-flex items-center gap-2 rounded-xl border px-5 py-3 text-[15px] font-semibold"
+          style="border-color: var(--border-strong); color: var(--text)"
+          rel="noopener noreferrer"
+          target="_blank"
+        >
+          Star on GitHub
+        </a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>
