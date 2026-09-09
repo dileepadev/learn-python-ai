@@ -1,0 +1,31 @@
+---
+import CodeRunner from "../CodeRunner.tsx";
+
+interface Props {
+  id: string;
+  /** Starter code the learner edits. */
+  code: string;
+  /** Python that raises AssertionError when the answer is wrong. */
+  tests: string;
+  solution?: string;
+  hint?: string;
+  title?: string;
+  /** The task, in one or two sentences. */
+  brief?: string;
+}
+
+const { id, title = "Exercise", brief, ...rest } = Astro.props;
+---
+
+<section class="my-8" data-exercise={id}>
+  <div class="mb-2 flex items-baseline gap-2">
+    <span
+      class="rounded-md px-2 py-0.5 text-[11px] font-bold uppercase tracking-wide"
+      style="background: color-mix(in oklab, var(--accent) 16%, transparent); color: var(--accent)"
+    >
+      {title}
+    </span>
+  </div>
+  {brief && <p class="mb-1 text-[15px]" style="color: var(--text-muted)" set:html={brief} />}
+  <CodeRunner client:visible id={id} exercise {...rest} />
+</section>

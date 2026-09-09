@@ -1,0 +1,15 @@
+---
+import CodeRunner from "../CodeRunner.tsx";
+
+interface Props {
+  id: string;
+  code: string;
+  stdin?: string;
+  label?: string;
+  editable?: boolean;
+}
+
+const { id, ...rest } = Astro.props;
+---
+
+<CodeRunner client:visible id={id} {...rest} />
