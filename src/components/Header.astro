@@ -1,0 +1,55 @@
+---
+import { SITE, withBase } from "../lib/paths";
+import ThemeToggle from "./ThemeToggle.astro";
+import { Github } from "./icons";
+
+const path = Astro.url.pathname.replace(/\/$/, "");
+const links = [
+  { href: withBase("/curriculum"), label: "Curriculum" },
+  { href: withBase("/learn/foundations/hello-world"), label: "Start learning", match: "/learn" },
+  { href: withBase("/playground"), label: "Playground" },
+];
+const isActive = (link: (typeof links)[number]) =>
+  path.includes(link.match ?? link.href.replace(withBase(""), ""));
+---
+
+<header
+  class="sticky top-0 z-40 border-b backdrop-blur-xl"
+  style="background: color-mix(in oklab, var(--bg) 78%, transparent); border-color: var(--border)"
+>
+  <div class="mx-auto flex h-14 w-full max-w-7xl items-center gap-3 px-5">
+    <a href={withBase("/")} class="flex items-center gap-2.5 font-semibold tracking-tight">
+      <span
+        class="grid h-7 w-7 place-items-center rounded-lg text-[13px] font-bold"
+        style="background: linear-gradient(135deg, var(--accent), var(--color-cyan-accent)); color: #06060b"
+        aria-hidden="true">Py</span
+      >
+      <span class="hidden sm:inline">{SITE.title}</span>
+    </a>
+
+    <nav class="ml-auto flex items-center gap-1 text-sm">
+      {
+        links.map((link) => (
+          <a
+            href={link.href}
+            class="hover-nav rounded-lg px-2.5 py-1.5 font-medium transition-colors"
+            style={`color: ${isActive(link) ? "var(--text)" : "var(--text-muted)"}; background: ${isActive(link) ? "var(--bg-sunken)" : "transparent"}`}
+          >
+            {link.label}
+          </a>
+        ))
+      }
+      <a
+        href={SITE.repo}
+        target="_blank"
+        rel="noopener noreferrer"
+        class="ml-1 rounded-lg p-2 transition-colors"
+        style="color: var(--text-muted)"
+        aria-label="View this course on GitHub"
+      >
+        <Github width={17} height={17} />
+      </a>
+      <ThemeToggle />
+    </nav>
+  </div>
+</header>
