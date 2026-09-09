@@ -1,0 +1,239 @@
+---
+title: Sets and tuples
+description: Two collections with sharp edges — sets for uniqueness and fast membership, tuples for values that must not change.
+module: foundations
+order: 7
+level: beginner
+minutes: 12
+objectives:
+  - Use sets to deduplicate and to test membership quickly
+  - Apply set algebra — union, intersection, difference
+  - Use tuples for fixed records and multiple return values
+  - Choose the right collection for a job
+---
+
+You have met lists and dictionaries. Two more collections round out the set, each solving a
+problem the others handle badly.
+
+## Sets: unique, unordered
+
+A set holds each value at most once and does not remember an order.
+
+<Run id="f-set-1" code={`unique = {1, 2, 3, 4, 5}
+print(unique, type(unique))
+
+with_duplicates = {1, 2, 2, 3, 4, 4, 5}
+print(with_duplicates)     # duplicates silently collapse
+
+# The most common use by far: deduplicating a list.
+tags = ["nlp", "vision", "nlp", "rag", "vision", "nlp"]
+print(set(tags))
+print(sorted(set(tags)))   # back to a predictable order`} />
+
+<Callout type="warning">
+`{}` creates an empty *dictionary*, not an empty set. For an empty set you must write
+`set()`.
+</Callout>
+
+### Membership is fast
+
+Checking `x in collection` on a list scans every item. On a set it is effectively instant,
+however large the set.
+
+<Run id="f-set-2" code={`import time
+
+big_list = list(range(200_000))
+big_set = set(big_list)
+needle = 199_999
+
+start = time.perf_counter()
+needle in big_list
+list_time = time.perf_counter() - start
+
+start = time.perf_counter()
+needle in big_set
+set_time = time.perf_counter() - start
+
+print(f"list: {list_time * 1e6:8.1f} microseconds")
+print(f"set:  {set_time * 1e6:8.1f} microseconds")`} />
+
+<Callout type="ai">
+Deduplicating documents before embedding them, or checking whether an id has already been
+processed, is a set operation. Doing it with a list turns an O(n) job into an O(n²) one — the
+kind of mistake that only shows up once the dataset gets big.
+</Callout>
+
+### Changing a set
+
+<Run id="f-set-3" code={`s = {1, 2, 3, 4, 5}
+
+s.add(6)
+print(s)
+
+s.discard(2)     # remove if present, no error if not
+s.remove(3)      # raises KeyError if absent
+print(s)
+
+print(3 in s, 4 in s)`} />
+
+Sets are unordered, so there is no indexing and no `.sort()`. Convert to a list when you need
+an order:
+
+<Run id="f-set-4" code={`s = {5, 3, 1, 4, 6}
+print(sorted(s))
+
+# s[0] would raise a TypeError — sets are not subscriptable.`} />
+
+### Set algebra
+
+This is where sets stop being "a list without duplicates" and start being genuinely useful.
+
+<Run id="f-set-5" code={`train_ids = {"a", "b", "c", "d", "e"}
+test_ids = {"d", "e", "f", "g"}
+
+print("union       ", sorted(train_ids | test_ids))   # everything
+print("intersection", sorted(train_ids & test_ids))   # in both
+print("difference  ", sorted(train_ids - test_ids))   # in train only
+print("symmetric   ", sorted(train_ids ^ test_ids))   # in one but not both
+
+leak = train_ids & test_ids
+if leak:
+    print(f"\\nWARNING: {len(leak)} ids leaked across the split: {sorted(leak)}")`} />
+
+That last check — intersecting your train and test ids — is a real data-leakage test you
+should run on every dataset you split.
+
+## Tuples: fixed, ordered
+
+A tuple is an ordered sequence like a list, but it cannot be changed after it is created.
+
+<Run id="f-tuple-1" code={`point = (1, 2, 3, 4, 5)
+
+print(point, type(point))
+print(point[0], point[-1])
+print(len(point))
+print(point[1:3])          # slicing works the same as lists
+
+point[0] = 10              # but assignment does not`} />
+
+Duplicates are fine — a tuple is a sequence, not a set:
+
+<Run id="f-tuple-2" code={`values = (1, 2, 2, 3, 4, 4, 5)
+print(values)
+print(values.count(4), values.index(3))`} />
+
+### Working around immutability
+
+You do not modify a tuple; you build a new one.
+
+<Run id="f-tuple-3" code={`original = (1, 2, 3)
+
+extended = original + (4, 5)
+print(extended)
+
+without_three = tuple(x for x in extended if x != 3)
+print(without_three)
+
+ordered = tuple(sorted((5, 3, 1, 4, 2)))
+print(ordered)`} />
+
+### Why tuples exist
+
+**Unpacking.** Assign several names at once:
+
+<Run id="f-tuple-4" code={`point = (3, 7)
+x, y = point
+print(x, y)
+
+# Swapping without a temporary variable:
+a, b = 1, 2
+a, b = b, a
+print(a, b)
+
+# The star catches the rest:
+first, *middle, last = [1, 2, 3, 4, 5]
+print(first, middle, last)`} />
+
+**Multiple return values.** A function returning a tuple looks like it returns several things:
+
+<Run id="f-tuple-5" code={`def split_ratio(total, ratio=0.8):
+    train = int(total * ratio)
+    return train, total - train
+
+n_train, n_test = split_ratio(1000)
+print(f"train: {n_train}, test: {n_test}")`} />
+
+**Dictionary keys.** Because a tuple cannot change, it can be hashed — so it can be a key.
+A list cannot.
+
+<Run id="f-tuple-6" code={`grid = {(0, 0): "origin", (1, 2): "somewhere"}
+print(grid[(1, 2)])
+
+broken = {[0, 0]: "nope"}   # lists are unhashable`} />
+
+## Choosing between them
+
+| Need | Use |
+| --- | --- |
+| An ordered collection you will change | `list` |
+| A fixed record, or several return values | `tuple` |
+| Uniqueness, or fast membership tests | `set` |
+| Lookup by a meaningful key | `dict` |
+
+## Try it yourself
+
+<Exercise
+  id="f-set-ex1"
+  title="Exercise 1"
+  brief="Print the number of document ids that appear in <em>both</em> splits, as <code>overlap: N</code>."
+  code={`train = ["d1", "d2", "d3", "d4", "d5", "d2"]
+test = ["d4", "d5", "d6", "d7"]
+
+# How many distinct ids appear in both lists?
+`}
+  hint="Turn each into a set, intersect them with &, then take the length."
+  solution={`train = ["d1", "d2", "d3", "d4", "d5", "d2"]
+test = ["d4", "d5", "d6", "d7"]
+
+overlap = set(train) & set(test)
+print(f"overlap: {len(overlap)}")`}
+  tests={`assert _lines == ["overlap: 2"], (
+    f"Expected the line 'overlap: 2', got: {_lines}"
+)`}
+/>
+
+<Exercise
+  id="f-tuple-ex1"
+  title="Exercise 2"
+  brief="Unpack <code>record</code> into <code>name</code>, <code>score</code> and <code>latency</code> in one statement."
+  code={`record = ("tuned-v2", 0.884, 47)
+
+# One line, three names.
+`}
+  hint="name, score, latency = record"
+  solution={`record = ("tuned-v2", 0.884, 47)
+
+name, score, latency = record
+print(name, score, latency)`}
+  tests={`assert name == "tuned-v2", f"name should be 'tuned-v2', got {name!r}."
+assert score == 0.884, f"score should be 0.884, got {score!r}."
+assert latency == 47, f"latency should be 47, got {latency!r}."`}
+/>
+
+<Quiz
+  question="Which of these can be used as a dictionary key?"
+  choices={[
+    { text: "[1, 2]", why: "Lists are mutable and therefore unhashable — this raises a TypeError." },
+    { text: "(1, 2)", correct: true, why: "Tuples are immutable, so they hash, so they work as keys." },
+    { text: "{1, 2}", why: "A set is mutable and unhashable. (A frozenset would work.)" },
+    { text: "{'a': 1}", why: "Dictionaries are mutable and cannot be keys either." },
+  ]}
+/>
+
+## Recap
+
+- Sets hold unique values, have no order, and test membership in constant time.
+- `|`, `&`, `-` and `^` give you union, intersection, difference and symmetric difference.
+- `{}` is an empty dict; use `set()` for an empty set.
+- Tuples are immutable sequences — ideal for fixed records, unpacking and dictionary keys.
+- Unpacking (`a, b = pair`) is how Python functions return more than one value.

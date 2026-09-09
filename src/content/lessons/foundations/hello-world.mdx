@@ -1,0 +1,122 @@
+---
+title: Your first program
+description: Run real Python in your browser, understand what print actually does, and meet the error message you will see most often.
+module: foundations
+order: 1
+level: beginner
+minutes: 8
+objectives:
+  - Run a Python program and read its output
+  - Understand the difference between an expression and a statement
+  - Read a SyntaxError and fix it
+---
+
+Python runs your file one line at a time, top to bottom. There is no build step and no
+`main` function to declare — the first line is where execution starts.
+
+Here is a complete Python program. Press **Run** (or `Ctrl`/`Cmd` + `Enter`).
+
+<Run id="f-hello-1" code={`print("Hello, World!")`} />
+
+<Callout type="note" title="What just happened">
+The first time you run something, the page downloads a real CPython interpreter compiled to
+WebAssembly — about 10 MB, cached afterwards. Everything runs inside your browser tab. Your
+code never leaves your machine.
+</Callout>
+
+## `print` is a function call
+
+`print` is a **function**, and `print("Hello, World!")` is a **call**. The parentheses mean
+"run this now", and the thing between them is the **argument** you're passing in.
+
+`print` takes as many arguments as you like and separates them with a space:
+
+<Run id="f-hello-2" code={`print("Hello,", "World!")
+print("Python", 3, 14, True)
+print()
+print("An empty print() gives you a blank line.")`} />
+
+Notice you can pass numbers and `True` alongside text — `print` converts whatever it's given
+into something readable. That's a convenience of `print` specifically, not a rule of the
+language, as you'll see in the next lesson.
+
+## Statements run in order
+
+Each line here is a **statement** — an instruction. Python runs them strictly top to bottom.
+
+<Run id="f-hello-3" code={`print("first")
+print("second")
+print("third")`} />
+
+Reorder those lines and run it again. The output order follows the source order exactly. This
+sounds obvious, but it is the single most useful debugging tool you have: when something goes
+wrong, add a `print` and find out how far execution actually got.
+
+## Your first error
+
+Python is strict about syntax. Leave off a closing parenthesis and it refuses to run *any* of
+the file — not even the lines before the mistake.
+
+<Run id="f-hello-4" code={`print("this line is fine")
+print("this one is missing something"`} />
+
+Read the error from the bottom up. The last line names the problem —
+`SyntaxError: '(' was never closed` — and the lines above point at where Python gave up.
+
+<Callout type="tip">
+A `SyntaxError` means Python could not even parse your file. Any other error type means your
+code parsed fine and then something went wrong while running. That distinction narrows down
+what to look for enormously.
+</Callout>
+
+Fix the code above by adding the missing `)` and run it again.
+
+## Comments
+
+A `#` makes Python ignore the rest of the line. Comments are for the human reading the code —
+usually you, in three months.
+
+<Run id="f-hello-5" code={`# This whole line is ignored.
+print("But this runs.")  # So is everything after the # here.
+
+# print("This is 'commented out' — a quick way to disable a line.")`} />
+
+<Callout type="ai" title="Why this matters for AI">
+Almost every AI script you write will be dominated by `print` and comments during development.
+When a model returns something unexpected, printing the raw response before you parse it is
+what turns "it doesn't work" into a specific, fixable problem.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="f-hello-ex1"
+  title="Exercise 1"
+  brief="Print exactly three lines: <code>ready</code>, <code>set</code>, then <code>go</code>."
+  code={`# Print "ready", then "set", then "go" — one per line.
+`}
+  hint="Three separate print calls, in that order."
+  solution={`print("ready")
+print("set")
+print("go")`}
+  tests={`assert _lines == ["ready", "set", "go"], (
+    f"Expected the three lines ready/set/go, but got: {_lines}"
+)`}
+/>
+
+<Quiz
+  question="Which of these prints a blank line?"
+  choices={[
+    { text: 'print(" ")', why: "This prints a single space character, which is not the same as an empty line." },
+    { text: "print()", correct: true, why: "With no arguments, print outputs nothing followed by a newline — a blank line." },
+    { text: "print", why: "Without parentheses this doesn't call the function at all; it just refers to it." },
+    { text: 'print("\\n\\n")', why: "This prints two newlines plus print's own newline — three blank lines, not one." },
+  ]}
+/>
+
+## Recap
+
+- Python executes statements top to bottom, starting at line 1.
+- `print(...)` is a function call; the parentheses are what makes it run.
+- `#` starts a comment, which Python ignores entirely.
+- A `SyntaxError` stops the whole file from running — fix it before anything else.

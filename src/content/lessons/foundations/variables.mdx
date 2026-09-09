@@ -1,0 +1,208 @@
+---
+title: Variables and types
+description: Bind names to values, learn the five types you will use constantly, and see why Python cares about the difference between "28" and 28.
+module: foundations
+order: 2
+level: beginner
+minutes: 12
+objectives:
+  - Assign values to names and reuse them
+  - Recognise str, int, float, bool and None
+  - Convert between types deliberately, and know when Python refuses to guess
+---
+
+A **variable** is a name pointing at a value. You create one with `=`, which does not mean
+"equals" here — it means "make this name refer to this value".
+
+<Run id="f-var-1" code={`message = "Hello, World!"
+print(message)
+
+message = "Changed my mind."
+print(message)`} />
+
+The name on the left, the value on the right. Reassigning just re-points the name; nothing is
+"overwritten" in place.
+
+<Callout type="tip">
+Names should say what the value *means*, not what type it is. `user_count` beats `n`, and
+`temperature_celsius` beats `temp`. Python convention is `lower_snake_case`.
+</Callout>
+
+## The types you will use every day
+
+### Text — `str`
+
+Single and double quotes are interchangeable. Pick whichever avoids escaping.
+
+<Run id="f-var-2" code={`first_name = "Dileepa"
+last_name = 'Bandara'
+
+# Quotes inside quotes: use the other kind.
+job_title = "Dileepa's job is Developer"
+address = 'He said "123 Main St"'
+
+print(first_name, last_name)
+print(job_title)
+print(address)`} />
+
+Triple quotes hold text that spans lines, newlines and all:
+
+<Run id="f-var-3" code={`bio = """Dileepa is a software developer.
+He loves coding and learning new technologies."""
+
+print(bio)`} />
+
+### Whole numbers — `int`, and decimals — `float`
+
+<Run id="f-var-4" code={`age = 28                       # int
+commits_per_day = 5.5          # float
+
+print(age, commits_per_day)
+print(age + 1, commits_per_day * 2)`} />
+
+An `int` is a whole number of unlimited size. A `float` is a decimal, and it is *approximate* —
+this trips up everyone once:
+
+<Run id="f-var-5" code={`print(0.1 + 0.2)
+print(0.1 + 0.2 == 0.3)`} />
+
+That is not a Python bug. Floats are binary fractions, and `0.1` has no exact binary
+representation, exactly as `1/3` has no exact decimal one. Compare floats with a tolerance
+rather than `==`.
+
+<Callout type="ai">
+This is why model evaluation code compares scores with something like
+`abs(a - b) < 1e-9` instead of `a == b`, and why two runs that "should" be identical can
+differ in the twelfth decimal place.
+</Callout>
+
+### True or false — `bool`
+
+<Run id="f-var-6" code={`is_developer = True
+experienced = False
+
+print(is_developer, experienced)
+print(is_developer and experienced)
+print(True + True)  # bools really are ints underneath`} />
+
+### Nothing at all — `None`
+
+`None` is Python's way of saying "no value here". It is not `0`, and it is not `""`.
+
+<Run id="f-var-7" code={`middle_name = None
+print(middle_name)
+print(middle_name is None)`} />
+
+You will meet `None` constantly: it is what a function returns when it returns nothing, and
+what an optional field holds when it wasn't provided.
+
+## Checking a type
+
+`type()` tells you what you actually have — invaluable when a value came from somewhere you
+don't control.
+
+<Run id="f-var-8" code={`message = "Hello"
+age = 28
+score = 5.5
+active = True
+nothing = None
+
+for value in (message, age, score, active, nothing):
+    print(f"{str(value):<8} -> {type(value).__name__}")`} />
+
+## Python will not guess for you
+
+Many languages quietly convert a number to text when you add it to a string. Python refuses:
+
+<Run id="f-var-9" code={`age = 28
+print("I am " + age + " years old")`} />
+
+`TypeError: can only concatenate str (not "int") to str`. The fix is to convert explicitly:
+
+<Run id="f-var-10" code={`age = 28
+
+print("I am " + str(age) + " years old")   # explicit conversion
+print("I am", age, "years old")            # print separates with spaces
+print(f"I am {age} years old")             # f-string — prefer this`} />
+
+The `f` before the quote makes it an **f-string**: anything inside `{}` is evaluated as Python
+and inserted. It is the clearest of the three and the one you should reach for by default.
+
+Conversion works in both directions, and fails loudly when it can't:
+
+<Run id="f-var-11" code={`print(int("42") + 1)
+print(float("3.14") * 2)
+print(str(99) + "!")
+print(int(9.99))        # truncates toward zero, does not round
+
+print(int("forty-two"))  # this one raises`} />
+
+<Callout type="ai" title="Why this matters for AI">
+Every value that arrives from an API, a CSV or a form starts life as a string. A model that
+"returns 0.92" actually returned the four characters <code>0.92</code>. Forgetting
+<code>float(...)</code> is one of the most common bugs in data pipelines — and it usually
+shows up as a wrong answer, not a crash.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="f-var-ex1"
+  title="Exercise 1"
+  brief="Given a name and a score as strings, print exactly: <code>Ada scored 92%</code>. The score must be rounded to a whole number from the string value."
+  code={`name = "Ada"
+raw_score = "0.9231"
+
+# Convert raw_score to a number, turn it into a whole percentage,
+# and print the sentence using an f-string.
+`}
+  hint="float(raw_score) gives you 0.9231. Multiply by 100 and pass it to round()."
+  solution={`name = "Ada"
+raw_score = "0.9231"
+
+score = round(float(raw_score) * 100)
+print(f"{name} scored {score}%")`}
+  tests={`assert _lines == ["Ada scored 92%"], (
+    f"Expected exactly one line 'Ada scored 92%', got: {_lines}"
+)`}
+/>
+
+<Exercise
+  id="f-var-ex2"
+  title="Exercise 2"
+  brief="Create a variable <code>total</code> holding the sum of the three values below, as a float."
+  code={`a = "10"
+b = 2.5
+c = True
+
+# Bind 'total' to a + b + c, converting where Python needs you to.
+`}
+  hint="Only 'a' needs converting. True counts as 1."
+  solution={`a = "10"
+b = 2.5
+c = True
+
+total = float(a) + b + c
+print(total)`}
+  tests={`assert "total" in dir() or "total" in globals(), "You need to create a variable called 'total'."
+assert isinstance(total, float), f"'total' should be a float, but it is a {type(total).__name__}."
+assert abs(total - 13.5) < 1e-9, f"Expected total to be 13.5, got {total}."`}
+/>
+
+<Quiz
+  question="What does type(3.0) report?"
+  choices={[
+    { text: "<class 'int'>", why: "The .0 makes it a float, even though the value is a whole number." },
+    { text: "<class 'float'>", correct: true, why: "Any literal with a decimal point is a float, regardless of the digits after it." },
+    { text: "<class 'number'>", why: "Python has no generic 'number' type for literals like this." },
+    { text: "It raises a TypeError", why: "3.0 is a perfectly valid float literal." },
+  ]}
+/>
+
+## Recap
+
+- `=` binds a name to a value; rebinding just re-points the name.
+- The core types are `str`, `int`, `float`, `bool` and `None`.
+- Floats are approximate — never compare them with `==`.
+- Python never converts types silently. Use `int()`, `float()`, `str()` yourself.
+- f-strings (`f"{value}"`) are the clearest way to build text from values.

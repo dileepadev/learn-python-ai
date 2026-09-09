@@ -1,0 +1,215 @@
+---
+title: Working with text
+description: Index, slice and transform strings — the type that carries every prompt, response and log line you will ever write.
+module: foundations
+order: 3
+level: beginner
+minutes: 14
+objectives:
+  - Index and slice strings, including negative indices
+  - Use the string methods that come up constantly
+  - Format values into text with f-strings
+  - Understand why strings are immutable
+---
+
+Text is where almost every AI program starts and ends. A prompt is a string, a model's response
+is a string, and everything logged in between is a string. It pays to be fluent here.
+
+## Strings are sequences
+
+A string is an ordered sequence of characters, numbered from zero.
+
+<Run id="f-str-1" code={`word = "Python"
+
+print(word[0])   # first
+print(word[1])
+print(word[-1])  # last
+print(word[-2])  # second from last
+print(len(word))`} />
+
+Negative indices count from the right, so `word[-1]` is always the last character no matter how
+long the string is.
+
+### Slicing
+
+`s[start:stop]` gives you everything from `start` up to *but not including* `stop`.
+
+<Run id="f-str-2" code={`text = "machine learning"
+
+print(text[0:7])    # start at 0, stop before 7
+print(text[:7])     # omit start -> from the beginning
+print(text[8:])     # omit stop  -> to the end
+print(text[-8:])    # last eight characters
+print(text[::2])    # every second character
+print(text[::-1])   # reversed`} />
+
+That "up to but not including" rule looks fussy until you notice it makes
+`text[:n]` and `text[n:]` fit together perfectly with no overlap and no gap.
+
+<Callout type="tip">
+`s[::-1]` reversing a string is a classic interview answer, but the real value of the third
+slice argument is the *step*. `data[::100]` gives you every hundredth item — a quick way to
+eyeball a large sequence.
+</Callout>
+
+## Strings never change
+
+Every string operation returns a *new* string. The original is untouched.
+
+<Run id="f-str-3" code={`greeting = "hello"
+
+shouted = greeting.upper()
+
+print(greeting)  # unchanged
+print(shouted)   # the new string
+
+greeting[0] = "H"  # this is not allowed`} />
+
+This is what **immutable** means, and it is why `text.strip()` on its own does nothing useful —
+you have to keep the result:
+
+<Run id="f-str-4" code={`messy = "   spaces everywhere   "
+
+messy.strip()            # result thrown away
+print(repr(messy))
+
+cleaned = messy.strip()  # result kept
+print(repr(cleaned))`} />
+
+<Callout type="tip">
+`repr()` shows you the string the way Python would write it — quotes, escapes and all. When
+whitespace or an invisible character is the suspect, `print(repr(x))` tells you far more than
+`print(x)`.
+</Callout>
+
+## The methods you will actually use
+
+<Run id="f-str-5" code={`s = "  Hello, World!  "
+
+print(repr(s.strip()))        # trim both ends
+print(s.strip().upper())
+print(s.strip().lower())
+print(s.strip().title())
+print(s.replace("World", "Python").strip())
+print(s.strip().startswith("Hello"))
+print(s.strip().endswith("!"))
+print(s.strip().find("World"))  # index, or -1 if absent
+print("World" in s)             # usually what you want instead of find`} />
+
+### Splitting and joining
+
+These two are the workhorses of text processing.
+
+<Run id="f-str-6" code={`line = "gpt-4,0.91,142ms"
+
+parts = line.split(",")
+print(parts)
+
+print(" | ".join(parts))
+print("\\n".join(parts))
+
+# split() with no argument splits on any run of whitespace
+sentence = "the   quick\\tbrown  fox"
+print(sentence.split())`} />
+
+Note the direction: `separator.join(list_of_strings)`. It reads backwards the first few times,
+but it is the separator that knows how to stitch things together.
+
+## f-strings, properly
+
+An f-string evaluates whatever you put inside `{}`.
+
+<Run id="f-str-7" code={`model = "claude"
+accuracy = 0.9187
+tokens = 14320
+
+print(f"{model} reached {accuracy} accuracy")
+
+# Format specs go after a colon.
+print(f"{accuracy:.2f}")     # 2 decimal places
+print(f"{accuracy:.1%}")     # as a percentage
+print(f"{tokens:,}")         # thousands separator
+print(f"{model:>12}|")       # right-align in 12 columns
+print(f"{model:<12}|")       # left-align
+print(f"{model:^12}|")       # centre
+
+# = prints the expression alongside its value — great for debugging.
+print(f"{accuracy * 100 = }")`} />
+
+<Callout type="ai" title="Why this matters for AI">
+Prompt construction is string formatting. An f-string with a clear layout — one variable per
+line, aligned — is the difference between a prompt you can debug and one you can't. And
+`f"{value = }"` is the fastest way to check what you are actually about to send.
+</Callout>
+
+## Multi-line text
+
+Triple quotes preserve newlines exactly, which makes them the natural home for prompts.
+
+<Run id="f-str-8" code={`prompt = """You are a helpful assistant.
+
+Answer in at most two sentences.
+Cite a source if you have one."""
+
+print(prompt)
+print("---")
+print(f"{len(prompt)} characters, {len(prompt.splitlines())} lines")`} />
+
+## Try it yourself
+
+<Exercise
+  id="f-str-ex1"
+  title="Exercise 1"
+  brief="Print the domain from the email address — just <code>example.com</code>, nothing else."
+  code={`email = "ada.lovelace@example.com"
+
+# Print only the part after the @.
+`}
+  hint="split('@') gives you a two-item list. Take the last one — or slice from the index of '@' plus one."
+  solution={`email = "ada.lovelace@example.com"
+
+print(email.split("@")[1])`}
+  tests={`assert _lines == ["example.com"], (
+    f"Expected a single line 'example.com', got: {_lines}"
+)`}
+/>
+
+<Exercise
+  id="f-str-ex2"
+  title="Exercise 2"
+  brief="Build <code>headline</code> so it reads exactly <code>tuned-v2 scored 88.4% on 1,250 samples</code>."
+  code={`model = "tuned-v2"
+score = 0.884
+samples = 1250
+
+# Use one f-string with format specs — no manual rounding or comma inserting.
+headline = ""
+print(headline)`}
+  hint="{score:.1%} gives '88.4%'. {samples:,} gives '1,250'."
+  solution={`model = "tuned-v2"
+score = 0.884
+samples = 1250
+
+headline = f"{model} scored {score:.1%} on {samples:,} samples"
+print(headline)`}
+  tests={`expected = "tuned-v2 scored 88.4% on 1,250 samples"
+assert headline == expected, f"Expected headline to be {expected!r}, got {headline!r}."`}
+/>
+
+<Quiz
+  question='What does "abcdef"[1:4] produce?'
+  choices={[
+    { text: '"abcd"', why: "Slicing starts at the start index, so index 0 is excluded." },
+    { text: '"bcde"', why: "The stop index is exclusive — index 4 is not included." },
+    { text: '"bcd"', correct: true, why: "Indices 1, 2 and 3 — start inclusive, stop exclusive." },
+    { text: '"bcdef"', why: "That would be [1:] with no stop index." },
+  ]}
+/>
+
+## Recap
+
+- Strings are zero-indexed sequences; negative indices count from the end.
+- `s[start:stop:step]` slices — start inclusive, stop exclusive.
+- Strings are immutable: every method returns a new string, so keep the result.
+- `split` and `join` are the pair you will use most.
+- f-strings with format specs (`:.2f`, `:%`, `:,`, `:>10`) do your formatting for you.
