@@ -52,6 +52,7 @@ Thank you for your interest in contributing to [learn-python-ai](https://github.
 - Keep your pull request focused and avoid unrelated changes.
 - Refer to the following templates and guidelines before submitting your changes:
   - [learn-python-ai/](./) - Root directory of the repository
+    - [AGENT.md](./AGENT.md) - Single source of truth for AI coding agents; every tool-specific config file points here
     - [.github/](./.github) - GitHub-specific files (workflows, templates, etc.)
       - [ISSUE_TEMPLATE/](./.github/ISSUE_TEMPLATE) - Contains all issue templates
         - [bug_report.md](./.github/ISSUE_TEMPLATE/bug_report.md) - Template for reporting bugs

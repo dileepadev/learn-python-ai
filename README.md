@@ -140,6 +140,26 @@ Corrections, new lessons and better explanations are all welcome. Please read
 [branch naming](BRANCH_NAMING_GUIDELINES.md), [commit message](COMMIT_MESSAGE_GUIDELINES.md)
 and [pull request](PULL_REQUEST_GUIDELINES.md) guidelines.
 
+### Using an AI coding agent
+
+[**AGENT.md**](AGENT.md) is the single source of truth for how work is done in this repository —
+architecture, lesson authoring, the exercise-checking contract, conventions and constraints.
+Every tool-specific config file points at it, so Claude Code, Cursor, GitHub Copilot, Antigravity,
+Gemini CLI and Windsurf all read the same guidance:
+
+| File | Read by |
+| --- | --- |
+| `AGENT.md` | **Canonical** — Zed, Amp, and anything told to read it |
+| `AGENTS.md` | Cursor, Antigravity, Codex, Copilot coding agent, Jules |
+| `CLAUDE.md` | Claude Code |
+| `.github/copilot-instructions.md` | GitHub Copilot in VS Code and JetBrains |
+| `.cursor/rules/project.mdc` | Cursor |
+| `.agents/rules/project.md` | Google Antigravity |
+| `GEMINI.md` | Gemini CLI, Antigravity |
+| `.windsurf/rules/project.md` | Windsurf |
+
+Add new guidance to `AGENT.md` only — the pointers stay thin so they cannot drift.
+
 ## Licence
 
 [MIT](LICENSE).

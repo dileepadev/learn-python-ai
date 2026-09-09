@@ -32,6 +32,9 @@ Changes are organized into the following categories:
 - Module 01 — Python Foundations: nine lessons covering the first program, variables and types,
   text, operators, lists, dictionaries, sets and tuples, conditionals, and loops.
 - GitHub Actions workflows for Pages deployment and pull-request CI.
+- `AGENT.md` as the single source of truth for AI coding agents, with thin pointer files for
+  Claude Code, Cursor, GitHub Copilot, Google Antigravity, Gemini CLI and Windsurf so every tool
+  reads the same guidance.
 
 ### Changed
 
