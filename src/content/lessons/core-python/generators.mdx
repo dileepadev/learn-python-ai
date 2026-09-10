@@ -1,0 +1,345 @@
+---
+title: Iterators, generators and lazy pipelines
+description: The protocol behind every for loop, how yield turns a function into a resumable stream, and how to chain generators into a pipeline that never loads the whole corpus.
+module: core-python
+order: 3
+level: intermediate
+minutes: 18
+objectives:
+  - Explain the iterator protocol — iter, next and StopIteration
+  - Write generator functions with yield, and understand where they pause
+  - Chain generators into a pipeline that processes one item at a time
+  - Delegate to a sub-generator with yield from
+  - Use itertools for the patterns you would otherwise write badly
+---
+
+Every `for` loop in Python is built on one small protocol. Understanding it is what lets you
+write a streaming pipeline instead of a program that loads ten gigabytes and dies.
+
+## The iterator protocol
+
+`iter()` asks a collection for an iterator. `next()` pulls one item. When there are none left,
+`next()` raises `StopIteration`:
+
+<Run id="cp-gen-1" code={`models = ["opus", "sonnet", "haiku"]
+
+cursor = iter(models)
+print(next(cursor))
+print(next(cursor))
+print(next(cursor))
+
+try:
+    print(next(cursor))          # nothing left
+except StopIteration:
+    print("StopIteration: the iterator is exhausted")`} />
+
+A `for` loop is exactly that, with the exception handled for you:
+
+<Run id="cp-gen-2" code={`models = ["opus", "sonnet", "haiku"]
+
+cursor = iter(models)
+while True:
+    try:
+        model = next(cursor)
+    except StopIteration:
+        break
+    print(model)`} />
+
+`next()` takes a default, which turns "nothing left" from an exception into a value — handy for
+"the first match, if there is one":
+
+<Run id="cp-gen-3" code={`documents = [
+    {"id": "intro", "tokens": 412},
+    {"id": "setup", "tokens": 4300},
+    {"id": "api", "tokens": 980},
+]
+
+first_large = next((d for d in documents if d["tokens"] > 1000), None)
+print(first_large)
+
+first_huge = next((d for d in documents if d["tokens"] > 99999), None)
+print(first_huge)`} />
+
+That stops scanning the moment it finds one. Over a corpus of a million documents, that is the
+difference between milliseconds and minutes.
+
+## Generator functions
+
+A function containing `yield` is a **generator function**. Calling it runs none of the body — it
+hands back a generator object. The body advances only when something asks for the next item, and
+it pauses again at each `yield`:
+
+<Run id="cp-gen-4" code={`def countdown(n):
+    print("  (starting)")
+    while n > 0:
+        yield n
+        n -= 1
+    print("  (finished)")
+
+gen = countdown(3)
+print("called, but nothing has run yet:", gen)
+
+print("first: ", next(gen))
+print("second:", next(gen))
+print("rest:  ", list(gen))`} />
+
+Watch where the prints appear relative to the `next()` calls: the body genuinely stops at
+`yield` and resumes there, keeping its local variables alive in between.
+
+<Run id="cp-gen-5" code={`def trace():
+    print("  A")
+    yield 1
+    print("  B")
+    yield 2
+    print("  C")
+
+for value in trace():
+    print("got", value)`} />
+
+## Streaming, not collecting
+
+The point of a generator is that it never has to hold everything at once. Compare:
+
+<Run id="cp-gen-6" code={`def read_all(n):
+    """Builds the whole list before returning anything."""
+    lines = []
+    for i in range(n):
+        lines.append(f"line {i}")
+    return lines
+
+def stream(n):
+    """Hands over one line at a time."""
+    for i in range(n):
+        yield f"line {i}"
+
+print(read_all(3))
+print(stream(3))
+
+# Only three lines are ever built, out of a hundred thousand:
+from itertools import islice
+print(list(islice(stream(100_000), 3)))`} />
+
+<Callout type="ai" title="Why this matters for AI">
+A streamed model response *is* an iterator: the SDK hands you deltas as they arrive, and your
+code loops over them printing partial text. Everything upstream is the same shape — reading a
+JSONL corpus line by line, chunking documents, batching embedding requests. Write those stages
+as generators and the pipeline works on a file bigger than memory without a single change.
+</Callout>
+
+Here is what a streamed reply looks like, standing in for the real SDK:
+
+<Run id="cp-gen-7" code={`def stream_reply(text):
+    """Pretend to be a model streaming its answer back, a word at a time."""
+    for word in text.split():
+        yield word + " "
+
+collected = ""
+for delta in stream_reply("Generators let you handle a reply before it is finished."):
+    collected += delta
+    print(delta, end="")
+
+print()
+print()
+print("full reply:", repr(collected.strip()))
+print("length:    ", len(collected.strip()))`} />
+
+## Pipelines
+
+Because a generator consumes an iterable and produces one, generators chain. Each stage pulls
+one item from the stage before it:
+
+<Run id="cp-gen-8" code={`def read(lines):
+    for line in lines:
+        yield line.strip()
+
+def drop_blank(lines):
+    for line in lines:
+        if line:
+            yield line
+
+def tokenise(lines):
+    for line in lines:
+        yield line.lower().split()
+
+raw = ["  The first line  ", "", "A SECOND line ", "   ", "third"]
+
+pipeline = tokenise(drop_blank(read(raw)))
+print(pipeline)
+
+for tokens in pipeline:
+    print(tokens)`} />
+
+Nothing is computed until the `for` loop asks, and at any moment exactly one line is in flight.
+Add a stage, remove a stage, reorder them — the memory profile does not change.
+
+## `yield from`
+
+To hand over every item of another iterable, `yield from` says it in one line:
+
+<Run id="cp-gen-9" code={`def flatten(batches):
+    for batch in batches:
+        yield from batch          # instead of: for item in batch: yield item
+
+print(list(flatten([["a", "b"], ["c"], ["d", "e"]])))
+
+def with_header(rows):
+    yield "id,tokens"
+    yield from rows
+
+print(list(with_header(["a,412", "b,980"])))`} />
+
+## itertools
+
+The standard library already contains the pipeline stages you were about to write badly:
+
+<Run id="cp-gen-10" code={`from itertools import islice, chain, batched, count, takewhile
+
+numbers = range(1, 20)
+
+print("islice:   ", list(islice(numbers, 3)))          # first 3
+print("islice:   ", list(islice(numbers, 5, 9)))       # a window
+print("chain:    ", list(chain([1, 2], [3], [4, 5])))  # join iterables
+print("batched:  ", [list(b) for b in batched(numbers, 6)])
+print("takewhile:", list(takewhile(lambda n: n < 6, numbers)))
+
+# count() is infinite — which is fine, because islice stops it.
+print("count:    ", list(islice(count(start=10, step=5), 4)))`} />
+
+`batched` is the one you will reach for constantly: embedding and completion APIs take a limited
+number of inputs per request, and this is how you respect that limit.
+
+<Run id="cp-gen-11" code={`from itertools import batched
+
+documents = [f"doc-{n}" for n in range(11)]
+
+for index, group in enumerate(batched(documents, 4), start=1):
+    print(f"request {index}: {list(group)}")`} />
+
+<Callout type="warning">
+A generator is single-pass. `list(gen)` twice gives you the contents and then an empty list —
+and because that is silent rather than an error, it is a classic way to lose data in a pipeline.
+If you need two passes, materialise it once with `list()` and pass the list around.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="cp-gen-ex1"
+  title="Exercise 1"
+  brief="Write the generator <code>chunks(items, size)</code>, which yields lists of at most <code>size</code> items. Do not import itertools — build it with yield."
+  code={`def chunks(items, size):
+    # Yield lists of length 'size', with a shorter final list if the
+    # items do not divide evenly. Use yield, and do not build the
+    # whole result up front.
+    ...
+
+
+for group in chunks(["a", "b", "c", "d", "e"], 2):
+    print(group)`}
+  hint="Accumulate into a batch list; when len(batch) == size, yield it and start a fresh one. After the loop, yield whatever is left if it is not empty."
+  solution={`def chunks(items, size):
+    batch = []
+    for item in items:
+        batch.append(item)
+        if len(batch) == size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+for group in chunks(["a", "b", "c", "d", "e"], 2):
+    print(group)`}
+  tests={`import inspect
+
+assert inspect.isgeneratorfunction(chunks), (
+    "chunks should be a generator function — it needs a yield in its body."
+)
+
+assert [list(g) for g in chunks(["a", "b", "c", "d", "e"], 2)] == [["a", "b"], ["c", "d"], ["e"]], (
+    f"Got {[list(g) for g in chunks(['a', 'b', 'c', 'd', 'e'], 2)]!r} for five items in twos."
+)
+assert [list(g) for g in chunks([1, 2, 3, 4], 2)] == [[1, 2], [3, 4]], (
+    "An exact division should not produce a trailing empty batch."
+)
+assert list(chunks([], 3)) == [], "No items means no batches at all."
+assert [list(g) for g in chunks([1], 5)] == [[1]], (
+    "A single item in a batch of five should still be yielded."
+)
+
+# It must stay lazy: taking one batch from an endless source must not hang.
+def endless():
+    n = 0
+    while True:
+        yield n
+        n += 1
+
+first = next(chunks(endless(), 3))
+assert list(first) == [0, 1, 2], f"The first batch of an infinite source should be [0, 1, 2], got {list(first)!r}."`}
+/>
+
+<Exercise
+  id="cp-gen-ex2"
+  title="Exercise 2"
+  brief="Print the id of the first document over 1000 tokens as <code>first: ID</code>, stopping the scan as soon as it is found. Print <code>first: none</code> if there is no such document."
+  code={`documents = [
+    {"id": "intro", "tokens": 412},
+    {"id": "setup", "tokens": 4300},
+    {"id": "api", "tokens": 980},
+    {"id": "guide", "tokens": 2200},
+]
+
+# Use next() with a generator expression and a default.
+found = None
+
+print(f"first: {found}")`}
+  hint="next((d['id'] for d in documents if d['tokens'] > 1000), 'none')"
+  solution={`documents = [
+    {"id": "intro", "tokens": 412},
+    {"id": "setup", "tokens": 4300},
+    {"id": "api", "tokens": 980},
+    {"id": "guide", "tokens": 2200},
+]
+
+found = next((d["id"] for d in documents if d["tokens"] > 1000), "none")
+
+print(f"first: {found}")`}
+  tests={`assert _lines == ["first: setup"], (
+    f"Expected 'first: setup' — setup is the first document over 1000 tokens. Got: {_lines}."
+)
+
+# The same expression must fall back cleanly when nothing matches.
+empty = next((d["id"] for d in [] if d["tokens"] > 1000), "none")
+assert empty == "none", "With no matches, next() should return its default."`}
+/>
+
+<Quiz
+  question="def g(): print('hi'); yield 1 — what happens when you call g() and assign it to a variable?"
+  choices={[
+    { text: "It prints 'hi' and returns 1", why: "That is what a plain function would do. The presence of yield changes the call entirely." },
+    { text: "Nothing runs; you get a generator object", correct: true, why: "The body does not start until something calls next() on the generator — that is what makes it lazy." },
+    { text: "It raises StopIteration immediately", why: "StopIteration comes at the end of iteration, not at the call." },
+    { text: "It prints 'hi' and returns a generator", why: "Not even the first print runs — the function body is untouched until the first next()." },
+  ]}
+/>
+
+<Quiz
+  question="Why write tokenise(drop_blank(read(lines))) rather than three loops that build three lists?"
+  choices={[
+    { text: "It is faster in every case", why: "Throughput is broadly similar; the win is memory and time-to-first-item, not raw speed." },
+    { text: "Only one item is in memory at a time, so the input can be larger than RAM", correct: true, why: "Each stage pulls one item from the one before it, so nothing accumulates between stages." },
+    { text: "Generators parallelise across cores automatically", why: "They do not — a generator pipeline is entirely sequential and single-threaded." },
+    { text: "It avoids StopIteration", why: "StopIteration still ends each stage; the for loop just handles it for you either way." },
+  ]}
+/>
+
+## Recap
+
+- `iter()` gives an iterator, `next()` pulls from it, `StopIteration` ends it — and `for` wraps
+  all three. `next(gen, default)` turns the end into a value instead of an exception.
+- A function with `yield` is a generator function: calling it runs nothing, and the body pauses
+  and resumes at each `yield`.
+- Generators chain into pipelines where exactly one item is in flight, whatever the input size.
+- `yield from` delegates to another iterable.
+- `itertools` already has `islice`, `chain`, `batched`, `takewhile` and `count`.
+- Generators are single-pass, and re-reading one fails silently rather than loudly.

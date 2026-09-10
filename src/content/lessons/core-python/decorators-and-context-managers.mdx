@@ -1,0 +1,442 @@
+---
+title: Decorators and context managers
+description: Wrap a function without touching it, build decorators that take arguments, and write your own with-blocks so setup and cleanup always pair up.
+module: core-python
+order: 9
+level: intermediate
+minutes: 20
+objectives:
+  - Explain closures, and how a decorator is built from one
+  - Write decorators that preserve the wrapped function's identity
+  - Build decorators that take arguments
+  - Cache expensive calls with functools.cache
+  - Write context managers as classes and with @contextmanager
+---
+
+Decorators and context managers solve the same problem from two directions: code that has to run
+*around* something else. Retries, timing, caching and logging around a function; setup and
+cleanup around a block.
+
+## Closures
+
+A function defined inside another function remembers the variables it was created with, even
+after the outer call has returned:
+
+<Run id="cp-dec-1" code={`def make_prefixer(prefix):
+    def prefixed(text):
+        return f"{prefix}{text}"      # "prefix" outlives make_prefixer
+    return prefixed
+
+warn = make_prefixer("[warn] ")
+info = make_prefixer("[info] ")
+
+print(warn("rate limited"))
+print(info("cache hit"))
+print(warn.__closure__[0].cell_contents)`} />
+
+That is all a decorator is: a function that takes a function and returns a replacement.
+
+## A first decorator
+
+<Run id="cp-dec-2" code={`def announced(function):
+    def wrapper(*args, **kwargs):
+        print(f"  calling {function.__name__} with {args}")
+        result = function(*args, **kwargs)
+        print(f"  {function.__name__} returned {result!r}")
+        return result
+    return wrapper
+
+def embed(text):
+    return [len(text)] * 3
+
+embed = announced(embed)          # the long way round
+print(embed("hello"))`} />
+
+`@announced` above a `def` means exactly that reassignment:
+
+<Run id="cp-dec-3" code={`def announced(function):
+    def wrapper(*args, **kwargs):
+        print(f"  calling {function.__name__}")
+        return function(*args, **kwargs)
+    return wrapper
+
+@announced
+def embed(text):
+    return [len(text)] * 3
+
+print(embed("hello"))`} />
+
+`*args, **kwargs` in the wrapper is what makes a decorator work on any function, whatever its
+signature.
+
+## Keep the function's identity
+
+Replacing a function loses its name and docstring, which breaks documentation tools, tracebacks
+and anything that inspects the signature. `functools.wraps` copies them across:
+
+<Run id="cp-dec-4" code={`import functools
+
+def naive(function):
+    def wrapper(*args, **kwargs):
+        return function(*args, **kwargs)
+    return wrapper
+
+def careful(function):
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        return function(*args, **kwargs)
+    return wrapper
+
+@naive
+def embed_a(text):
+    """Turn text into a vector."""
+
+@careful
+def embed_b(text):
+    """Turn text into a vector."""
+
+print("naive:  ", embed_a.__name__, "|", embed_a.__doc__)
+print("careful:", embed_b.__name__, "|", embed_b.__doc__)`} />
+
+<Callout type="warning">
+Always use `@functools.wraps`. Without it, every decorated function in your codebase is called
+`wrapper` in logs and tracebacks, and you will spend an afternoon finding out why.
+</Callout>
+
+## Decorators that take arguments
+
+A decorator with arguments is a function that *returns* a decorator — one more layer:
+
+<Run id="cp-dec-5" code={`import functools, time
+
+def retry(attempts=3, delay=0.01, on=(ValueError,)):
+    def decorator(function):
+        @functools.wraps(function)
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, attempts + 1):
+                try:
+                    return function(*args, **kwargs)
+                except on as error:
+                    if attempt == attempts:
+                        raise
+                    print(f"  attempt {attempt} failed ({error}); retrying")
+                    time.sleep(delay * 2 ** (attempt - 1))
+        return wrapper
+    return decorator
+
+calls = {"n": 0}
+
+@retry(attempts=4)
+def flaky_call(prompt):
+    calls["n"] += 1
+    if calls["n"] < 3:
+        raise ValueError("overloaded")
+    return f"reply to {prompt!r}"
+
+print(flaky_call("Summarise this"))
+print("calls made:", calls["n"])`} />
+
+Read it outside-in: `retry(attempts=4)` runs first and returns `decorator`, which is then applied
+to `flaky_call`.
+
+## Stacking
+
+Decorators apply bottom-up — the one nearest the `def` wraps first:
+
+<Run id="cp-dec-6" code={`import functools
+
+def tag(label):
+    def decorator(function):
+        @functools.wraps(function)
+        def wrapper(*args, **kwargs):
+            print(f"  enter {label}")
+            result = function(*args, **kwargs)
+            print(f"  leave {label}")
+            return result
+        return wrapper
+    return decorator
+
+@tag("outer")
+@tag("inner")
+def work():
+    print("  doing the work")
+
+work()`} />
+
+## Caching
+
+`functools.cache` remembers what a function returned for a given set of arguments. For anything
+pure and expensive — an embedding, a tokenisation, a parsed config — it is a one-line win:
+
+<Run id="cp-dec-7" code={`import functools
+
+@functools.cache
+def embed(text):
+    print(f"  (computing an embedding for {text!r})")
+    return [len(text), text.count("a"), text.count("e")]
+
+print(embed("retrieval"))
+print(embed("retrieval"))          # no recomputation
+print(embed("generation"))
+print(embed.cache_info())`} />
+
+`functools.lru_cache(maxsize=1024)` is the bounded version — use it when the set of inputs is
+unbounded, so the cache cannot grow forever.
+
+<Callout type="warning">
+A cached function must be **pure** and its arguments **hashable**. Caching something that reads a
+file or calls an API freezes the first answer forever, and a list argument raises `TypeError`.
+</Callout>
+
+## Context managers
+
+A `with` block guarantees that cleanup runs, whatever happens inside. Implementing `__enter__`
+and `__exit__` makes your own object work that way:
+
+<Run id="cp-dec-8" code={`class Stage:
+    def __init__(self, name, log):
+        self.name = name
+        self.log = log
+
+    def __enter__(self):
+        self.log.append(f"start {self.name}")
+        return self                       # what "as" binds
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.log.append(f"end {self.name}")
+        return False                      # False: do not swallow exceptions
+
+log = []
+
+with Stage("chunking", log) as stage:
+    log.append(f"  working inside {stage.name}")
+
+try:
+    with Stage("embedding", log):
+        raise RuntimeError("the API failed")
+except RuntimeError as error:
+    log.append(f"  caught {error}")
+
+for line in log:
+    print(line)`} />
+
+`__exit__` receives the exception if one was raised. Returning `False` lets it propagate;
+returning `True` suppresses it — which you almost never want.
+
+## `@contextmanager`
+
+For most cases, a generator is less ceremony. Everything before `yield` is setup, everything
+after is cleanup, and `try`/`finally` is what makes the cleanup unconditional:
+
+<Run id="cp-dec-9" code={`from contextlib import contextmanager
+import time
+
+@contextmanager
+def timed(label):
+    started = time.perf_counter()
+    print(f"  {label}: start")
+    try:
+        yield label
+    finally:
+        elapsed = time.perf_counter() - started
+        print(f"  {label}: done in {elapsed * 1000:.1f} ms")
+
+with timed("retrieval") as label:
+    total = sum(range(200_000))
+    print(f"  {label}: computed {total}")
+
+try:
+    with timed("generation"):
+        raise RuntimeError("model unavailable")
+except RuntimeError as error:
+    print("caught:", error)`} />
+
+<Callout type="ai" title="Why this matters for AI">
+Every serious LLM client is a stack of these. A `@retry` for 429s and 529s, a `@cache` so the
+same chunk is not embedded twice, and a timing context manager around each pipeline stage so a
+trace shows where the nine seconds went. Writing them as decorators and context managers keeps
+the retrieval and prompting code readable — the cross-cutting concerns stay out of the way
+instead of being copied into every call site.
+</Callout>
+
+`contextlib` has ready-made ones worth knowing:
+
+<Run id="cp-dec-10" code={`from contextlib import suppress
+from pathlib import Path
+
+# Instead of a try/except that does nothing:
+with suppress(FileNotFoundError):
+    print(Path("missing.json").read_text())
+
+print("carried on regardless")
+
+# Nested with-blocks share one statement:
+Path("a.txt").write_text("alpha\\n")
+Path("b.txt").write_text("beta\\n")
+
+with open("a.txt") as first, open("b.txt") as second:
+    print(first.read().strip(), second.read().strip())`} />
+
+## Try it yourself
+
+<Exercise
+  id="cp-dec-ex1"
+  title="Exercise 1"
+  brief="Write the decorator <code>logged(function)</code>: it appends <code>call NAME</code> to <code>CALLS</code> before running, returns the result unchanged, and preserves the wrapped function's name and docstring."
+  code={`import functools
+
+CALLS = []
+
+def logged(function):
+    # Append f"call {function.__name__}" to CALLS, then call through.
+    # Keep the original name and docstring on the wrapper.
+    ...
+
+
+@logged
+def embed(text):
+    """Turn text into a vector."""
+    return [len(text)]
+
+
+print(embed("hello"))
+print(CALLS)
+print(embed.__name__, "|", embed.__doc__)`}
+  hint="Define wrapper(*args, **kwargs) inside, decorate it with @functools.wraps(function), and return wrapper."
+  solution={`import functools
+
+CALLS = []
+
+def logged(function):
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        CALLS.append(f"call {function.__name__}")
+        return function(*args, **kwargs)
+    return wrapper
+
+
+@logged
+def embed(text):
+    """Turn text into a vector."""
+    return [len(text)]
+
+
+print(embed("hello"))
+print(CALLS)
+print(embed.__name__, "|", embed.__doc__)`}
+  tests={`assert embed.__name__ == "embed", (
+    f"The wrapper should keep the name 'embed', got {embed.__name__!r}. Use @functools.wraps."
+)
+assert embed.__doc__ == "Turn text into a vector.", (
+    "The docstring should survive decoration — that is what functools.wraps copies across."
+)
+
+CALLS.clear()
+assert embed("abcd") == [4], "The decorator must return the wrapped function's result unchanged."
+assert CALLS == ["call embed"], f"One call should record one entry, got {CALLS!r}."
+
+# It has to work on a different signature too.
+@logged
+def join(*parts, sep="-"):
+    return sep.join(parts)
+
+CALLS.clear()
+assert join("a", "b", sep="+") == "a+b", (
+    "Accept *args and **kwargs so the decorator works on any signature."
+)
+assert CALLS == ["call join"], f"Expected ['call join'], got {CALLS!r}."`}
+/>
+
+<Exercise
+  id="cp-dec-ex2"
+  title="Exercise 2"
+  brief="Write the context manager <code>stage(name)</code> with <code>@contextmanager</code>. It appends <code>start NAME</code> on entry and <code>end NAME</code> on exit — even when the block raises — and yields the name."
+  code={`from contextlib import contextmanager
+
+LOG = []
+
+@contextmanager
+def stage(name):
+    # Append "start {name}", yield the name, and append "end {name}"
+    # in a way that still runs if the block raises.
+    ...
+
+
+with stage("chunking") as label:
+    LOG.append(f"inside {label}")
+
+print(LOG)`}
+  hint="LOG.append the start line, then try: yield name / finally: LOG.append the end line."
+  solution={`from contextlib import contextmanager
+
+LOG = []
+
+@contextmanager
+def stage(name):
+    LOG.append(f"start {name}")
+    try:
+        yield name
+    finally:
+        LOG.append(f"end {name}")
+
+
+with stage("chunking") as label:
+    LOG.append(f"inside {label}")
+
+print(LOG)`}
+  tests={`LOG.clear()
+with stage("chunking") as label:
+    LOG.append(f"inside {label}")
+
+assert label == "chunking", f"The with-block should bind the name, got {label!r}."
+assert LOG == ["start chunking", "inside chunking", "end chunking"], (
+    f"Expected start, body, end in that order — got {LOG!r}."
+)
+
+LOG.clear()
+try:
+    with stage("embedding"):
+        raise RuntimeError("boom")
+except RuntimeError:
+    pass
+else:
+    raise AssertionError("The exception should propagate — do not swallow it.")
+
+assert LOG == ["start embedding", "end embedding"], (
+    f"The end line must still be appended when the block raises. Got {LOG!r}. "
+    "Wrap the yield in try/finally."
+)`}
+/>
+
+<Quiz
+  question="What does @functools.wraps(function) do to the wrapper?"
+  choices={[
+    { text: "Copies the wrapped function's name, docstring and metadata onto the wrapper", correct: true, why: "Without it every decorated function reports itself as 'wrapper' in logs, tracebacks and docs tools." },
+    { text: "Makes the wrapper call the original function automatically", why: "You still write that call yourself; wraps only copies metadata." },
+    { text: "Prevents the decorator from changing the return value", why: "Nothing stops the wrapper returning something else — that is often the point." },
+    { text: "Caches the wrapped function's results", why: "That is functools.cache, an unrelated decorator." },
+  ]}
+/>
+
+<Quiz
+  question="In a @contextmanager generator, why must the yield be inside a try/finally?"
+  choices={[
+    { text: "So the cleanup after the yield still runs when the with-block raises", correct: true, why: "The exception is thrown back in at the yield; without finally, everything after it is skipped." },
+    { text: "Because a generator may only yield inside a try block", why: "There is no such rule — it is purely about guaranteeing the cleanup." },
+    { text: "To suppress exceptions raised inside the block", why: "finally does not suppress anything; the exception still propagates, which is what you want." },
+    { text: "To allow the context manager to yield more than once", why: "It must yield exactly once either way; a second yield is an error." },
+  ]}
+/>
+
+## Recap
+
+- A closure is an inner function that remembers the names it was created with; a decorator is a
+  function that takes a function and returns its replacement.
+- `@decorator` above a `def` is just `f = decorator(f)`.
+- Accept `*args, **kwargs` in the wrapper, and always apply `@functools.wraps`.
+- A decorator with arguments is one extra layer: a function returning a decorator.
+- Stacked decorators apply bottom-up.
+- `functools.cache` memoises a pure function with hashable arguments; `lru_cache(maxsize=...)`
+  bounds it.
+- `with` needs `__enter__`/`__exit__`, or a `@contextmanager` generator whose `yield` sits inside
+  a `try`/`finally`.
