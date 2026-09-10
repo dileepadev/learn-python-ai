@@ -1,0 +1,382 @@
+---
+title: The estimator API and your first model
+description: fit, predict, score — the three methods every scikit-learn model shares, and why a linear classifier over embeddings is the baseline you have to beat.
+module: ml-foundations
+order: 1
+level: advanced
+minutes: 18
+objectives:
+  - Shape data as X and y the way scikit-learn expects
+  - Fit a model, predict with it and score it
+  - Read predicted probabilities, and why they are not confidence
+  - Swap estimators without changing the surrounding code
+  - Explain what a transformer is and how it differs from an estimator
+---
+
+scikit-learn has one interface, and every model in it follows the same three steps. Learn that
+interface once and you can use the entire library — and, more usefully, you can swap models in and
+out of a pipeline without rewriting anything around them.
+
+## X and y
+
+Features go in a 2-D array of shape `(n_samples, n_features)`. Targets go in a 1-D array of
+length `n_samples`. That is the whole data contract:
+
+<Run id="ml-est-1" code={`import numpy as np
+from sklearn.datasets import make_classification
+
+X, y = make_classification(
+    n_samples=400, n_features=6, n_informative=4,
+    n_classes=2, random_state=0,
+)
+
+print("X:", X.shape, X.dtype)
+print("y:", y.shape, np.bincount(y))
+print()
+print("first row of X:", X[0].round(3))
+print("its label:     ", y[0])`} />
+
+## fit, predict, score
+
+<Run id="ml-est-2" code={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+
+X, y = make_classification(n_samples=400, n_features=6, n_informative=4, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=0)
+
+model = LogisticRegression(max_iter=1000)
+model.fit(X_train, y_train)                    # learn from the training data
+
+predictions = model.predict(X_test)            # one label per row
+print("first 10 predictions:", predictions[:10])
+print("first 10 truths:     ", y_test[:10])
+print()
+print("accuracy:", round(model.score(X_test, y_test), 4))
+print("by hand: ", round((predictions == y_test).mean(), 4))`} />
+
+`fit` learns, `predict` applies, `score` is a convenience that predicts and compares in one call.
+Anything the model learned is stored on it with a trailing underscore:
+
+<Run id="ml-est-3" code={`from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=400, n_features=6, n_informative=4, random_state=0)
+
+model = LogisticRegression(max_iter=1000).fit(X, y)
+
+print("coefficients:", model.coef_.round(3))
+print("intercept:   ", model.intercept_.round(3))
+print("classes:     ", model.classes_)
+print()
+print("most influential feature:", int(abs(model.coef_[0]).argmax()))`} />
+
+<Callout type="tip">
+The trailing underscore is a convention worth knowing: `coef_` and `classes_` exist only after
+`fit`. Attributes without one — `max_iter`, `C` — are the settings you chose. If an attribute you
+want raises `AttributeError`, the model has not been fitted.
+</Callout>
+
+## Probabilities
+
+`predict_proba` gives the probability of each class, in the order of `model.classes_`:
+
+<Run id="ml-est-4" code={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+
+X, y = make_classification(n_samples=400, n_features=6, n_informative=4, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=0)
+
+model = LogisticRegression(max_iter=1000).fit(X_train, y_train)
+probabilities = model.predict_proba(X_test)
+
+print("classes:", model.classes_)
+print(probabilities[:5].round(3))
+print("each row sums to:", probabilities[:5].sum(axis=1).round(6))
+print()
+
+# predict is just argmax over those probabilities at a 0.5 threshold.
+print("argmax == predict:", np.array_equal(model.classes_[probabilities.argmax(axis=1)],
+                                            model.predict(X_test)))
+
+# Moving the threshold trades precision for recall.
+for threshold in (0.3, 0.5, 0.7):
+    flagged = (probabilities[:, 1] >= threshold)
+    print(f"threshold {threshold}: flags {flagged.sum():3} of {len(flagged)} rows")`} />
+
+<Callout type="warning">
+A predicted probability of 0.92 does not mean the model is 92% likely to be right. It means the
+model's learned function output 0.92, which is only a real probability if the model is
+*calibrated* — and most are not by default. Check calibration before you use a probability as a
+threshold for anything that matters.
+</Callout>
+
+## One interface, many models
+
+The point of the API is that the surrounding code never changes:
+
+<Run id="ml-est-5" code={`from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.dummy import DummyClassifier
+
+X, y = make_classification(n_samples=600, n_features=8, n_informative=5, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=0)
+
+candidates = {
+    "dummy (most frequent)": DummyClassifier(strategy="most_frequent"),
+    "logistic regression": LogisticRegression(max_iter=1000),
+    "decision tree": DecisionTreeClassifier(random_state=0),
+    "random forest": RandomForestClassifier(n_estimators=100, random_state=0),
+    "k nearest neighbours": KNeighborsClassifier(n_neighbors=5),
+}
+
+for name, model in candidates.items():
+    model.fit(X_train, y_train)
+    print(f"{name:24} {model.score(X_test, y_test):.4f}")`} />
+
+<Callout type="ai" title="Why this matters for AI">
+`DummyClassifier` is in that list on purpose. On an imbalanced problem — 95% of requests are fine,
+5% are abuse — always predicting the majority class scores 0.95, and any model that cannot beat
+that has learned nothing. The same discipline applies to LLM work: before writing a prompt to
+classify support tickets, fit a logistic regression over embeddings of those tickets. It costs
+minutes, runs in microseconds, and often wins. If the LLM cannot beat it, the LLM is the wrong
+tool.
+</Callout>
+
+## Regression
+
+The same three methods, with a continuous target:
+
+<Run id="ml-est-6" code={`import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(0)
+prompt_tokens = rng.integers(100, 8000, 500)
+latency = 40 + prompt_tokens * 0.08 + rng.normal(0, 60, 500)
+
+X = prompt_tokens.reshape(-1, 1)      # a single feature still needs 2 axes
+y = latency
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=0)
+
+model = LinearRegression().fit(X_train, y_train)
+print(f"latency ≈ {model.coef_[0]:.4f} * tokens + {model.intercept_:.1f}")
+print("R² on held-out data:", round(model.score(X_test, y_test), 4))
+print()
+print("predicted latency for a 3,000-token prompt:", round(model.predict([[3000]])[0], 1), "ms")`} />
+
+<Callout type="warning">
+A single feature must still be a 2-D array. `model.fit(prompt_tokens, latency)` with a 1-D `X`
+raises a shape error; `reshape(-1, 1)` turns 500 numbers into 500 rows of one feature.
+</Callout>
+
+## Transformers
+
+A transformer learns something from data and then changes data, with `fit` and `transform`
+instead of `fit` and `predict`:
+
+<Run id="ml-est-7" code={`import numpy as np
+from sklearn.preprocessing import StandardScaler
+
+features = np.array([
+    [120.0, 0.9],
+    [4300.0, 0.2],
+    [980.0, 0.75],
+    [75.0, 0.4],
+])
+
+scaler = StandardScaler()
+scaler.fit(features)                       # learn each column's mean and std
+
+print("learned mean:", scaler.mean_.round(3))
+print("learned std: ", scaler.scale_.round(3))
+print()
+print(scaler.transform(features).round(3))
+print()
+print("fit_transform does both:", StandardScaler().fit_transform(features).shape)`} />
+
+Scaling matters more than it looks: the first column runs to 4,300 and the second to 1, so
+anything distance-based treats the second column as irrelevant.
+
+<Run id="ml-est-8" code={`from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+
+X, y = make_classification(n_samples=600, n_features=5, n_informative=3,
+                           n_redundant=0, random_state=0)
+# Blow one feature up so it dominates every distance.
+X[:, 0] *= 1000
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=0)
+
+raw = KNeighborsClassifier().fit(X_train, y_train).score(X_test, y_test)
+
+scaler = StandardScaler().fit(X_train)     # learned on training data only
+scaled = KNeighborsClassifier().fit(scaler.transform(X_train), y_train).score(
+    scaler.transform(X_test), y_test
+)
+
+print(f"unscaled: {raw:.4f}")
+print(f"scaled:   {scaled:.4f}")`} />
+
+Note that the scaler was fitted on the training set and then *applied* to the test set. Fitting it
+on everything would leak the test set's statistics into training — the next lesson is about
+exactly that, and the lesson after it about the `Pipeline` that makes the mistake impossible.
+
+## Try it yourself
+
+<Exercise
+  id="ml-est-ex1"
+  title="Exercise 1"
+  brief="Fit a <code>LogisticRegression</code> on the training data, put its held-out accuracy in <code>accuracy</code>, and print it to four decimal places."
+  code={`from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+
+X, y = make_classification(n_samples=500, n_features=6, n_informative=4, random_state=1)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=1)
+
+model = None
+accuracy = None
+
+print(f"accuracy: {accuracy}")`}
+  hint="LogisticRegression(max_iter=1000).fit(X_train, y_train), then model.score(X_test, y_test)."
+  solution={`from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+
+X, y = make_classification(n_samples=500, n_features=6, n_informative=4, random_state=1)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=1)
+
+model = LogisticRegression(max_iter=1000).fit(X_train, y_train)
+accuracy = round(model.score(X_test, y_test), 4)
+
+print(f"accuracy: {accuracy}")`}
+  tests={`from sklearn.linear_model import LogisticRegression
+import numpy as np
+
+assert isinstance(model, LogisticRegression), (
+    f"model should be a LogisticRegression, got {type(model).__name__}."
+)
+assert hasattr(model, "coef_"), "The model has not been fitted — call .fit(X_train, y_train)."
+
+expected = model.score(X_test, y_test)
+assert abs(float(accuracy) - round(expected, 4)) < 1e-6, (
+    f"accuracy should be the held-out score ({expected:.4f}), got {accuracy!r}."
+)
+assert expected > 0.8, (
+    f"This dataset is comfortably learnable; a score of {expected:.4f} suggests the model was "
+    "fitted on the wrong data."
+)
+
+# It must be scored on the test set, not the training set.
+assert abs(float(accuracy) - round(model.score(X_train, y_train), 4)) > 1e-9 or \
+       abs(model.score(X_train, y_train) - expected) < 1e-9, (
+    "Score the model on X_test and y_test, not on the training data."
+)`}
+/>
+
+<Exercise
+  id="ml-est-ex2"
+  title="Exercise 2"
+  brief="Fit every candidate and build <code>scores</code>: a dict of name → held-out accuracy, rounded to four places."
+  code={`from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.dummy import DummyClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+
+X, y = make_classification(n_samples=600, n_features=8, n_informative=5, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=0)
+
+candidates = {
+    "dummy": DummyClassifier(strategy="most_frequent"),
+    "logistic": LogisticRegression(max_iter=1000),
+    "tree": DecisionTreeClassifier(random_state=0),
+}
+
+scores = {}
+
+for name, score in scores.items():
+    print(f"{name:10} {score}")`}
+  hint="Loop over candidates.items(), call fit on the training data and score on the test data — the same two lines work for every estimator."
+  solution={`from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.dummy import DummyClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+
+X, y = make_classification(n_samples=600, n_features=8, n_informative=5, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=0)
+
+candidates = {
+    "dummy": DummyClassifier(strategy="most_frequent"),
+    "logistic": LogisticRegression(max_iter=1000),
+    "tree": DecisionTreeClassifier(random_state=0),
+}
+
+scores = {}
+for name, model in candidates.items():
+    model.fit(X_train, y_train)
+    scores[name] = round(model.score(X_test, y_test), 4)
+
+for name, score in scores.items():
+    print(f"{name:10} {score}")`}
+  tests={`assert isinstance(scores, dict), f"scores should be a dict, got {type(scores).__name__}."
+assert set(scores) == {"dummy", "logistic", "tree"}, (
+    f"Expected one entry per candidate. Got {sorted(scores)}."
+)
+
+for name, model in candidates.items():
+    expected = round(model.score(X_test, y_test), 4)
+    assert abs(scores[name] - expected) < 1e-6, (
+        f"{name} should score {expected} on the held-out set, got {scores[name]}."
+    )
+
+assert scores["logistic"] > scores["dummy"], (
+    "A real model should beat always predicting the majority class — "
+    f"logistic {scores['logistic']} against dummy {scores['dummy']}."
+)`}
+/>
+
+<Quiz
+  question="Your abuse classifier reports 95% accuracy on a dataset where 95% of requests are benign. What should you check?"
+  choices={[
+    { text: "Whether it beats a DummyClassifier that always predicts 'benign' — which also scores 95%", correct: true, why: "On an imbalanced problem accuracy is dominated by the majority class, so the baseline is the only way to know whether anything was learned." },
+    { text: "Nothing — 95% is a strong result", why: "It is identical to the result of a model that ignores its input entirely." },
+    { text: "Whether the learning rate was too high", why: "Logistic regression's optimiser is not the issue; the metric is." },
+    { text: "Whether to collect more benign examples", why: "More of the majority class would make the number look even better while learning even less." },
+  ]}
+/>
+
+<Quiz
+  question="What is the difference between an estimator and a transformer in scikit-learn?"
+  choices={[
+    { text: "An estimator learns and then predicts; a transformer learns and then changes the data", correct: true, why: "Both have fit; predictors add predict, transformers add transform, and a Pipeline chains transformers into a final predictor." },
+    { text: "Transformers do not need fitting", why: "Most do — a StandardScaler has to learn each column's mean and standard deviation first." },
+    { text: "Estimators work on X only, transformers on both X and y", why: "Estimators take y during fit; transformers usually ignore it." },
+    { text: "Transformers are only for text data", why: "Scaling, imputing and encoding are all transformers, on any kind of feature." },
+  ]}
+/>
+
+## Recap
+
+- `X` is `(n_samples, n_features)` and `y` is `(n_samples,)` — a single feature still needs
+  `reshape(-1, 1)`.
+- `fit` learns, `predict` applies, `score` does both. Learned attributes end in an underscore.
+- `predict_proba` gives per-class probabilities in `classes_` order, and `predict` is their
+  argmax — but an uncalibrated probability is not a confidence.
+- Every estimator shares the interface, so swapping models changes one line.
+- Always fit a `DummyClassifier` first; on an imbalanced problem it tells you what accuracy means.
+- Transformers use `fit`/`transform`, learn on the training data only, and are applied to both
+  splits.
