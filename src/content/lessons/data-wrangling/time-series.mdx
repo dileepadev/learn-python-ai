@@ -1,0 +1,353 @@
+---
+title: Time series basics
+description: Parse timestamps properly, index by them, resample to a coarser grain, and use rolling windows to watch a model's latency and quality drift.
+module: data-wrangling
+order: 6
+level: intermediate
+minutes: 18
+objectives:
+  - Parse timestamps and set a DatetimeIndex
+  - Slice by date with a string
+  - Pull parts of a timestamp out with the .dt accessor
+  - Resample to a coarser grain with a chosen aggregation
+  - Smooth a noisy metric with a rolling window, and measure change with shift and diff
+---
+
+Almost everything an AI system emits is a time series: requests per minute, latency, cost, error
+rate, the fraction of answers a judge accepts. pandas has a whole layer for this, and it removes
+most of the date arithmetic you would otherwise get wrong.
+
+## Timestamps and the index
+
+<Run id="dw-ts-1" code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 48
+
+logs = pd.DataFrame({
+    "timestamp": pd.date_range("2026-03-01", periods=n, freq="30min", tz="UTC"),
+    "latency_ms": rng.integers(80, 900, size=n),
+    "tokens": rng.integers(100, 2000, size=n),
+    "ok": rng.random(n) > 0.1,
+})
+
+print(logs.head())
+print()
+print("dtype:", logs["timestamp"].dtype)
+print("span: ", logs["timestamp"].min(), "->", logs["timestamp"].max())`} />
+
+Parsing real timestamps means being explicit, and letting bad rows fail visibly:
+
+<Run id="dw-ts-2" code={`import pandas as pd
+
+raw = pd.DataFrame({
+    "run": ["a", "b", "c", "d"],
+    "started": ["2026-03-01T09:30:00Z", "2026-03-01T14:05:00Z", "", "not a timestamp"],
+})
+
+raw["started"] = pd.to_datetime(raw["started"], errors="coerce", format="ISO8601", utc=True)
+print(raw)
+print()
+print("parsed:", raw["started"].notna().sum(), "of", len(raw))
+print("dtype: ", raw["started"].dtype)`} />
+
+<Callout type="warning">
+Always pass a `format` when you know it, and `utc=True` when the data is UTC. Without a format,
+pandas infers one from the first rows — and a file where the first thousand dates are
+unambiguous and the thousand-and-first is `03/04/2026` will be parsed two different ways in two
+different runs.
+</Callout>
+
+Setting the timestamp as the index unlocks the time-aware behaviour:
+
+<Run id="dw-ts-3" code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 48
+logs = pd.DataFrame({
+    "timestamp": pd.date_range("2026-03-01", periods=n, freq="30min", tz="UTC"),
+    "latency_ms": rng.integers(80, 900, size=n),
+}).set_index("timestamp")
+
+print(logs.head(3))
+print()
+print("a whole day:  ", logs.loc["2026-03-01"].shape)
+print("one hour:     ", logs.loc["2026-03-01 09"].shape)
+print("a range:")
+print(logs.loc["2026-03-01 09:00":"2026-03-01 10:30"])`} />
+
+## The `.dt` accessor
+
+On an ordinary timestamp column, `.dt` reaches the parts:
+
+<Run id="dw-ts-4" code={`import pandas as pd
+
+logs = pd.DataFrame({
+    "timestamp": pd.to_datetime([
+        "2026-03-01T09:30:00Z", "2026-03-01T22:05:00Z", "2026-03-03T14:00:00Z",
+    ], format="ISO8601", utc=True),
+    "latency_ms": [120, 480, 260],
+})
+
+logs["date"] = logs["timestamp"].dt.date
+logs["hour"] = logs["timestamp"].dt.hour
+logs["weekday"] = logs["timestamp"].dt.day_name()
+logs["is_weekend"] = logs["timestamp"].dt.dayofweek >= 5
+
+print(logs)
+print()
+print("mean latency by hour of day:")
+print(logs.groupby(logs["timestamp"].dt.hour)["latency_ms"].mean())`} />
+
+## Resampling
+
+`resample` is a group-by where the groups are time buckets. It is how a stream of individual
+requests becomes a chart you can read:
+
+<Run id="dw-ts-5" code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 480
+logs = pd.DataFrame({
+    "latency_ms": rng.integers(80, 900, size=n),
+    "tokens": rng.integers(100, 2000, size=n),
+    "ok": rng.random(n) > 0.08,
+}, index=pd.date_range("2026-03-01", periods=n, freq="3min", tz="UTC"))
+
+hourly = logs.resample("1h").agg(
+    requests=("latency_ms", "size"),
+    median_latency=("latency_ms", "median"),
+    p95_latency=("latency_ms", lambda s: s.quantile(0.95)),
+    tokens=("tokens", "sum"),
+    error_rate=("ok", lambda s: 1 - s.mean()),
+).round(3)
+
+print(hourly.head(8))
+print()
+print("daily totals:")
+print(logs.resample("1D").agg(requests=("latency_ms", "size"), tokens=("tokens", "sum")))`} />
+
+The frequency strings you will use: `min`, `h`, `D`, `W`, `ME` (month end). Upsampling to a finer
+grain leaves gaps, which you then fill deliberately:
+
+<Run id="dw-ts-6" code={`import pandas as pd
+
+sparse = pd.DataFrame(
+    {"value": [1.0, 4.0]},
+    index=pd.to_datetime(["2026-03-01 00:00", "2026-03-01 04:00"], utc=True),
+)
+
+print(sparse.resample("1h").asfreq())
+print()
+print("forward-filled:")
+print(sparse.resample("1h").ffill())
+print()
+print("interpolated:")
+print(sparse.resample("1h").interpolate())`} />
+
+## Rolling windows
+
+A rolling window smooths a noisy metric so a trend becomes visible:
+
+<Run id="dw-ts-7" code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(1)
+n = 24
+drifting = np.linspace(200, 500, n) + rng.normal(0, 60, n)
+
+logs = pd.DataFrame(
+    {"latency_ms": drifting.round(1)},
+    index=pd.date_range("2026-03-01", periods=n, freq="1h", tz="UTC"),
+)
+
+logs["rolling_mean_6h"] = logs["latency_ms"].rolling(window=6).mean().round(1)
+logs["rolling_p95_6h"] = logs["latency_ms"].rolling(window=6).quantile(0.95).round(1)
+logs["expanding_mean"] = logs["latency_ms"].expanding().mean().round(1)
+
+print(logs.head(10))`} />
+
+The first five rolling values are `NaN` because a six-wide window needs six observations.
+`min_periods` relaxes that when you would rather have an early, noisier number:
+
+<Run id="dw-ts-8" code={`import pandas as pd
+import numpy as np
+
+values = pd.Series([10.0, 12.0, 11.0, 30.0, 13.0, 12.0])
+
+print(pd.DataFrame({
+    "value": values,
+    "strict": values.rolling(3).mean().round(2),
+    "relaxed": values.rolling(3, min_periods=1).mean().round(2),
+}))`} />
+
+## shift and diff
+
+`shift` moves a column along the index, which is how you compare each point with the one before:
+
+<Run id="dw-ts-9" code={`import pandas as pd
+
+daily = pd.DataFrame(
+    {"cost_usd": [12.0, 13.5, 13.0, 19.0, 18.5, 41.0]},
+    index=pd.date_range("2026-03-01", periods=6, freq="1D", tz="UTC"),
+)
+
+daily["yesterday"] = daily["cost_usd"].shift(1)
+daily["change"] = daily["cost_usd"].diff()
+daily["pct_change"] = (daily["cost_usd"].pct_change() * 100).round(1)
+daily["vs_7d_mean"] = (daily["cost_usd"] / daily["cost_usd"].expanding().mean()).round(2)
+
+print(daily)
+print()
+spike = daily[daily["pct_change"] > 50]
+print("days that more than 50% above the day before:")
+print(spike[["cost_usd", "pct_change"]])`} />
+
+<Callout type="ai" title="Why this matters for AI">
+This is the shape of every production AI dashboard. Requests and tokens resampled hourly give you
+cost; the p95 of latency tells you what a slow user actually experiences; a rolling acceptance
+rate from an LLM-as-judge shows quality drifting before anyone complains. And note `shift` only
+ever looks backwards — using a future value to explain a present one is the classic leak in any
+model trained on time-ordered data, and it is a one-character mistake.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="dw-ts-ex1"
+  title="Exercise 1"
+  brief="Resample the request log to hourly buckets in <code>hourly</code>, with <code>requests</code> (count) and <code>median_latency</code> columns."
+  code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 240
+logs = pd.DataFrame(
+    {"latency_ms": rng.integers(80, 900, size=n)},
+    index=pd.date_range("2026-03-01", periods=n, freq="3min", tz="UTC"),
+)
+
+hourly = None
+
+print(hourly.head())
+print("buckets:", len(hourly))`}
+  hint="logs.resample('1h').agg(requests=('latency_ms', 'size'), median_latency=('latency_ms', 'median'))"
+  solution={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 240
+logs = pd.DataFrame(
+    {"latency_ms": rng.integers(80, 900, size=n)},
+    index=pd.date_range("2026-03-01", periods=n, freq="3min", tz="UTC"),
+)
+
+hourly = logs.resample("1h").agg(
+    requests=("latency_ms", "size"),
+    median_latency=("latency_ms", "median"),
+)
+
+print(hourly.head())
+print("buckets:", len(hourly))`}
+  tests={`import pandas as pd
+
+assert isinstance(hourly, pd.DataFrame), "hourly should be a DataFrame."
+assert list(hourly.columns) == ["requests", "median_latency"], (
+    f"Expected columns requests and median_latency. Got {list(hourly.columns)}."
+)
+assert len(hourly) == 12, (
+    f"240 rows at 3-minute intervals span 12 hours, so 12 buckets — got {len(hourly)}."
+)
+assert hourly["requests"].sum() == 240, (
+    f"Every request should land in exactly one bucket, got {hourly['requests'].sum()}."
+)
+assert (hourly["requests"] == 20).all(), (
+    f"Twenty 3-minute requests fit in an hour, got {hourly['requests'].tolist()}."
+)
+assert isinstance(hourly.index, pd.DatetimeIndex), "The result should still be indexed by time."`}
+/>
+
+<Exercise
+  id="dw-ts-ex2"
+  title="Exercise 2"
+  brief="Add a <code>rolling_3d</code> column — the three-day rolling mean of cost — and a <code>change</code> column holding the day-on-day difference."
+  code={`import pandas as pd
+
+daily = pd.DataFrame(
+    {"cost_usd": [12.0, 13.5, 13.0, 19.0, 18.5, 41.0]},
+    index=pd.date_range("2026-03-01", periods=6, freq="1D", tz="UTC"),
+)
+
+# Add rolling_3d and change.
+
+print(daily)`}
+  hint="rolling(3).mean() for the window, and .diff() for the day-on-day change."
+  solution={`import pandas as pd
+
+daily = pd.DataFrame(
+    {"cost_usd": [12.0, 13.5, 13.0, 19.0, 18.5, 41.0]},
+    index=pd.date_range("2026-03-01", periods=6, freq="1D", tz="UTC"),
+)
+
+daily["rolling_3d"] = daily["cost_usd"].rolling(3).mean()
+daily["change"] = daily["cost_usd"].diff()
+
+print(daily)`}
+  tests={`import pandas as pd
+import math
+
+assert "rolling_3d" in daily.columns and "change" in daily.columns, (
+    "Add both a rolling_3d and a change column."
+)
+assert len(daily) == 6, "Keep all six rows."
+
+rolling = daily["rolling_3d"].tolist()
+assert math.isnan(rolling[0]) and math.isnan(rolling[1]), (
+    "A three-wide window has no value for the first two days."
+)
+assert abs(rolling[2] - (12.0 + 13.5 + 13.0) / 3) < 1e-9, (
+    f"The first rolling value should be the mean of the first three days, got {rolling[2]}."
+)
+assert abs(rolling[5] - (19.0 + 18.5 + 41.0) / 3) < 1e-9, (
+    f"The last rolling value should be the mean of the last three days, got {rolling[5]}."
+)
+
+change = daily["change"].tolist()
+assert math.isnan(change[0]), "The first day has nothing to compare against."
+assert abs(change[1] - 1.5) < 1e-9, f"Day two rose by 1.5, got {change[1]}."
+assert abs(change[5] - 22.5) < 1e-9, f"The last day rose by 22.5, got {change[5]}."`}
+/>
+
+<Quiz
+  question="Why does a rolling(6) mean start with five NaN values?"
+  choices={[
+    { text: "A six-wide window cannot be filled until six observations exist", correct: true, why: "pandas refuses to average a partial window by default; min_periods lets you opt into an earlier, noisier value." },
+    { text: "The first five rows were dropped", why: "Every row survives — the first five simply have no value for that column." },
+    { text: "The data must be sorted first", why: "Sorting matters for correctness but has nothing to do with the leading gap." },
+    { text: "It is a bug fixed by resampling first", why: "Resampling changes the grain, not the fact that a window needs to fill up." },
+  ]}
+/>
+
+<Quiz
+  question="You add a feature using .shift(-1) to a model trained on time-ordered data. What have you done?"
+  choices={[
+    { text: "Leaked the future into the present — the feature holds a value that had not happened yet", correct: true, why: "A negative shift pulls from later rows, so the model learns from information it could never have at prediction time." },
+    { text: "Nothing unusual; negative shifts are the normal direction", why: "The normal direction is shift(1), which looks backwards at what already happened." },
+    { text: "Made the feature missing for the first row instead of the last", why: "That is the mechanical effect, but the serious consequence is the leak." },
+    { text: "Created a duplicate of the original column", why: "It is offset by one position, which is precisely the problem." },
+  ]}
+/>
+
+## Recap
+
+- Parse with an explicit `format` and `utc=True`; `errors="coerce"` keeps bad rows visible.
+- A `DatetimeIndex` lets you slice with a string: `df.loc["2026-03-01"]`.
+- `.dt` reaches the parts of a timestamp column — `hour`, `date`, `day_name`, `dayofweek`.
+- `resample("1h").agg(...)` is a group-by over time buckets; `ffill` or `interpolate` fills the
+  gaps upsampling leaves.
+- `rolling(n)` smooths, and needs `n` observations unless you set `min_periods`.
+- `shift(1)` and `diff()` compare a point with the one before. `shift(-1)` looks into the
+  future — and leaks it into any model you train.

@@ -1,0 +1,362 @@
+---
+title: Plotting with matplotlib
+description: Draw the four charts that answer most questions about a model — line, bar, histogram and scatter — and read the distribution a summary statistic hides.
+module: data-wrangling
+order: 7
+level: intermediate
+minutes: 18
+objectives:
+  - Draw a figure with the explicit fig and ax interface
+  - Choose between line, bar, histogram and scatter
+  - Label every axis, and know why an unlabelled chart is useless
+  - Plot straight from a DataFrame onto an axis you control
+  - Put several charts in one figure, and use a log scale when the data demands it
+---
+
+Charts in these lessons render underneath the code: draw a figure and it appears in the output
+panel. You do not need `plt.show()` here — although you do in a script on your own machine, so
+the examples include it where it belongs.
+
+## The figure and the axes
+
+Always create both explicitly. `fig` is the canvas; `ax` is the plot on it, and every method you
+want lives on `ax`:
+
+<Run id="dw-plot-1" code={`import matplotlib.pyplot as plt
+import numpy as np
+
+steps = np.arange(1, 51)
+loss = 2.5 * np.exp(-steps / 12) + 0.15
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+ax.plot(steps, loss, linewidth=2)
+ax.set_title("Training loss")
+ax.set_xlabel("step")
+ax.set_ylabel("loss")
+ax.grid(True)
+
+plt.show()   # needed in a script; this page renders the figure either way`} />
+
+<Callout type="warning">
+Avoid the `plt.plot(...)` / `plt.title(...)` style. It draws onto whichever figure happens to be
+current, which breaks the moment you have two charts or put plotting inside a function. `fig, ax
+= plt.subplots()` and then `ax.something(...)` always does what it says.
+</Callout>
+
+## Lines: something over something else
+
+<Run id="dw-plot-2" code={`import matplotlib.pyplot as plt
+import numpy as np
+
+steps = np.arange(1, 51)
+train = 2.5 * np.exp(-steps / 12) + 0.15
+validation = 2.5 * np.exp(-steps / 14) + 0.15 + np.linspace(0, 0.35, 50)
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+ax.plot(steps, train, label="train", linewidth=2)
+ax.plot(steps, validation, label="validation", linewidth=2, linestyle="--")
+ax.axvline(20, color="#ef4444", linewidth=1, linestyle=":")
+ax.annotate("overfitting starts", xy=(20, 0.6), xytext=(26, 1.2),
+            arrowprops={"arrowstyle": "->", "color": "#ef4444"}, color="#ef4444")
+ax.set_title("Train and validation loss")
+ax.set_xlabel("step")
+ax.set_ylabel("loss")
+ax.legend()
+ax.grid(True)`} />
+
+The gap opening between two curves is the picture of overfitting, and it is far more legible than
+the two final numbers.
+
+## Bars: comparing categories
+
+<Run id="dw-plot-3" code={`import matplotlib.pyplot as plt
+import pandas as pd
+
+summary = pd.DataFrame({
+    "model": ["haiku", "sonnet", "opus"],
+    "easy": [0.80, 0.88, 0.95],
+    "hard": [0.40, 0.61, 0.72],
+}).set_index("model")
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+summary.plot(kind="bar", ax=ax, rot=0)
+ax.set_title("Accuracy by model and difficulty")
+ax.set_xlabel("")
+ax.set_ylabel("accuracy")
+ax.set_ylim(0, 1)
+ax.legend(title="difficulty")`} />
+
+`DataFrame.plot(..., ax=ax)` hands pandas an axis you made, so you keep control of the labels and
+the figure while pandas does the drawing.
+
+## Histograms: the distribution behind the mean
+
+<Run id="dw-plot-4" code={`import matplotlib.pyplot as plt
+import numpy as np
+
+rng = np.random.default_rng(0)
+# Most requests are fast; a cached minority is very fast; a few are very slow.
+latency = np.concatenate([
+    rng.normal(220, 40, 700),
+    rng.normal(60, 10, 200),
+    rng.normal(1400, 300, 100),
+]).clip(10, None)
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+ax.hist(latency, bins=60)
+ax.axvline(latency.mean(), color="#ef4444", linewidth=2, label=f"mean {latency.mean():.0f} ms")
+ax.axvline(np.median(latency), color="#22c55e", linewidth=2, label=f"median {np.median(latency):.0f} ms")
+ax.set_title("Request latency")
+ax.set_xlabel("milliseconds")
+ax.set_ylabel("requests")
+ax.legend()
+
+print(f"mean   {latency.mean():7.1f} ms")
+print(f"median {np.median(latency):7.1f} ms")
+print(f"p95    {np.quantile(latency, 0.95):7.1f} ms")`} />
+
+<Callout type="ai" title="Why this matters for AI">
+The mean here describes nobody: there are three populations — cache hits, ordinary requests, and
+a slow tail — and no single number captures that. A histogram takes two lines and shows it
+immediately. The same applies to evaluation scores: a mean of 0.7 might be every answer scoring
+0.7, or 70% scoring 1.0 and 30% scoring 0. Those call for completely different work, and only the
+distribution tells you which you have.
+</Callout>
+
+## Scatter: does one thing track another?
+
+<Run id="dw-plot-5" code={`import matplotlib.pyplot as plt
+import numpy as np
+
+rng = np.random.default_rng(0)
+prompt_tokens = rng.integers(100, 4000, 200)
+latency = 40 + prompt_tokens * 0.08 + rng.normal(0, 60, 200)
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+ax.scatter(prompt_tokens, latency, s=14, alpha=0.6)
+
+slope, intercept = np.polyfit(prompt_tokens, latency, 1)
+line_x = np.array([prompt_tokens.min(), prompt_tokens.max()])
+ax.plot(line_x, slope * line_x + intercept, color="#ef4444", linewidth=2,
+        label=f"{slope * 1000:.0f} ms per 1k tokens")
+
+ax.set_title("Latency against prompt length")
+ax.set_xlabel("prompt tokens")
+ax.set_ylabel("latency (ms)")
+ax.legend()
+ax.grid(True, alpha=0.3)`} />
+
+## Several charts in one figure
+
+`plt.subplots(rows, columns)` returns an array of axes:
+
+<Run id="dw-plot-6" code={`import matplotlib.pyplot as plt
+import numpy as np
+
+rng = np.random.default_rng(0)
+steps = np.arange(1, 61)
+
+fig, axes = plt.subplots(2, 2, figsize=(8, 5))
+
+axes[0, 0].plot(steps, 2.5 * np.exp(-steps / 15) + 0.2)
+axes[0, 0].set_title("loss")
+
+axes[0, 1].hist(rng.normal(220, 60, 500), bins=30)
+axes[0, 1].set_title("latency")
+
+axes[1, 0].bar(["haiku", "sonnet", "opus"], [0.62, 0.79, 0.91])
+axes[1, 0].set_title("accuracy")
+axes[1, 0].set_ylim(0, 1)
+
+axes[1, 1].scatter(rng.random(120), rng.random(120), s=10, alpha=0.6)
+axes[1, 1].set_title("scores")
+
+for ax in axes.ravel():
+    ax.grid(True, alpha=0.25)
+
+fig.suptitle("Run 42")`} />
+
+## Log scales
+
+When values span orders of magnitude, a linear axis shows you one bar and four invisible ones:
+
+<Run id="dw-plot-7" code={`import matplotlib.pyplot as plt
+
+models = ["embed", "haiku", "sonnet", "opus", "opus-thinking"]
+cost_per_million = [0.02, 0.8, 3.0, 15.0, 75.0]
+
+fig, axes = plt.subplots(1, 2, figsize=(8, 3.2))
+
+axes[0].bar(models, cost_per_million)
+axes[0].set_title("linear")
+axes[0].tick_params(axis="x", rotation=45)
+
+axes[1].bar(models, cost_per_million)
+axes[1].set_yscale("log")
+axes[1].set_title("log")
+axes[1].tick_params(axis="x", rotation=45)
+
+for ax in axes:
+    ax.set_ylabel("USD per million tokens")`} />
+
+## Plotting a time series
+
+<Run id="dw-plot-8" code={`import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(1)
+n = 72
+logs = pd.DataFrame(
+    {"latency_ms": np.linspace(200, 420, n) + rng.normal(0, 70, n)},
+    index=pd.date_range("2026-03-01", periods=n, freq="1h", tz="UTC"),
+)
+logs["rolling_6h"] = logs["latency_ms"].rolling(6).mean()
+
+fig, ax = plt.subplots(figsize=(7.5, 3.5))
+ax.plot(logs.index, logs["latency_ms"], linewidth=0.8, alpha=0.5, label="hourly")
+ax.plot(logs.index, logs["rolling_6h"], linewidth=2, label="6-hour mean")
+ax.set_title("Latency drifting upwards")
+ax.set_ylabel("milliseconds")
+ax.legend()
+ax.grid(True, alpha=0.3)
+fig.autofmt_xdate()`} />
+
+<Callout type="tip">
+Label every axis and give every chart a title. A chart you will look at once still gets pasted
+into an issue, and six weeks later nobody — including you — remembers whether that axis was
+seconds or milliseconds.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="dw-plot-ex1"
+  title="Exercise 1"
+  brief="Draw both series on <code>ax</code> as lines with the labels <code>train</code> and <code>validation</code>, then add the title <code>Loss</code>, the x label <code>step</code>, the y label <code>loss</code> and a legend."
+  code={`import matplotlib.pyplot as plt
+import numpy as np
+
+steps = np.arange(1, 41)
+train = 2.0 * np.exp(-steps / 10) + 0.2
+validation = 2.0 * np.exp(-steps / 12) + 0.2 + np.linspace(0, 0.3, 40)
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+
+# Plot both series with labels, then set the title, axis labels and legend.
+`}
+  hint="ax.plot(steps, train, label='train') and the same for validation, then ax.set_title, ax.set_xlabel, ax.set_ylabel and ax.legend()."
+  solution={`import matplotlib.pyplot as plt
+import numpy as np
+
+steps = np.arange(1, 41)
+train = 2.0 * np.exp(-steps / 10) + 0.2
+validation = 2.0 * np.exp(-steps / 12) + 0.2 + np.linspace(0, 0.3, 40)
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+
+ax.plot(steps, train, label="train")
+ax.plot(steps, validation, label="validation")
+ax.set_title("Loss")
+ax.set_xlabel("step")
+ax.set_ylabel("loss")
+ax.legend()`}
+  tests={`assert len(ax.lines) == 2, f"Expected two plotted lines, found {len(ax.lines)}."
+
+labels = [line.get_label() for line in ax.lines]
+assert labels == ["train", "validation"], (
+    f"Expected the lines labelled 'train' then 'validation', got {labels}."
+)
+
+first = ax.lines[0].get_ydata()
+assert len(first) == 40, f"The first line should plot all 40 steps, got {len(first)}."
+assert abs(float(first[0]) - float(train[0])) < 1e-9, (
+    "The first line should be the train series."
+)
+
+assert ax.get_title() == "Loss", f"Expected the title 'Loss', got {ax.get_title()!r}."
+assert ax.get_xlabel() == "step", f"Expected the x label 'step', got {ax.get_xlabel()!r}."
+assert ax.get_ylabel() == "loss", f"Expected the y label 'loss', got {ax.get_ylabel()!r}."
+assert ax.get_legend() is not None, "Call ax.legend() so the labels are shown."`}
+/>
+
+<Exercise
+  id="dw-plot-ex2"
+  title="Exercise 2"
+  brief="Draw a histogram of <code>latency</code> on <code>ax</code> with 40 bins, then mark the median with a vertical line. Label the x axis <code>milliseconds</code>."
+  code={`import matplotlib.pyplot as plt
+import numpy as np
+
+rng = np.random.default_rng(0)
+latency = np.concatenate([rng.normal(220, 40, 600), rng.normal(1200, 200, 120)]).clip(10, None)
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+
+# Draw the histogram with 40 bins, add a vertical line at the median,
+# and label the x axis.
+`}
+  hint="ax.hist(latency, bins=40), then ax.axvline(np.median(latency)), then ax.set_xlabel('milliseconds')."
+  solution={`import matplotlib.pyplot as plt
+import numpy as np
+
+rng = np.random.default_rng(0)
+latency = np.concatenate([rng.normal(220, 40, 600), rng.normal(1200, 200, 120)]).clip(10, None)
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+
+ax.hist(latency, bins=40)
+ax.axvline(np.median(latency), color="#22c55e", linewidth=2)
+ax.set_xlabel("milliseconds")`}
+  tests={`import numpy as np
+
+assert len(ax.patches) == 40, (
+    f"A 40-bin histogram draws 40 bars, found {len(ax.patches)}. Pass bins=40 to ax.hist."
+)
+assert sum(patch.get_height() for patch in ax.patches) == len(latency), (
+    "Every observation should land in a bin — plot the whole latency array."
+)
+
+assert len(ax.lines) >= 1, "Add a vertical line at the median with ax.axvline."
+median = float(np.median(latency))
+positions = [float(line.get_xdata()[0]) for line in ax.lines]
+assert any(abs(p - median) < 1.0 for p in positions), (
+    f"The vertical line should sit at the median ({median:.1f}), found lines at "
+    f"{[round(p, 1) for p in positions]}."
+)
+
+assert ax.get_xlabel() == "milliseconds", (
+    f"Expected the x label 'milliseconds', got {ax.get_xlabel()!r}."
+)`}
+/>
+
+<Quiz
+  question="Your latency has a mean of 380 ms and a median of 210 ms. What does a histogram most likely show?"
+  choices={[
+    { text: "A long right tail — a minority of very slow requests dragging the mean up", correct: true, why: "A mean well above the median is the signature of a right-skewed distribution, and the tail is exactly what users complain about." },
+    { text: "A symmetric distribution centred on 295 ms", why: "A symmetric distribution has its mean and median in the same place." },
+    { text: "A left tail of unusually fast requests", why: "Fast outliers pull the mean *below* the median, not above it." },
+    { text: "That the data is corrupt", why: "Skew is completely normal for latency; it is a property of the system, not an error." },
+  ]}
+/>
+
+<Quiz
+  question="Why prefer fig, ax = plt.subplots() over calling plt.plot() and plt.title() directly?"
+  choices={[
+    { text: "Every call names the axis it acts on, so it keeps working with several charts or inside a function", correct: true, why: "The plt.* functions target whichever figure is current, which is implicit global state and breaks as soon as there is more than one." },
+    { text: "plt.plot cannot draw lines", why: "It draws perfectly well; the problem is which figure it draws on." },
+    { text: "subplots renders faster", why: "The rendering path is identical." },
+    { text: "plt.title has been removed", why: "It still exists — it is just the less robust way to work." },
+  ]}
+/>
+
+## Recap
+
+- Create the figure and axes explicitly with `fig, ax = plt.subplots()`, and call methods on
+  `ax`.
+- Line for something over time or steps, bar for categories, histogram for a distribution,
+  scatter for a relationship between two numbers.
+- A histogram shows what a mean hides — multiple populations, skew, a long tail.
+- `DataFrame.plot(..., ax=ax)` lets pandas draw onto an axis you still control.
+- `plt.subplots(rows, cols)` gives a grid; `set_yscale("log")` rescues data spanning orders of
+  magnitude.
+- Title and label every chart, every time.

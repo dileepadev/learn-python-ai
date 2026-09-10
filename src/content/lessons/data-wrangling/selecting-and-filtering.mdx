@@ -1,0 +1,352 @@
+---
+title: Selecting, filtering and assigning
+description: loc and iloc, boolean masks that read like sentences, and the chained-assignment mistake that silently does nothing.
+module: data-wrangling
+order: 2
+level: intermediate
+minutes: 18
+objectives:
+  - Select by label with loc and by position with iloc
+  - Filter rows with boolean masks and combine conditions correctly
+  - Use isin, between and the .str accessor for text columns
+  - Assign through .loc rather than through a chained selection
+  - Build derived columns with assign in a readable chain
+---
+
+Almost every question you ask of a dataset starts with "the rows where…". pandas has two
+selectors and one filtering idiom, and knowing which is which saves a lot of confusion.
+
+<Run id="dw-sel-1" code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "question": ["q1", "q2", "q3", "q4", "q5", "q6"],
+    "model": ["opus", "haiku", "opus", "haiku", "opus", "haiku"],
+    "difficulty": ["easy", "easy", "hard", "hard", "medium", "medium"],
+    "score": [0.95, 0.72, 0.61, 0.40, 0.88, 0.55],
+    "latency_ms": [320, 90, 410, 85, 350, 95],
+})
+
+print(evaluations)`} />
+
+## loc and iloc
+
+`loc` works with **labels** — the index values and column names. `iloc` works with **integer
+positions**, like a NumPy array:
+
+<Run id="dw-sel-2" code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "question": ["q1", "q2", "q3", "q4"],
+    "score": [0.95, 0.72, 0.61, 0.40],
+}).set_index("question")
+
+print("loc by label:")
+print(evaluations.loc["q2"])
+print()
+print("loc, rows and a column:", evaluations.loc["q2", "score"])
+print("loc, a label range:   ", list(evaluations.loc["q2":"q3", "score"]))
+print()
+print("iloc by position:     ", evaluations.iloc[1, 0])
+print("iloc, a slice:        ", list(evaluations.iloc[1:3, 0]))`} />
+
+<Callout type="warning">
+A `loc` slice **includes** its endpoint; an `iloc` slice excludes it, like every other Python
+slice. `loc["q2":"q3"]` gives two rows; `iloc[1:3]` also gives two, but for a different reason.
+</Callout>
+
+## Filtering
+
+A comparison on a column gives a boolean Series, and passing it back selects the `True` rows:
+
+<Run id="dw-sel-3" code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "question": ["q1", "q2", "q3", "q4", "q5", "q6"],
+    "model": ["opus", "haiku", "opus", "haiku", "opus", "haiku"],
+    "difficulty": ["easy", "easy", "hard", "hard", "medium", "medium"],
+    "score": [0.95, 0.72, 0.61, 0.40, 0.88, 0.55],
+})
+
+mask = evaluations["score"] >= 0.7
+print(mask)
+print()
+print(evaluations[mask])
+print()
+print("how many passed:", mask.sum(), "of", len(mask))`} />
+
+Combine conditions with `&`, `|` and `~`, parenthesising each one — exactly as in NumPy:
+
+<Run id="dw-sel-4" code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "question": ["q1", "q2", "q3", "q4", "q5", "q6"],
+    "model": ["opus", "haiku", "opus", "haiku", "opus", "haiku"],
+    "difficulty": ["easy", "easy", "hard", "hard", "medium", "medium"],
+    "score": [0.95, 0.72, 0.61, 0.40, 0.88, 0.55],
+})
+
+hard_failures = evaluations[(evaluations["difficulty"] == "hard") & (evaluations["score"] < 0.7)]
+print(hard_failures)
+print()
+
+either = evaluations[(evaluations["model"] == "opus") | (evaluations["score"] > 0.7)]
+print("opus or scored well:", list(either["question"]))
+print("not opus:           ", list(evaluations[~(evaluations["model"] == "opus")]["question"]))`} />
+
+## isin, between and .str
+
+<Run id="dw-sel-5" code={`import pandas as pd
+
+documents = pd.DataFrame({
+    "path": ["docs/intro.md", "docs/api.md", "blog/launch.md", "docs/faq.txt"],
+    "language": ["en", "en", "si", "en"],
+    "tokens": [412, 980, 2100, 120],
+})
+
+print(documents[documents["language"].isin(["si", "ta"])])
+print()
+print(documents[documents["tokens"].between(100, 1000)])
+print()
+print(documents[documents["path"].str.startswith("docs/")])
+print()
+print(documents[documents["path"].str.endswith(".md")])
+print()
+print("extracted names:", list(documents["path"].str.split("/").str[-1]))`} />
+
+The `.str` accessor applies a string method down the whole column. `.str.contains`,
+`.str.lower`, `.str.strip`, `.str.replace` and `.str.len` cover most text cleaning.
+
+<Run id="dw-sel-6" code={`import pandas as pd
+
+documents = pd.DataFrame({
+    "title": ["  Retrieval Basics ", "EMBEDDINGS explained", "Chunking  strategies"],
+})
+
+documents["clean"] = documents["title"].str.strip().str.lower()
+documents["words"] = documents["clean"].str.split().str.len()
+documents["mentions_chunk"] = documents["clean"].str.contains("chunk")
+
+print(documents)`} />
+
+## query
+
+For a long chain of conditions, `query` reads better — column names become bare names:
+
+<Run id="dw-sel-7" code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "question": ["q1", "q2", "q3", "q4", "q5", "q6"],
+    "model": ["opus", "haiku", "opus", "haiku", "opus", "haiku"],
+    "difficulty": ["easy", "easy", "hard", "hard", "medium", "medium"],
+    "score": [0.95, 0.72, 0.61, 0.40, 0.88, 0.55],
+    "latency_ms": [320, 90, 410, 85, 350, 95],
+})
+
+print(evaluations.query("score > 0.7 and latency_ms < 400"))
+print()
+print(evaluations.query("difficulty in ['hard', 'medium'] and model == 'opus'"))
+print()
+
+threshold = 0.6
+print(evaluations.query("score > @threshold").shape)`} />
+
+An `@` prefix reaches out to a Python variable. Note that `query` uses `and`/`or`, not `&`/`|` —
+it is a small expression language of its own.
+
+## Assigning
+
+Assign through `.loc`, naming both the rows and the column:
+
+<Run id="dw-sel-8" code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "question": ["q1", "q2", "q3", "q4"],
+    "score": [0.95, 0.72, 0.61, 0.40],
+})
+
+evaluations.loc[evaluations["score"] < 0.7, "verdict"] = "review"
+evaluations.loc[evaluations["score"] >= 0.7, "verdict"] = "accept"
+
+print(evaluations)
+print()
+
+# A whole column at once:
+evaluations["score"] = evaluations["score"].round(1)
+print(evaluations)`} />
+
+The mistake to know about is **chained assignment** — selecting twice and assigning into the
+second selection:
+
+<Run id="dw-sel-9" code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "question": ["q1", "q2", "q3"],
+    "score": [0.95, 0.72, 0.40],
+})
+
+# Two separate operations: the filter makes a new frame, and the assignment
+# lands on that temporary. The original is untouched.
+evaluations[evaluations["score"] < 0.5]["score"] = 0.0
+print(evaluations)
+print()
+
+# What you meant:
+evaluations.loc[evaluations["score"] < 0.5, "score"] = 0.0
+print(evaluations)`} />
+
+<Callout type="warning">
+Chained assignment never modifies the original frame — `df[mask]["col"] = value` writes into a
+temporary that is discarded immediately. Under pandas' copy-on-write behaviour this is
+consistently a no-op rather than a coin flip, which is better, but it is still silent. One
+`.loc[rows, column] = value` is always the right form.
+</Callout>
+
+## where, mask and assign
+
+<Run id="dw-sel-10" code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "question": ["q1", "q2", "q3", "q4"],
+    "score": [0.95, 0.72, 0.61, 0.40],
+    "latency_ms": [320, 90, 410, 85],
+})
+
+# where: keep the value where the condition is True, replace it otherwise.
+print(evaluations["score"].where(evaluations["score"] > 0.7, 0.0))
+print()
+# mask is the inverse.
+print(evaluations["score"].mask(evaluations["score"] > 0.7, 1.0))
+print()
+
+# assign returns a new frame, so several derived columns chain cleanly.
+summary = (
+    evaluations
+    .assign(passed=lambda df: df["score"] >= 0.7)
+    .assign(seconds=lambda df: df["latency_ms"] / 1000)
+    .sort_values("score", ascending=False)
+    .reset_index(drop=True)
+)
+print(summary)`} />
+
+<Callout type="ai" title="Why this matters for AI">
+Every claim about a model is a filtered slice: accuracy on hard questions, latency at the 95th
+percentile, failures where the prompt was over 4,000 tokens. Being able to express those slices
+directly is what lets you answer "where is it actually going wrong?" in one line instead of an
+afternoon. The chained-assignment trap matters here too — a labelling script that silently fails
+to write leaves you evaluating against data you think you fixed.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="dw-sel-ex1"
+  title="Exercise 1"
+  brief="Set <code>slow_failures</code> to the rows where the score is below 0.7 <em>and</em> latency is above 300 ms, keeping only the <code>question</code> and <code>score</code> columns."
+  code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "question": ["q1", "q2", "q3", "q4", "q5", "q6"],
+    "model": ["opus", "haiku", "opus", "haiku", "opus", "haiku"],
+    "score": [0.95, 0.72, 0.61, 0.40, 0.55, 0.66],
+    "latency_ms": [320, 90, 410, 85, 620, 310],
+})
+
+slow_failures = None
+
+print(slow_failures)`}
+  hint="Build the mask as (evaluations['score'] < 0.7) & (evaluations['latency_ms'] > 300), then select the two columns with a list."
+  solution={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "question": ["q1", "q2", "q3", "q4", "q5", "q6"],
+    "model": ["opus", "haiku", "opus", "haiku", "opus", "haiku"],
+    "score": [0.95, 0.72, 0.61, 0.40, 0.55, 0.66],
+    "latency_ms": [320, 90, 410, 85, 620, 310],
+})
+
+mask = (evaluations["score"] < 0.7) & (evaluations["latency_ms"] > 300)
+slow_failures = evaluations.loc[mask, ["question", "score"]]
+
+print(slow_failures)`}
+  tests={`import pandas as pd
+
+assert isinstance(slow_failures, pd.DataFrame), (
+    f"slow_failures should be a DataFrame, got {type(slow_failures).__name__}."
+)
+assert list(slow_failures.columns) == ["question", "score"], (
+    f"Keep only question and score, in that order. Got {list(slow_failures.columns)}."
+)
+assert list(slow_failures["question"]) == ["q3", "q5", "q6"], (
+    f"q3, q5 and q6 are the slow failures. Got {list(slow_failures['question'])}."
+)
+assert len(slow_failures) == 3, f"Expected 3 rows, got {len(slow_failures)}."`}
+/>
+
+<Exercise
+  id="dw-sel-ex2"
+  title="Exercise 2"
+  brief="The chained assignment below does nothing. Rewrite it with <code>.loc</code> so every score under 0.5 really does become 0.0."
+  code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "question": ["q1", "q2", "q3", "q4"],
+    "score": [0.95, 0.40, 0.61, 0.20],
+})
+
+evaluations[evaluations["score"] < 0.5]["score"] = 0.0
+
+print(evaluations)`}
+  hint="One statement: evaluations.loc[rows, 'score'] = 0.0, where rows is the boolean mask."
+  solution={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "question": ["q1", "q2", "q3", "q4"],
+    "score": [0.95, 0.40, 0.61, 0.20],
+})
+
+evaluations.loc[evaluations["score"] < 0.5, "score"] = 0.0
+
+print(evaluations)`}
+  tests={`import pandas as pd
+
+assert list(evaluations["score"]) == [0.95, 0.0, 0.61, 0.0], (
+    f"Expected the two low scores floored to 0.0, got {list(evaluations['score'])}. "
+    "A chained selection assigns into a temporary and leaves the original untouched."
+)
+assert list(evaluations["question"]) == ["q1", "q2", "q3", "q4"], (
+    "No rows should be dropped — only the two low scores change."
+)`}
+/>
+
+<Quiz
+  question="df.loc['a':'c'] and df.iloc[0:3] on a six-row frame indexed a…f. How many rows does each return?"
+  choices={[
+    { text: "Three each, but loc includes its endpoint while iloc excludes it", correct: true, why: "loc slices by label and is inclusive on both ends; iloc follows normal Python slicing." },
+    { text: "loc gives two, iloc gives three", why: "loc['a':'c'] includes c, so it gives a, b and c." },
+    { text: "Both give four", why: "iloc[0:3] stops before position 3, so it can never return four rows." },
+    { text: "loc raises an error on a string slice", why: "Slicing a sorted label index with strings is well defined and common." },
+  ]}
+/>
+
+<Quiz
+  question="Why does df[df['score'] < 0.5]['score'] = 0.0 leave the original frame unchanged?"
+  choices={[
+    { text: "The filter produces a new temporary frame, and the assignment lands on that before it is discarded", correct: true, why: "There are two separate operations; nothing connects the write back to the frame you started with." },
+    { text: "The mask is evaluated lazily and never runs", why: "The mask is computed immediately; the problem is where the assignment goes." },
+    { text: "score is read-only after filtering", why: "Nothing is read-only; the write succeeds, just not on the object you wanted." },
+    { text: "It does change it, but only after you call df.flush()", why: "There is no such method — the write is simply gone." },
+  ]}
+/>
+
+## Recap
+
+- `loc` selects by label and its slices include the endpoint; `iloc` selects by position and
+  excludes it.
+- A comparison gives a boolean Series; index with it to filter, and combine with `&`, `|`, `~`,
+  parenthesising each condition.
+- `isin`, `between` and the `.str` accessor cover most of what masks need.
+- `query("score > 0.7 and latency_ms < 400")` reads better for long conditions, and `@name`
+  reaches a Python variable.
+- Assign with `df.loc[rows, column] = value`. Chained assignment writes to a temporary and is
+  silently lost.
+- `assign` returns a new frame, so derived columns chain readably.

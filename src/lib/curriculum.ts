@@ -67,18 +67,8 @@ export const MODULES: Module[] = [
     description:
       "Real datasets are messy, and most of an AI project is spent here. Load, reshape, join, group, and visualise data — and learn the failure modes that quietly poison a model downstream.",
     level: "intermediate",
-    status: "planned",
+    status: "published",
     icon: "table",
-    plannedLessons: [
-      "Series and DataFrames",
-      "Selecting, filtering and assigning",
-      "Missing data and type coercion",
-      "Group-by, aggregate, pivot",
-      "Joins and reshaping",
-      "Time series basics",
-      "Plotting with matplotlib",
-      "Exploratory analysis without fooling yourself",
-    ],
   },
   {
     slug: "ml-foundations",

@@ -1,0 +1,437 @@
+---
+title: Exploratory analysis without fooling yourself
+description: Simpson's paradox, survivorship bias, small-group noise and the multiple-comparisons trap — the four ways a correct calculation tells you something false.
+module: data-wrangling
+order: 8
+level: intermediate
+minutes: 20
+objectives:
+  - Look at distributions and group sizes before believing an average
+  - Recognise Simpson's paradox and check for a confounder
+  - Spot survivorship bias in a filtered dataset
+  - Quantify how much a small group's number can be trusted
+  - Avoid finding a false result by slicing until something looks significant
+---
+
+Every calculation in this module is easy to get arithmetically right and still be misled by.
+This lesson is about the four failures that produce a correct number and a wrong conclusion.
+
+## Start with the shape, not the mean
+
+<Run id="dw-eda-1" code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+
+# Two very different realities with the same average.
+uniform = rng.normal(0.70, 0.05, 500).clip(0, 1)
+bimodal = np.concatenate([rng.normal(0.97, 0.02, 350), rng.normal(0.07, 0.03, 150)]).clip(0, 1)
+
+for name, scores in [("uniform", uniform), ("bimodal", bimodal)]:
+    print(f"{name:8} mean {scores.mean():.3f}  median {np.median(scores):.3f}  "
+          f"std {scores.std():.3f}  p10 {np.quantile(scores, 0.1):.3f}")
+
+print()
+print("fraction scoring below 0.5:")
+print(f"  uniform {np.mean(uniform < 0.5):.1%}")
+print(f"  bimodal {np.mean(bimodal < 0.5):.1%}")`} />
+
+Both average about 0.70. One model is mediocre at everything; the other is excellent at 70% of
+questions and completely fails the rest. They need different work, and the mean cannot tell them
+apart.
+
+<Run id="dw-eda-2" code={`import matplotlib.pyplot as plt
+import numpy as np
+
+rng = np.random.default_rng(0)
+uniform = rng.normal(0.70, 0.05, 500).clip(0, 1)
+bimodal = np.concatenate([rng.normal(0.97, 0.02, 350), rng.normal(0.07, 0.03, 150)]).clip(0, 1)
+
+fig, axes = plt.subplots(1, 2, figsize=(8, 3), sharey=True)
+for ax, (name, scores) in zip(axes, [("uniform", uniform), ("bimodal", bimodal)]):
+    ax.hist(scores, bins=40, range=(0, 1))
+    ax.axvline(scores.mean(), color="#ef4444", linewidth=2)
+    ax.set_title(f"{name} — mean {scores.mean():.2f}")
+    ax.set_xlabel("score")`} />
+
+## Simpson's paradox
+
+A model can be worse overall and better on every single subgroup:
+
+<Run id="dw-eda-3" code={`import pandas as pd
+
+results = pd.DataFrame([
+    {"model": "A", "difficulty": "easy", "correct": 90, "total": 100},
+    {"model": "A", "difficulty": "hard", "correct": 5, "total": 10},
+    {"model": "B", "difficulty": "easy", "correct": 19, "total": 20},
+    {"model": "B", "difficulty": "hard", "correct": 60, "total": 100},
+])
+
+results["accuracy"] = results["correct"] / results["total"]
+print(results)
+print()
+
+overall = results.groupby("model")[["correct", "total"]].sum()
+overall["accuracy"] = (overall["correct"] / overall["total"]).round(4)
+print("overall:")
+print(overall)`} />
+
+Model B wins on easy questions (0.95 against 0.90) and on hard questions (0.60 against 0.50), and
+loses overall. Nothing is wrong with the arithmetic — the two models were simply given different
+mixes of questions:
+
+<Run id="dw-eda-4" code={`import pandas as pd
+
+results = pd.DataFrame([
+    {"model": "A", "difficulty": "easy", "correct": 90, "total": 100},
+    {"model": "A", "difficulty": "hard", "correct": 5, "total": 10},
+    {"model": "B", "difficulty": "easy", "correct": 19, "total": 20},
+    {"model": "B", "difficulty": "hard", "correct": 60, "total": 100},
+])
+
+mix = results.pivot_table(index="model", columns="difficulty", values="total", aggfunc="sum")
+mix["hard_share"] = (mix["hard"] / (mix["easy"] + mix["hard"])).round(3)
+print(mix)
+print()
+
+# Reweight both models to the same question mix — the fair comparison.
+weights = {"easy": 0.5, "hard": 0.5}
+results["accuracy"] = results["correct"] / results["total"]
+results["weight"] = results["difficulty"].map(weights)
+balanced = results.groupby("model").apply(
+    lambda g: (g["accuracy"] * g["weight"]).sum(), include_groups=False
+)
+print("accuracy on a 50/50 mix:")
+print(balanced.round(4))`} />
+
+<Callout type="ai" title="Why this matters for AI">
+This is not a curiosity — it is the default state of model comparison. Two models are almost
+never evaluated on the same mix of questions, languages, prompt lengths or users, and whichever
+got the easier mix wins on the headline number. Before comparing two models, check that the
+denominators match: `crosstab(model, difficulty)` takes one line and settles it. If the mixes
+differ, either reweight or compare only within subgroups.
+</Callout>
+
+## Survivorship bias
+
+The rows that are missing are often the rows that matter:
+
+<Run id="dw-eda-5" code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 500
+
+questions = pd.DataFrame({
+    "question_id": range(n),
+    "prompt_tokens": rng.integers(100, 8000, n),
+})
+# Long prompts time out and produce no answer at all.
+questions["answered"] = questions["prompt_tokens"] < 6000
+questions["score"] = np.where(
+    questions["answered"],
+    (1 - questions["prompt_tokens"] / 12000 + rng.normal(0, 0.08, n)).clip(0, 1),
+    np.nan,
+)
+
+answered = questions[questions["answered"]]
+
+print(f"answered {len(answered)} of {n} questions")
+print(f"mean score over answered only: {answered['score'].mean():.3f}")
+print(f"mean score counting failures as 0: {questions['score'].fillna(0).mean():.3f}")
+print()
+print("mean prompt length:")
+print(f"  answered {answered['prompt_tokens'].mean():7.0f} tokens")
+print(f"  dropped  {questions.loc[~questions['answered'], 'prompt_tokens'].mean():7.0f} tokens")`} />
+
+Reporting 0.72 over the answered subset is not a lie, but it answers a question nobody asked. The
+number a user experiences counts the failures.
+
+## Small groups are noise
+
+<Run id="dw-eda-6" code={`import pandas as pd
+import numpy as np
+
+def wilson_interval(correct, total, z=1.96):
+    """A confidence interval for a proportion that behaves at small n."""
+    if total == 0:
+        return (0.0, 1.0)
+    p = correct / total
+    denominator = 1 + z ** 2 / total
+    centre = (p + z ** 2 / (2 * total)) / denominator
+    spread = z * np.sqrt(p * (1 - p) / total + z ** 2 / (4 * total ** 2)) / denominator
+    return (max(0.0, centre - spread), min(1.0, centre + spread))
+
+groups = pd.DataFrame([
+    {"language": "en", "correct": 340, "total": 400},
+    {"language": "si", "correct": 3, "total": 3},
+    {"language": "ta", "correct": 7, "total": 12},
+    {"language": "fr", "correct": 46, "total": 60},
+])
+groups["accuracy"] = (groups["correct"] / groups["total"]).round(3)
+groups[["low", "high"]] = [wilson_interval(r.correct, r.total) for r in groups.itertuples()]
+groups["width"] = (groups["high"] - groups["low"]).round(3)
+
+print(groups.round(3).sort_values("accuracy", ascending=False))`} />
+
+Sinhala tops the table at 100% — from three questions, with an interval running from 0.44 to
+1.00. It is entirely consistent with that model being worse than every other language.
+
+<Callout type="tip">
+Put an interval, or at least the group size, next to every per-group number you report. A table
+of accuracies without denominators invites exactly the wrong conclusion, and it takes one extra
+column to prevent.
+</Callout>
+
+## Slicing until something looks real
+
+If you test twenty slices at the 5% level, you expect one false positive even when nothing is
+happening:
+
+<Run id="dw-eda-7" code={`import numpy as np
+
+rng = np.random.default_rng(3)
+
+# One model, no real differences: every slice is the same coin.
+slices = [f"slice-{i}" for i in range(20)]
+true_rate = 0.70
+n_per_slice = 60
+
+observed = {name: rng.binomial(n_per_slice, true_rate) / n_per_slice for name in slices}
+
+best = max(observed, key=observed.get)
+worst = min(observed, key=observed.get)
+
+print(f"true rate for every slice: {true_rate}")
+print(f"best slice:  {best} at {observed[best]:.3f}")
+print(f"worst slice: {worst} at {observed[worst]:.3f}")
+print(f"spread purely from noise: {observed[best] - observed[worst]:.3f}")
+print()
+print("standard error of one slice:", round(np.sqrt(true_rate * (1 - true_rate) / n_per_slice), 4))`} />
+
+An 18-point gap, entirely from chance. If you had gone looking for the slice where the model
+underperforms, you would have found one and written a ticket about it.
+
+<Callout type="warning">
+Decide which slices you care about **before** you look. If you must explore, treat anything you
+find as a hypothesis and confirm it on a fresh sample — the same discipline as a held-out test
+set, applied to your own analysis.
+</Callout>
+
+## Correlation is not the mechanism
+
+<Run id="dw-eda-8" code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 400
+
+# Long prompts arrive with hard questions AND cause slow responses.
+difficulty = rng.random(n)
+prompt_tokens = 200 + difficulty * 6000 + rng.normal(0, 300, n)
+latency = 50 + prompt_tokens * 0.05 + rng.normal(0, 40, n)
+score = (1 - difficulty + rng.normal(0, 0.1, n)).clip(0, 1)
+
+frame = pd.DataFrame({
+    "difficulty": difficulty,
+    "prompt_tokens": prompt_tokens,
+    "latency_ms": latency,
+    "score": score,
+})
+
+print(frame.corr(numeric_only=True).round(3))
+print()
+print("Latency correlates with a low score at", round(frame["latency_ms"].corr(frame["score"]), 3))
+print("...but within a narrow difficulty band:")
+band = frame[(frame["difficulty"] > 0.45) & (frame["difficulty"] < 0.55)]
+print("  correlation:", round(band["latency_ms"].corr(band["score"]), 3), f"(n={len(band)})")`} />
+
+Slow answers score badly — but making the model faster would not help. Difficulty drives both.
+
+## A checklist
+
+<Run id="dw-eda-9" code={`checks = [
+    "Did I look at the distribution, or only the mean?",
+    "Do the groups I am comparing have the same mix of inputs?",
+    "What is in the denominator — and what got filtered out before I looked?",
+    "How big is each group, and how wide is the interval around its number?",
+    "Did I decide on this slice before or after seeing the data?",
+    "Is there a third variable driving both sides of this correlation?",
+]
+
+for number, check in enumerate(checks, start=1):
+    print(f"{number}. {check}")`} />
+
+## Try it yourself
+
+<Exercise
+  id="dw-eda-ex1"
+  title="Exercise 1"
+  brief="Compute <code>overall</code> (accuracy per model over all questions) and <code>by_difficulty</code> (accuracy per model and difficulty), then set <code>paradox</code> to True if one model wins overall while the other wins every subgroup."
+  code={`import pandas as pd
+
+results = pd.DataFrame([
+    {"model": "A", "difficulty": "easy", "correct": 90, "total": 100},
+    {"model": "A", "difficulty": "hard", "correct": 5, "total": 10},
+    {"model": "B", "difficulty": "easy", "correct": 19, "total": 20},
+    {"model": "B", "difficulty": "hard", "correct": 60, "total": 100},
+])
+
+overall = None        # a Series: model -> pooled accuracy
+by_difficulty = None  # a Series indexed by (model, difficulty) -> accuracy
+paradox = None
+
+print(overall)
+print(by_difficulty)
+print("paradox:", paradox)`}
+  hint="Pool with groupby('model')[['correct','total']].sum() then divide. For subgroups, group by both columns. Then compare who wins overall against who wins each subgroup."
+  solution={`import pandas as pd
+
+results = pd.DataFrame([
+    {"model": "A", "difficulty": "easy", "correct": 90, "total": 100},
+    {"model": "A", "difficulty": "hard", "correct": 5, "total": 10},
+    {"model": "B", "difficulty": "easy", "correct": 19, "total": 20},
+    {"model": "B", "difficulty": "hard", "correct": 60, "total": 100},
+])
+
+pooled = results.groupby("model")[["correct", "total"]].sum()
+overall = pooled["correct"] / pooled["total"]
+
+grouped = results.groupby(["model", "difficulty"])[["correct", "total"]].sum()
+by_difficulty = grouped["correct"] / grouped["total"]
+
+overall_winner = overall.idxmax()
+subgroup_winners = {
+    level: by_difficulty.xs(level, level="difficulty").idxmax()
+    for level in results["difficulty"].unique()
+}
+paradox = (
+    len(set(subgroup_winners.values())) == 1
+    and overall_winner not in set(subgroup_winners.values())
+)
+
+print(overall)
+print(by_difficulty)
+print("paradox:", paradox)`}
+  tests={`import pandas as pd
+
+assert isinstance(overall, pd.Series), f"overall should be a Series, got {type(overall).__name__}."
+assert abs(overall["A"] - 95 / 110) < 1e-9, (
+    f"Model A got 95 of 110 overall, so {95 / 110:.4f}. Got {overall['A']}."
+)
+assert abs(overall["B"] - 79 / 120) < 1e-9, (
+    f"Model B got 79 of 120 overall, so {79 / 120:.4f}. Got {overall['B']}."
+)
+
+assert isinstance(by_difficulty, pd.Series), "by_difficulty should be a Series."
+assert abs(by_difficulty[("B", "hard")] - 0.6) < 1e-9, (
+    f"B answered 60 of 100 hard questions. Got {by_difficulty[('B', 'hard')]}."
+)
+assert abs(by_difficulty[("A", "easy")] - 0.9) < 1e-9, (
+    f"A answered 90 of 100 easy questions. Got {by_difficulty[('A', 'easy')]}."
+)
+
+assert paradox is True, (
+    "B beats A on easy (0.95 vs 0.90) and on hard (0.60 vs 0.50) yet loses overall — "
+    f"that is the paradox, so paradox should be True. Got {paradox!r}."
+)`}
+/>
+
+<Exercise
+  id="dw-eda-ex2"
+  title="Exercise 2"
+  brief="Write <code>trustworthy(correct, total, width=0.2)</code>: return True only when the Wilson interval around the accuracy is narrower than <code>width</code>."
+  code={`import numpy as np
+
+def wilson_interval(correct, total, z=1.96):
+    if total == 0:
+        return (0.0, 1.0)
+    p = correct / total
+    denominator = 1 + z ** 2 / total
+    centre = (p + z ** 2 / (2 * total)) / denominator
+    spread = z * np.sqrt(p * (1 - p) / total + z ** 2 / (4 * total ** 2)) / denominator
+    return (max(0.0, centre - spread), min(1.0, centre + spread))
+
+
+def trustworthy(correct, total, width=0.2):
+    # True only when high - low is below width.
+    ...
+
+
+for correct, total in [(3, 3), (7, 12), (46, 60), (340, 400)]:
+    low, high = wilson_interval(correct, total)
+    print(f"{correct:3}/{total:<4} [{low:.3f}, {high:.3f}] width {high - low:.3f} -> {trustworthy(correct, total)}")`}
+  hint="Unpack wilson_interval(correct, total) and compare high - low with width."
+  solution={`import numpy as np
+
+def wilson_interval(correct, total, z=1.96):
+    if total == 0:
+        return (0.0, 1.0)
+    p = correct / total
+    denominator = 1 + z ** 2 / total
+    centre = (p + z ** 2 / (2 * total)) / denominator
+    spread = z * np.sqrt(p * (1 - p) / total + z ** 2 / (4 * total ** 2)) / denominator
+    return (max(0.0, centre - spread), min(1.0, centre + spread))
+
+
+def trustworthy(correct, total, width=0.2):
+    low, high = wilson_interval(correct, total)
+    return (high - low) < width
+
+
+for correct, total in [(3, 3), (7, 12), (46, 60), (340, 400)]:
+    low, high = wilson_interval(correct, total)
+    print(f"{correct:3}/{total:<4} [{low:.3f}, {high:.3f}] width {high - low:.3f} -> {trustworthy(correct, total)}")`}
+  tests={`assert trustworthy(340, 400) is True or trustworthy(340, 400) == True, (
+    "400 questions give a narrow interval, so this should be trustworthy."
+)
+assert not trustworthy(3, 3), (
+    "Three questions at 100% give an interval roughly 0.44 to 1.00 — far wider than 0.2."
+)
+assert not trustworthy(7, 12), "Twelve questions are not enough for a 0.2-wide interval."
+assert trustworthy(0, 0) is False or not trustworthy(0, 0), (
+    "With no data at all the interval spans the whole range, so it cannot be trustworthy."
+)
+
+# The width argument must actually be used.
+assert trustworthy(7, 12, width=1.0), (
+    "With a permissive width of 1.0, a 12-question group should pass — use the width argument."
+)
+assert not trustworthy(340, 400, width=0.01), (
+    "With a demanding width of 0.01, even 400 questions should fail."
+)`}
+/>
+
+<Quiz
+  question="Model B beats Model A on easy questions and on hard questions, but loses on the pooled number. What should you check first?"
+  choices={[
+    { text: "Whether the two models were given the same mix of easy and hard questions", correct: true, why: "That is Simpson's paradox: the pooled figure is dominated by whichever model got the easier mix, and a crosstab of model against difficulty settles it immediately." },
+    { text: "Whether the accuracy calculation has a bug", why: "The arithmetic can be perfectly correct and still produce this reversal — that is what makes it dangerous." },
+    { text: "Whether B is overfitting", why: "Overfitting would show as a train/test gap, not as a subgroup-versus-pooled reversal." },
+    { text: "Nothing — the pooled number is the one that counts", why: "The pooled number answers 'how did it do on this particular mix', which is not the question when the mixes differ." },
+  ]}
+/>
+
+<Quiz
+  question="You check twenty subgroups for underperformance and find one that is clearly worse. What is the responsible next step?"
+  choices={[
+    { text: "Treat it as a hypothesis and test it on fresh data before acting", correct: true, why: "Twenty tests at the 5% level produce a false positive about half the time, so the finding needs confirming on data you did not search." },
+    { text: "Open a ticket — the evidence is in the data", why: "The evidence is exactly what you would expect from noise once you have looked twenty times." },
+    { text: "Report it, noting that you checked twenty subgroups", why: "Disclosure is better than silence but does not make an unreplicated finding actionable." },
+    { text: "Re-run the same analysis to confirm", why: "Re-running on the same data reproduces the same noise; only new data tests the claim." },
+  ]}
+/>
+
+## Recap
+
+- Look at the distribution first. Two models with the same mean can need completely different
+  work.
+- Simpson's paradox is the normal case in model comparison: check the group sizes match, and
+  reweight or compare within subgroups when they do not.
+- Ask what got filtered out before the number was computed — the unanswered questions are usually
+  the interesting ones.
+- Report group sizes or intervals. A 100% from three examples is consistent with being the worst
+  group you have.
+- Choose your slices before you look, and confirm anything you find by exploring on fresh data.
+- A correlation usually has a third variable behind it; check within a narrow band of the
+  suspected confounder.
