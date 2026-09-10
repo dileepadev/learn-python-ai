@@ -7,9 +7,22 @@ interface Props {
   stdin?: string;
   label?: string;
   editable?: boolean;
+  /**
+   * This block is *meant* to fail, with this exception class — a lesson
+   * demonstrating a KeyError, say. Read by scripts/verify-exercises.mjs, which
+   * then fails the build if the block ever stops raising it.
+   */
+  raises?: string;
+  /**
+   * This block never terminates on purpose, to demonstrate Stop. The verifier
+   * skips it rather than hanging.
+   */
+  endless?: boolean;
 }
 
-const { id, ...rest } = Astro.props;
+// `raises` and `endless` describe the block for the verifier; the reader sees
+// the same editor either way, and the surrounding prose explains what happens.
+const { id, raises: _raises, endless: _endless, ...rest } = Astro.props;
 ---
 
 <CodeRunner client:visible id={id} {...rest} />
