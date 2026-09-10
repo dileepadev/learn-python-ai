@@ -1,0 +1,376 @@
+---
+title: Group-by, aggregate, pivot
+description: Split-apply-combine — the operation that answers "how does this vary by model, by difficulty, by day?" — plus transform, pivot tables and crosstabs.
+module: data-wrangling
+order: 4
+level: intermediate
+minutes: 20
+objectives:
+  - Group by one or more columns and aggregate each group
+  - Name several aggregations at once with agg
+  - Broadcast a group statistic back to every row with transform
+  - Keep or drop whole groups with filter
+  - Build a pivot table and a crosstab
+---
+
+Nearly every question about an evaluation is a group-by: accuracy **by model**, latency **by
+difficulty**, cost **by day**. pandas calls the pattern split-apply-combine — split the rows into
+groups, apply a function to each, combine the answers into a table.
+
+<Run id="dw-grp-1" code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 300
+
+evaluations = pd.DataFrame({
+    "model": rng.choice(["opus", "haiku", "sonnet"], size=n),
+    "difficulty": rng.choice(["easy", "medium", "hard"], size=n),
+    "score": rng.random(n).round(3),
+    "latency_ms": rng.integers(60, 900, size=n),
+    "tokens": rng.integers(100, 3000, size=n),
+})
+
+print(evaluations.head())
+print("rows:", len(evaluations))`} />
+
+## One group, one number
+
+<Run id="dw-grp-2" code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "model": ["opus", "haiku", "opus", "haiku", "opus", "sonnet"],
+    "score": [0.95, 0.62, 0.88, 0.71, 0.79, 0.84],
+    "latency_ms": [320, 90, 350, 85, 300, 180],
+})
+
+print(evaluations.groupby("model")["score"].mean().round(3))
+print()
+print("how many of each:")
+print(evaluations.groupby("model").size())
+print()
+print("several columns at once:")
+print(evaluations.groupby("model")[["score", "latency_ms"]].mean().round(2))`} />
+
+The grouping column becomes the index. `reset_index()` turns it back into an ordinary column when
+you want a flat table:
+
+<Run id="dw-grp-3" code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "model": ["opus", "haiku", "opus", "haiku"],
+    "score": [0.95, 0.62, 0.88, 0.71],
+})
+
+grouped = evaluations.groupby("model")["score"].mean()
+print(type(grouped).__name__)
+print(grouped)
+print()
+print(grouped.reset_index())`} />
+
+## Named aggregations
+
+Asking for several statistics with names is what makes a summary table readable:
+
+<Run id="dw-grp-4" code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 300
+evaluations = pd.DataFrame({
+    "model": rng.choice(["opus", "haiku", "sonnet"], size=n),
+    "score": rng.random(n).round(3),
+    "latency_ms": rng.integers(60, 900, size=n),
+    "tokens": rng.integers(100, 3000, size=n),
+})
+
+summary = evaluations.groupby("model").agg(
+    examples=("score", "size"),
+    accuracy=("score", "mean"),
+    worst=("score", "min"),
+    p95_latency=("latency_ms", lambda s: s.quantile(0.95)),
+    total_tokens=("tokens", "sum"),
+).round(3)
+
+print(summary)
+print()
+print(summary.sort_values("accuracy", ascending=False))`} />
+
+<Callout type="tip">
+`size` counts every row in the group; `count` counts the non-missing values in a column. When a
+column has gaps those two differ, and the gap between them is itself worth looking at.
+</Callout>
+
+## Grouping by several columns
+
+<Run id="dw-grp-5" code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 300
+evaluations = pd.DataFrame({
+    "model": rng.choice(["opus", "haiku"], size=n),
+    "difficulty": rng.choice(["easy", "medium", "hard"], size=n),
+    "score": rng.random(n).round(3),
+})
+
+by_both = evaluations.groupby(["model", "difficulty"])["score"].mean().round(3)
+print(by_both)
+print()
+print("as a flat table:")
+print(by_both.reset_index())
+print()
+print("just one combination:", round(by_both.loc[("opus", "hard")], 3))`} />
+
+## transform
+
+`transform` computes a per-group statistic and hands it back aligned to every original row —
+which is how you compare a row against its own group:
+
+<Run id="dw-grp-6" code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "model": ["opus", "opus", "opus", "haiku", "haiku", "haiku"],
+    "question": ["q1", "q2", "q3", "q1", "q2", "q3"],
+    "score": [0.95, 0.60, 0.88, 0.71, 0.40, 0.62],
+})
+
+evaluations["model_mean"] = evaluations.groupby("model")["score"].transform("mean")
+evaluations["vs_model_mean"] = (evaluations["score"] - evaluations["model_mean"]).round(3)
+evaluations["rank_in_model"] = evaluations.groupby("model")["score"].rank(ascending=False)
+
+print(evaluations.round(3))
+print()
+print("below their model's average:")
+print(evaluations[evaluations["vs_model_mean"] < 0][["model", "question", "score"]])`} />
+
+`agg` collapses each group to one row; `transform` keeps every row. That is the whole
+distinction, and choosing the wrong one is the most common group-by mistake.
+
+## filter
+
+`filter` keeps or drops entire groups based on a condition about the group:
+
+<Run id="dw-grp-7" code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "model": ["opus", "opus", "opus", "haiku", "experimental"],
+    "score": [0.95, 0.60, 0.88, 0.71, 0.99],
+})
+
+print("groups with at least 2 examples:")
+print(evaluations.groupby("model").filter(lambda group: len(group) >= 2))
+print()
+print("groups averaging above 0.7:")
+print(evaluations.groupby("model").filter(lambda group: group["score"].mean() > 0.7))`} />
+
+<Callout type="ai" title="Why this matters for AI">
+A single accuracy number hides everything interesting. Grouping is how you find that a model is
+excellent on easy questions and no better than chance on hard ones, that latency triples on one
+document type, or that a 2% overall failure rate is a 40% failure rate for one language. The
+`filter` above also matters: a per-group score computed from three examples is noise, and
+dropping tiny groups before you draw conclusions is basic hygiene.
+</Callout>
+
+## Pivot tables
+
+A pivot table is a group-by laid out as a grid, which is far easier to read when you are
+comparing two dimensions:
+
+<Run id="dw-grp-8" code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 400
+evaluations = pd.DataFrame({
+    "model": rng.choice(["opus", "haiku", "sonnet"], size=n),
+    "difficulty": rng.choice(["easy", "medium", "hard"], size=n),
+    "score": rng.random(n).round(3),
+})
+
+table = evaluations.pivot_table(
+    index="model",
+    columns="difficulty",
+    values="score",
+    aggfunc="mean",
+).round(3)
+
+print(table[["easy", "medium", "hard"]])
+print()
+print("with totals:")
+print(evaluations.pivot_table(
+    index="model", columns="difficulty", values="score",
+    aggfunc="mean", margins=True, margins_name="all",
+).round(3))`} />
+
+`crosstab` is the count-only shorthand, useful for checking a dataset is balanced:
+
+<Run id="dw-grp-9" code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 400
+evaluations = pd.DataFrame({
+    "model": rng.choice(["opus", "haiku", "sonnet"], size=n),
+    "difficulty": rng.choice(["easy", "medium", "hard"], size=n),
+})
+
+print(pd.crosstab(evaluations["model"], evaluations["difficulty"]))
+print()
+print("as proportions of each row:")
+print(pd.crosstab(evaluations["model"], evaluations["difficulty"], normalize="index").round(3))`} />
+
+## apply, and its price
+
+`apply` runs an arbitrary Python function per group. It is the escape hatch — flexible, and far
+slower than a built-in aggregation, because it cannot stay in compiled code:
+
+<Run id="dw-grp-10" code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "model": ["opus", "opus", "haiku", "haiku"],
+    "score": [0.95, 0.60, 0.71, 0.40],
+    "tokens": [1000, 500, 200, 100],
+})
+
+def weighted_accuracy(group):
+    return (group["score"] * group["tokens"]).sum() / group["tokens"].sum()
+
+print(evaluations.groupby("model")[["score", "tokens"]].apply(weighted_accuracy).round(4))
+print()
+print("the same thing without apply:")
+evaluations["weighted"] = evaluations["score"] * evaluations["tokens"]
+totals = evaluations.groupby("model")[["weighted", "tokens"]].sum()
+print((totals["weighted"] / totals["tokens"]).round(4))`} />
+
+## Try it yourself
+
+<Exercise
+  id="dw-grp-ex1"
+  title="Exercise 1"
+  brief="Build <code>summary</code>: one row per model, with columns <code>examples</code> (row count), <code>accuracy</code> (mean score) and <code>total_tokens</code> (sum), sorted by accuracy, best first."
+  code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "model": ["opus", "haiku", "opus", "haiku", "opus", "sonnet"],
+    "score": [0.9, 0.6, 0.8, 0.7, 0.7, 0.5],
+    "tokens": [100, 200, 300, 400, 500, 600],
+})
+
+summary = None
+
+print(summary)`}
+  hint="groupby('model').agg(examples=('score', 'size'), accuracy=('score', 'mean'), total_tokens=('tokens', 'sum')) then sort_values."
+  solution={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "model": ["opus", "haiku", "opus", "haiku", "opus", "sonnet"],
+    "score": [0.9, 0.6, 0.8, 0.7, 0.7, 0.5],
+    "tokens": [100, 200, 300, 400, 500, 600],
+})
+
+summary = evaluations.groupby("model").agg(
+    examples=("score", "size"),
+    accuracy=("score", "mean"),
+    total_tokens=("tokens", "sum"),
+).sort_values("accuracy", ascending=False)
+
+print(summary)`}
+  tests={`import pandas as pd
+
+assert isinstance(summary, pd.DataFrame), f"summary should be a DataFrame, got {type(summary).__name__}."
+assert set(summary.columns) == {"examples", "accuracy", "total_tokens"}, (
+    f"Expected columns examples, accuracy, total_tokens. Got {list(summary.columns)}."
+)
+assert list(summary.index) == ["opus", "haiku", "sonnet"], (
+    f"One row per model, sorted by accuracy best first: opus, haiku, sonnet. Got {list(summary.index)}."
+)
+assert summary.loc["opus", "examples"] == 3, f"opus has 3 rows, got {summary.loc['opus', 'examples']}."
+assert abs(summary.loc["opus", "accuracy"] - 0.8) < 1e-9, (
+    f"opus averages 0.8, got {summary.loc['opus', 'accuracy']}."
+)
+assert summary.loc["haiku", "total_tokens"] == 600, (
+    f"haiku's tokens sum to 600, got {summary.loc['haiku', 'total_tokens']}."
+)`}
+/>
+
+<Exercise
+  id="dw-grp-ex2"
+  title="Exercise 2"
+  brief="Add a <code>vs_model_mean</code> column holding each row's score minus its own model's mean score, and keep every original row."
+  code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "model": ["opus", "opus", "opus", "haiku", "haiku"],
+    "question": ["q1", "q2", "q3", "q1", "q2"],
+    "score": [0.9, 0.6, 0.9, 0.8, 0.4],
+})
+
+# Add vs_model_mean without collapsing the frame.
+
+print(evaluations)`}
+  hint="groupby('model')['score'].transform('mean') returns one value per original row, aligned — subtract it."
+  solution={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "model": ["opus", "opus", "opus", "haiku", "haiku"],
+    "question": ["q1", "q2", "q3", "q1", "q2"],
+    "score": [0.9, 0.6, 0.9, 0.8, 0.4],
+})
+
+evaluations["vs_model_mean"] = (
+    evaluations["score"] - evaluations.groupby("model")["score"].transform("mean")
+)
+
+print(evaluations)`}
+  tests={`import pandas as pd
+
+assert "vs_model_mean" in evaluations.columns, "Add a vs_model_mean column."
+assert len(evaluations) == 5, (
+    f"Every original row must survive — transform, not agg. Got {len(evaluations)} rows."
+)
+
+expected = [0.1, -0.2, 0.1, 0.2, -0.2]
+actual = [round(v, 10) for v in evaluations["vs_model_mean"]]
+assert all(abs(a - b) < 1e-9 for a, b in zip(actual, expected)), (
+    f"opus averages 0.8 and haiku 0.6, so expected {expected}. Got {actual}."
+)
+
+# Each group's deviations must sum to zero.
+sums = evaluations.groupby("model")["vs_model_mean"].sum()
+assert all(abs(v) < 1e-9 for v in sums), (
+    "Deviations from a group's own mean must cancel within that group."
+)`}
+/>
+
+<Quiz
+  question="You want each row labelled with its group's average, keeping every row. agg or transform?"
+  choices={[
+    { text: "transform — it returns one value per original row, aligned to the frame", correct: true, why: "agg collapses each group to a single row, which is exactly what you do not want here." },
+    { text: "agg — then merge the result back", why: "That works but is a roundabout way of doing what transform does in one call." },
+    { text: "apply, because the others cannot compute a mean", why: "Both compute means; the difference is the shape of what comes back." },
+    { text: "filter, with a lambda returning the mean", why: "filter keeps or drops whole groups and returns rows, not statistics." },
+  ]}
+/>
+
+<Quiz
+  question="A per-model accuracy table shows one model at 0.99 from 3 examples and another at 0.84 from 400. What should you do?"
+  choices={[
+    { text: "Treat the 3-example figure as noise, and drop tiny groups before comparing", correct: true, why: "Three examples give a confidence interval wide enough to contain almost anything; the comparison is meaningless until the group is big enough." },
+    { text: "Ship the 0.99 model — it is clearly better", why: "It is not clearly anything; three examples cannot distinguish 0.99 from 0.5 with any confidence." },
+    { text: "Average the two numbers to get an overall figure", why: "An unweighted average of group means quietly gives the 3-example group equal weight to the 400-example one." },
+    { text: "Nothing — group size does not affect a mean", why: "It does not affect the arithmetic, but it entirely determines how much the number can be trusted." },
+  ]}
+/>
+
+## Recap
+
+- Split-apply-combine: `groupby(cols)` then an aggregation.
+- `agg(name=(column, function), ...)` names several statistics in one readable table.
+- `size` counts rows; `count` counts non-missing values, and the difference is informative.
+- `transform` returns a value per original row — use it to compare a row with its own group.
+  `agg` collapses; `transform` keeps.
+- `filter` keeps or drops whole groups, which is how you remove groups too small to trust.
+- `pivot_table` lays a two-dimensional group-by out as a grid; `crosstab` does the count-only
+  version.
+- `apply` is the flexible, slow escape hatch — prefer a built-in aggregation when one exists.

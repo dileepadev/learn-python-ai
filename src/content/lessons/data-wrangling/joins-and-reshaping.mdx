@@ -1,0 +1,371 @@
+---
+title: Joins and reshaping
+description: Merge predictions onto ground truth without silently duplicating rows, and move between the wide shape people read and the long shape tools want.
+module: data-wrangling
+order: 5
+level: intermediate
+minutes: 20
+objectives:
+  - Merge two frames with inner, left and outer joins
+  - Catch an unintended fan-out with validate and indicator
+  - Concatenate frames by row and by column
+  - Reshape between wide and long with melt and pivot
+  - Expand a column of lists into one row per item with explode
+---
+
+Data arrives split across files: the questions in one, the model's answers in another, the human
+labels in a third. Joining them is routine — and the most common way to corrupt a dataset without
+noticing, because a bad join makes the table *bigger* rather than raising an error.
+
+## merge
+
+<Run id="dw-join-1" code={`import pandas as pd
+
+questions = pd.DataFrame({
+    "question_id": ["q1", "q2", "q3", "q4"],
+    "text": ["What is a token?", "What is RAG?", "Define embedding", "Explain MCP"],
+    "difficulty": ["easy", "medium", "easy", "hard"],
+})
+
+answers = pd.DataFrame({
+    "question_id": ["q1", "q2", "q3", "q5"],
+    "answer": ["A unit of text.", "Retrieval augmented generation.", "A vector.", "orphaned"],
+    "score": [0.95, 0.88, 0.72, 0.10],
+})
+
+print("inner — only ids in both:")
+print(questions.merge(answers, on="question_id"))
+print()
+print("left — every question, whether answered or not:")
+print(questions.merge(answers, on="question_id", how="left"))`} />
+
+<Run id="dw-join-2" code={`import pandas as pd
+
+questions = pd.DataFrame({
+    "question_id": ["q1", "q2", "q3", "q4"],
+    "difficulty": ["easy", "medium", "easy", "hard"],
+})
+answers = pd.DataFrame({
+    "question_id": ["q1", "q2", "q3", "q5"],
+    "score": [0.95, 0.88, 0.72, 0.10],
+})
+
+print("outer — everything from both sides:")
+print(questions.merge(answers, on="question_id", how="outer"))
+print()
+print("which side each row came from:")
+print(questions.merge(answers, on="question_id", how="outer", indicator=True))`} />
+
+`indicator=True` adds a `_merge` column saying whether each row was in the left frame, the right
+frame or both. Checking it is the fastest way to find the rows you were not expecting:
+
+<Run id="dw-join-3" code={`import pandas as pd
+
+questions = pd.DataFrame({"question_id": ["q1", "q2", "q3", "q4"]})
+answers = pd.DataFrame({"question_id": ["q1", "q2", "q3", "q5"], "score": [0.95, 0.88, 0.72, 0.10]})
+
+merged = questions.merge(answers, on="question_id", how="outer", indicator=True)
+print(merged["_merge"].value_counts())
+print()
+print("unanswered questions:", merged.loc[merged["_merge"] == "left_only", "question_id"].tolist())
+print("answers with no question:", merged.loc[merged["_merge"] == "right_only", "question_id"].tolist())`} />
+
+## Different column names, and suffixes
+
+<Run id="dw-join-4" code={`import pandas as pd
+
+predictions = pd.DataFrame({"qid": ["q1", "q2"], "score": [0.9, 0.4], "model": ["opus", "opus"]})
+truth = pd.DataFrame({"question_id": ["q1", "q2"], "score": [1.0, 0.0]})
+
+merged = predictions.merge(
+    truth,
+    left_on="qid",
+    right_on="question_id",
+    suffixes=("_predicted", "_true"),
+)
+print(merged)
+print()
+merged["error"] = (merged["score_predicted"] - merged["score_true"]).abs()
+print(merged[["qid", "score_predicted", "score_true", "error"]])`} />
+
+When both sides have a column of the same name, pandas appends the suffixes rather than losing
+one. Setting them explicitly turns `score_x` and `score_y` into something you can read.
+
+## Guarding against a fan-out
+
+If the right-hand frame has duplicate keys, a merge multiplies rows — quietly:
+
+<Run id="dw-join-5" code={`import pandas as pd
+
+questions = pd.DataFrame({"question_id": ["q1", "q2"], "difficulty": ["easy", "hard"]})
+answers = pd.DataFrame({
+    "question_id": ["q1", "q1", "q2"],      # q1 appears twice
+    "score": [0.9, 0.5, 0.7],
+})
+
+merged = questions.merge(answers, on="question_id")
+print(merged)
+print()
+print(f"{len(questions)} questions became {len(merged)} rows")
+print("mean score is now wrong:", round(merged["score"].mean(), 4))`} />
+
+`validate=` turns that from a silent corruption into an error:
+
+<Run id="dw-join-6" raises="MergeError" code={`import pandas as pd
+
+questions = pd.DataFrame({"question_id": ["q1", "q2"], "difficulty": ["easy", "hard"]})
+answers = pd.DataFrame({"question_id": ["q1", "q1", "q2"], "score": [0.9, 0.5, 0.7]})
+
+merged = questions.merge(answers, on="question_id", validate="one_to_one")
+print(merged)`} />
+
+<Callout type="warning">
+Pass `validate=` on every merge you write. `"one_to_one"`, `"one_to_many"` and `"many_to_one"`
+each state what you believe about the keys, and pandas checks it. A merge that silently triples
+your rows will not show up in a row count you never looked at, but it will move every average you
+report.
+</Callout>
+
+<Callout type="ai" title="Why this matters for AI">
+Evaluation is a join: predictions on one side, ground truth on the other. Get it wrong and every
+number downstream is wrong in a way no chart reveals — an inner join silently drops the examples
+your model failed to answer, which is exactly the set that mattered, and a fan-out counts some
+examples twice. Use a left join from the *ground truth* so unanswered examples stay visible as
+nulls, and pass `validate="one_to_one"`.
+</Callout>
+
+<Run id="dw-join-7" code={`import pandas as pd
+
+truth = pd.DataFrame({"question_id": ["q1", "q2", "q3", "q4"], "answer": ["a", "b", "c", "d"]})
+predictions = pd.DataFrame({"question_id": ["q1", "q2", "q3"], "predicted": ["a", "x", "c"]})
+
+# Left join from the truth: every example survives, failures included.
+evaluated = truth.merge(predictions, on="question_id", how="left", validate="one_to_one")
+evaluated["correct"] = evaluated["answer"] == evaluated["predicted"]
+evaluated["answered"] = evaluated["predicted"].notna()
+
+print(evaluated)
+print()
+print("accuracy over answered only:", round(evaluated.loc[evaluated["answered"], "correct"].mean(), 3))
+print("accuracy over everything:   ", round(evaluated["correct"].mean(), 3))`} />
+
+Those two numbers differ, and reporting the first without mentioning the second is how
+evaluations mislead.
+
+## concat
+
+`merge` combines columns on a key; `concat` stacks frames:
+
+<Run id="dw-join-8" code={`import pandas as pd
+
+monday = pd.DataFrame({"run": ["a", "b"], "score": [0.8, 0.9]})
+tuesday = pd.DataFrame({"run": ["c", "d"], "score": [0.7, 0.95]})
+
+print(pd.concat([monday, tuesday], ignore_index=True))
+print()
+print("tagged by source:")
+print(pd.concat([monday, tuesday], keys=["monday", "tuesday"], names=["day", None]).reset_index(level=0))
+print()
+print("side by side:")
+print(pd.concat([monday, tuesday.rename(columns={"score": "score_tuesday"})["score_tuesday"]], axis=1))`} />
+
+## Wide and long
+
+The same data has two shapes. **Wide** has one column per variable and is what people read;
+**long** has one row per observation and is what plotting and modelling tools want.
+
+<Run id="dw-join-9" code={`import pandas as pd
+
+wide = pd.DataFrame({
+    "model": ["opus", "haiku", "sonnet"],
+    "easy": [0.95, 0.80, 0.88],
+    "medium": [0.88, 0.65, 0.79],
+    "hard": [0.72, 0.40, 0.61],
+})
+print("wide:")
+print(wide)
+print()
+
+long = wide.melt(id_vars="model", var_name="difficulty", value_name="accuracy")
+print("long:")
+print(long)`} />
+
+`pivot` goes back the other way:
+
+<Run id="dw-join-10" code={`import pandas as pd
+
+long = pd.DataFrame({
+    "model": ["opus", "opus", "haiku", "haiku"],
+    "difficulty": ["easy", "hard", "easy", "hard"],
+    "accuracy": [0.95, 0.72, 0.80, 0.40],
+})
+
+wide = long.pivot(index="model", columns="difficulty", values="accuracy")
+print(wide)
+print()
+print("flattened:")
+print(wide.reset_index().rename_axis(columns=None))`} />
+
+<Callout type="tip">
+`pivot` needs the index and column pair to be unique — it only rearranges. `pivot_table`
+aggregates duplicates instead, which is why it takes an `aggfunc`. If `pivot` raises about
+duplicate entries, you wanted `pivot_table`.
+</Callout>
+
+## explode
+
+One document becomes many chunks. `explode` turns a column of lists into one row per item,
+repeating everything else:
+
+<Run id="dw-join-11" code={`import pandas as pd
+
+documents = pd.DataFrame({
+    "doc_id": ["intro", "guide"],
+    "language": ["en", "en"],
+    "chunks": [
+        ["retrieval augmented", "generation grounds", "an answer"],
+        ["chunking strategies matter"],
+    ],
+})
+print(documents)
+print()
+
+chunks = documents.explode("chunks", ignore_index=True).rename(columns={"chunks": "text"})
+chunks["chunk_index"] = chunks.groupby("doc_id").cumcount()
+chunks["tokens"] = chunks["text"].str.split().str.len()
+
+print(chunks)
+print()
+print("tokens per document:")
+print(chunks.groupby("doc_id")["tokens"].sum())`} />
+
+## Try it yourself
+
+<Exercise
+  id="dw-join-ex1"
+  title="Exercise 1"
+  brief="Join <code>predictions</code> onto <code>truth</code> so every question survives, add a boolean <code>correct</code> column, and print <code>coverage: N</code> — how many questions got a prediction."
+  code={`import pandas as pd
+
+truth = pd.DataFrame({
+    "question_id": ["q1", "q2", "q3", "q4", "q5"],
+    "answer": ["a", "b", "c", "d", "e"],
+})
+predictions = pd.DataFrame({
+    "question_id": ["q1", "q2", "q4"],
+    "predicted": ["a", "x", "d"],
+})
+
+evaluated = None
+
+print(evaluated)
+print(f"coverage: {0}")`}
+  hint="truth.merge(predictions, on='question_id', how='left', validate='one_to_one'), then compare the two answer columns and count the non-null predictions."
+  solution={`import pandas as pd
+
+truth = pd.DataFrame({
+    "question_id": ["q1", "q2", "q3", "q4", "q5"],
+    "answer": ["a", "b", "c", "d", "e"],
+})
+predictions = pd.DataFrame({
+    "question_id": ["q1", "q2", "q4"],
+    "predicted": ["a", "x", "d"],
+})
+
+evaluated = truth.merge(predictions, on="question_id", how="left", validate="one_to_one")
+evaluated["correct"] = evaluated["answer"] == evaluated["predicted"]
+coverage = int(evaluated["predicted"].notna().sum())
+
+print(evaluated)
+print(f"coverage: {coverage}")`}
+  tests={`import pandas as pd
+
+assert isinstance(evaluated, pd.DataFrame), "evaluated should be a DataFrame."
+assert len(evaluated) == 5, (
+    f"Every question must survive — a left join from truth gives 5 rows, got {len(evaluated)}."
+)
+assert "correct" in evaluated.columns, "Add a boolean correct column."
+assert list(evaluated["correct"]) == [True, False, False, True, False], (
+    f"q1 and q4 match; q2 is wrong; q3 and q5 were never answered. Got {list(evaluated['correct'])}."
+)
+assert evaluated["predicted"].isna().sum() == 2, (
+    "The two unanswered questions should have a null prediction, not be dropped."
+)
+assert _lines[-1] == "coverage: 3", f"Three questions got a prediction. Last line: {_lines[-1]!r}."`}
+/>
+
+<Exercise
+  id="dw-join-ex2"
+  title="Exercise 2"
+  brief="Reshape <code>wide</code> into <code>long</code> with one row per model and difficulty, using the column names <code>model</code>, <code>difficulty</code> and <code>accuracy</code>."
+  code={`import pandas as pd
+
+wide = pd.DataFrame({
+    "model": ["opus", "haiku"],
+    "easy": [0.95, 0.80],
+    "hard": [0.72, 0.40],
+})
+
+long = None
+
+print(long)`}
+  hint="wide.melt(id_vars='model', var_name='difficulty', value_name='accuracy')"
+  solution={`import pandas as pd
+
+wide = pd.DataFrame({
+    "model": ["opus", "haiku"],
+    "easy": [0.95, 0.80],
+    "hard": [0.72, 0.40],
+})
+
+long = wide.melt(id_vars="model", var_name="difficulty", value_name="accuracy")
+
+print(long)`}
+  tests={`import pandas as pd
+
+assert isinstance(long, pd.DataFrame), "long should be a DataFrame."
+assert list(long.columns) == ["model", "difficulty", "accuracy"], (
+    f"Expected columns model, difficulty, accuracy. Got {list(long.columns)}."
+)
+assert len(long) == 4, f"Two models by two difficulties gives 4 rows, got {len(long)}."
+assert set(long["difficulty"]) == {"easy", "hard"}, (
+    f"difficulty should hold the old column names. Got {sorted(set(long['difficulty']))}."
+)
+
+lookup = {(r.model, r.difficulty): r.accuracy for r in long.itertuples()}
+assert lookup[("opus", "easy")] == 0.95 and lookup[("haiku", "hard")] == 0.40, (
+    f"The values moved to the wrong rows: {lookup}."
+)`}
+/>
+
+<Quiz
+  question="You merge 1,000 predictions onto 1,000 ground-truth rows and get 1,240 rows back. What happened?"
+  choices={[
+    { text: "The key is duplicated on one side, so some rows were matched more than once", correct: true, why: "A many-to-one relationship you assumed was one-to-one fans the rows out — and validate='one_to_one' would have caught it." },
+    { text: "pandas added 240 blank rows for unmatched keys", why: "Unmatched keys add rows only in an outer or right join, and they would appear as nulls, not as extras beyond both inputs." },
+    { text: "The frames were concatenated rather than merged", why: "Concatenating 1,000 and 1,000 rows would give 2,000." },
+    { text: "It is expected behaviour for an inner join", why: "An inner join can only ever return at most as many rows as the smaller side, unless keys repeat." },
+  ]}
+/>
+
+<Quiz
+  question="Why evaluate with a left join from ground truth rather than an inner join?"
+  choices={[
+    { text: "An inner join silently drops the examples the model never answered — usually the hardest ones", correct: true, why: "Those rows vanish from the denominator, so accuracy is computed only over the subset the model managed, which flatters it." },
+    { text: "Inner joins are slower", why: "Speed is not the issue; which rows survive is." },
+    { text: "A left join is the only one that supports validate=", why: "validate= works with every join type." },
+    { text: "There is no difference when both sides have the same keys", why: "True only when coverage is perfect — and the whole point is that you cannot assume that." },
+  ]}
+/>
+
+## Recap
+
+- `merge(on=..., how=...)`: inner keeps matches, left keeps every left row, outer keeps
+  everything. `indicator=True` shows where each row came from.
+- Pass `validate="one_to_one"` (or `"many_to_one"`) on every merge — a silent fan-out moves every
+  number you report.
+- Evaluate with a **left join from ground truth** so unanswered examples remain visible.
+- `concat` stacks frames by row, or by column with `axis=1`.
+- `melt` goes wide to long, `pivot` goes back. `pivot` requires unique pairs; `pivot_table`
+  aggregates duplicates.
+- `explode` turns a column of lists into one row per item — how a document becomes its chunks.
