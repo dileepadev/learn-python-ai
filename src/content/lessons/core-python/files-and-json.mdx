@@ -1,0 +1,421 @@
+---
+title: Files, paths and JSON
+description: pathlib instead of string surgery, context managers that always close, and JSON and JSONL — the two formats every dataset and API response arrives in.
+module: core-python
+order: 5
+level: intermediate
+minutes: 18
+objectives:
+  - Build and inspect paths with pathlib rather than string concatenation
+  - Read and write text safely with a with-block
+  - Stream a large file line by line instead of loading it whole
+  - Convert between Python objects and JSON, and handle what JSON cannot represent
+  - Read and write JSONL, the format datasets and eval sets ship in
+---
+
+Data arrives as files. In AI work that means a corpus of documents, a JSONL dataset, a directory
+of model outputs, and a config you have to read without breaking on a missing key.
+
+## Paths
+
+`pathlib` treats a path as an object, not a string. The `/` operator joins, and it gets the
+separator right on every operating system:
+
+<Run id="cp-file-1" code={`from pathlib import Path
+
+root = Path("data")
+dataset = root / "eval" / "questions.jsonl"
+
+print(dataset)
+print("name:  ", dataset.name)
+print("stem:  ", dataset.stem)
+print("suffix:", dataset.suffix)
+print("parent:", dataset.parent)
+print("parts: ", dataset.parts)
+
+print("swapped suffix:", dataset.with_suffix(".json"))`} />
+
+Building paths by adding strings — `"data" + "/" + name` — breaks the first time a name already
+ends in a slash, and breaks again on Windows. Use `/`.
+
+<Run id="cp-file-2" code={`from pathlib import Path
+
+base = Path("runs")
+base.mkdir(parents=True, exist_ok=True)      # no error if it already exists
+
+for name in ["baseline", "tuned"]:
+    (base / name).mkdir(exist_ok=True)
+    (base / name / "score.txt").write_text("0.88\\n")
+
+print("exists:   ", base.exists())
+print("is a dir: ", base.is_dir())
+print("contents: ", sorted(p.name for p in base.iterdir()))
+print("every txt:", sorted(str(p) for p in base.rglob("*.txt")))`} />
+
+`mkdir(parents=True, exist_ok=True)` is the incantation worth memorising: create the whole chain,
+and do not complain if it is already there.
+
+## Reading and writing
+
+For a small file, `read_text` and `write_text` are the whole API:
+
+<Run id="cp-file-3" code={`from pathlib import Path
+
+note = Path("note.txt")
+note.write_text("first line\\nsecond line\\n", encoding="utf-8")
+
+print(repr(note.read_text(encoding="utf-8")))
+print(note.read_text(encoding="utf-8").splitlines())
+print("bytes on disk:", note.stat().st_size)`} />
+
+For anything bigger, open the file and let a `with` block close it for you — even if the code
+inside raises:
+
+<Run id="cp-file-4" code={`from pathlib import Path
+
+with open("log.txt", "w", encoding="utf-8") as handle:
+    for n in range(1, 4):
+        handle.write(f"run {n}: ok\\n")
+
+with open("log.txt", encoding="utf-8") as handle:
+    print("closed inside the block?", handle.closed)
+    for line in handle:                 # iterating a file yields lines, lazily
+        print(" ", line.rstrip())
+
+print("closed after the block?", handle.closed)`} />
+
+<Callout type="warning">
+Always pass `encoding="utf-8"`. Without it Python uses the platform default, which differs
+between your laptop and the training machine — and the first non-ASCII character in the corpus
+turns into a `UnicodeDecodeError` on one of them.
+</Callout>
+
+The modes you actually need: `"r"` read (the default), `"w"` write and truncate, `"a"` append,
+`"rb"`/`"wb"` for bytes.
+
+<Run id="cp-file-5" code={`from pathlib import Path
+
+Path("counts.txt").write_text("start\\n")
+
+with open("counts.txt", "a", encoding="utf-8") as handle:
+    handle.write("appended\\n")
+
+print(Path("counts.txt").read_text())`} />
+
+## Streaming a big file
+
+Iterating the handle reads one line at a time, so the file's size stops mattering:
+
+<Run id="cp-file-6" code={`from pathlib import Path
+
+with open("corpus.txt", "w", encoding="utf-8") as handle:
+    for n in range(50_000):
+        handle.write(f"document {n} with some words in it\\n")
+
+# Never do this on a real corpus:
+#   text = Path("corpus.txt").read_text()
+
+total_words = 0
+lines = 0
+with open("corpus.txt", encoding="utf-8") as handle:
+    for line in handle:
+        total_words += len(line.split())
+        lines += 1
+
+print(f"{lines:,} lines, {total_words:,} words, one line in memory at a time")`} />
+
+## JSON
+
+`json.dumps` turns a Python object into a JSON string; `json.loads` turns it back:
+
+<Run id="cp-file-7" code={`import json
+
+response = {
+    "model": "claude-opus-5",
+    "usage": {"input_tokens": 412, "output_tokens": 37},
+    "stop_reason": "end_turn",
+    "cached": None,
+    "streamed": True,
+}
+
+text = json.dumps(response)
+print(text)
+print()
+print(json.dumps(response, indent=2, sort_keys=True))
+
+back = json.loads(text)
+print()
+print(type(back), back["usage"]["input_tokens"])`} />
+
+Note what changed types on the way out and back: `None` became `null`, `True` became `true`, and
+a tuple would come back as a list. JSON has six types and Python has many more.
+
+<Run id="cp-file-8" code={`import json
+
+original = {"scores": (0.1, 0.2), "tags": ["a", "b"], "missing": None}
+round_tripped = json.loads(json.dumps(original))
+
+print(original)
+print(round_tripped)
+print("tuple survived?", isinstance(round_tripped["scores"], tuple))`} />
+
+Reading and writing a JSON file uses `dump` and `load` — the same names without the `s`:
+
+<Run id="cp-file-9" code={`import json
+from pathlib import Path
+
+config = {"model": "claude-opus-5", "max_tokens": 1024, "temperature": 0.0}
+
+with open("config.json", "w", encoding="utf-8") as handle:
+    json.dump(config, handle, indent=2)
+
+print(Path("config.json").read_text())
+
+with open("config.json", encoding="utf-8") as handle:
+    loaded = json.load(handle)
+
+print(loaded["max_tokens"] + 1)`} />
+
+## What JSON cannot hold
+
+Sets, dates, bytes and NumPy numbers all fail. `default=` gives you a last-resort converter:
+
+<Run id="cp-file-10" raises="TypeError" code={`import json
+from datetime import datetime
+
+record = {"id": "run-1", "tags": {"eval", "baseline"}, "at": datetime(2026, 3, 1, 9, 30)}
+print(json.dumps(record))`} />
+
+<Run id="cp-file-11" code={`import json
+from datetime import datetime
+
+record = {"id": "run-1", "tags": {"eval", "baseline"}, "at": datetime(2026, 3, 1, 9, 30)}
+
+def encode(value):
+    if isinstance(value, set):
+        return sorted(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    raise TypeError(f"cannot serialise {type(value).__name__}")
+
+print(json.dumps(record, default=encode, indent=2))`} />
+
+For text that is not English, turn off the escaping so the file stays readable:
+
+<Run id="cp-file-12" code={`import json
+
+record = {"language": "සිංහල", "note": "naïve café"}
+
+print(json.dumps(record))                        # escaped by default
+print(json.dumps(record, ensure_ascii=False))    # what you want in a file`} />
+
+## JSONL
+
+One JSON object per line. It is the format for datasets and eval sets, because you can append a
+record without rewriting the file and read a million of them without loading any but the current
+one.
+
+<Run id="cp-file-13" code={`import json
+from pathlib import Path
+
+examples = [
+    {"id": 1, "question": "What is a token?", "answer": "A unit of text."},
+    {"id": 2, "question": "What is an embedding?", "answer": "A vector of numbers."},
+    {"id": 3, "question": "What is RAG?", "answer": "Retrieval augmented generation."},
+]
+
+with open("eval.jsonl", "w", encoding="utf-8") as handle:
+    for example in examples:
+        handle.write(json.dumps(example, ensure_ascii=False) + "\\n")
+
+print(Path("eval.jsonl").read_text())
+
+# Reading it back, one record at a time:
+with open("eval.jsonl", encoding="utf-8") as handle:
+    for line in handle:
+        record = json.loads(line)
+        print(record["id"], "->", record["question"])`} />
+
+<Callout type="ai" title="Why this matters for AI">
+JSONL is the lingua franca of AI datasets: fine-tuning files, batch-inference inputs, evaluation
+sets and logged model outputs all ship this way. Because each line stands alone, a crashed job
+can resume from the last complete line, two processes can append safely-ish, and `wc -l` tells
+you the dataset size instantly. Write your own eval results as JSONL and every later analysis
+becomes a one-line read.
+</Callout>
+
+A generator makes the reader reusable and keeps it lazy:
+
+<Run id="cp-file-14" code={`import json
+from pathlib import Path
+
+Path("eval.jsonl").write_text(
+    '{"id": 1, "tokens": 412}\\n'
+    '{"id": 2, "tokens": 980}\\n'
+    '\\n'
+    '{"id": 3, "tokens": 95}\\n',
+    encoding="utf-8",
+)
+
+def read_jsonl(path):
+    with open(path, encoding="utf-8") as handle:
+        for number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue                 # blank lines happen; skip them
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as error:
+                print(f"  skipping line {number}: {error.msg}")
+
+records = list(read_jsonl("eval.jsonl"))
+print(records)
+print("total tokens:", sum(r["tokens"] for r in read_jsonl("eval.jsonl")))`} />
+
+## Try it yourself
+
+<Exercise
+  id="cp-file-ex1"
+  title="Exercise 1"
+  brief="Write the three records to <code>runs.jsonl</code>, one JSON object per line, then read the file back and print <code>total: N</code> for the sum of their tokens."
+  code={`import json
+from pathlib import Path
+
+records = [
+    {"run": "baseline", "tokens": 412},
+    {"run": "tuned", "tokens": 980},
+    {"run": "ensemble", "tokens": 1600},
+]
+
+# 1. Write runs.jsonl — one json.dumps(...) per line, each ending in a newline.
+# 2. Read it back line by line, parsing each with json.loads.
+# 3. Print the total as: total: N
+
+`}
+  hint="Open with mode 'w', loop over records writing json.dumps(record) + a newline. Then reopen and sum json.loads(line)['tokens'] for each non-empty line."
+  solution={`import json
+from pathlib import Path
+
+records = [
+    {"run": "baseline", "tokens": 412},
+    {"run": "tuned", "tokens": 980},
+    {"run": "ensemble", "tokens": 1600},
+]
+
+with open("runs.jsonl", "w", encoding="utf-8") as handle:
+    for record in records:
+        handle.write(json.dumps(record) + "\\n")
+
+total = 0
+with open("runs.jsonl", encoding="utf-8") as handle:
+    for line in handle:
+        if line.strip():
+            total += json.loads(line)["tokens"]
+
+print(f"total: {total}")`}
+  tests={`import json
+from pathlib import Path
+
+path = Path("runs.jsonl")
+assert path.exists(), "runs.jsonl was never written."
+
+lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+assert len(lines) == 3, f"Expected 3 records, one per line — found {len(lines)}."
+
+parsed = [json.loads(line) for line in lines]
+assert parsed == records, (
+    f"The file should round-trip to the original records. Got {parsed!r}."
+)
+assert _lines[-1] == "total: 2992", (
+    f"The last line should be 'total: 2992'. Got: {_lines}."
+)`}
+/>
+
+<Exercise
+  id="cp-file-ex2"
+  title="Exercise 2"
+  brief="<code>json.dumps</code> cannot serialise this record. Make it work by supplying a <code>default=</code> function: sets become sorted lists, and datetimes become ISO strings."
+  code={`import json
+from datetime import datetime
+
+record = {
+    "run": "baseline",
+    "tags": {"eval", "nightly"},
+    "started": datetime(2026, 3, 1, 9, 30),
+}
+
+# Write an encode(value) function and pass it as default=
+text = json.dumps(record)
+
+print(text)`}
+  hint="def encode(value): if isinstance(value, set): return sorted(value) ... and raise TypeError for anything else."
+  solution={`import json
+from datetime import datetime
+
+record = {
+    "run": "baseline",
+    "tags": {"eval", "nightly"},
+    "started": datetime(2026, 3, 1, 9, 30),
+}
+
+def encode(value):
+    if isinstance(value, set):
+        return sorted(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    raise TypeError(f"cannot serialise {type(value).__name__}")
+
+text = json.dumps(record, default=encode)
+
+print(text)`}
+  tests={`import json
+
+parsed = json.loads(text)
+assert parsed["run"] == "baseline", "The run field should be unchanged."
+assert parsed["tags"] == ["eval", "nightly"], (
+    f"tags should become a sorted list, got {parsed['tags']!r}."
+)
+assert parsed["started"] == "2026-03-01T09:30:00", (
+    f"started should be an ISO string, got {parsed['started']!r}."
+)
+
+assert callable(encode), "Define an encode(value) function and pass it as default=."
+try:
+    encode(object())
+except TypeError:
+    pass
+else:
+    raise AssertionError("encode should raise TypeError for a type it does not handle.")`}
+/>
+
+<Quiz
+  question="Why is JSONL preferred over one big JSON array for a million-example dataset?"
+  choices={[
+    { text: "JSON arrays have a size limit", why: "There is no such limit in the format — the problem is what reading one costs." },
+    { text: "Each line parses independently, so you can stream or append without loading the whole file", correct: true, why: "A JSON array must be parsed as a unit; JSONL lets you read, append and resume one record at a time." },
+    { text: "JSONL compresses better", why: "Compression is broadly similar; the difference is how the file is read and written." },
+    { text: "JSON cannot represent nested objects", why: "It represents them fine — nesting is not the issue here." },
+  ]}
+/>
+
+<Quiz
+  question="What does the with-block in `with open(path) as handle:` guarantee?"
+  choices={[
+    { text: "The file is closed when the block ends, including when an exception is raised", correct: true, why: "That is the contract of a context manager, and why a with-block beats a manual close()." },
+    { text: "The file is read entirely into memory first", why: "Nothing is read until you ask; iterating the handle stays lazy inside the block." },
+    { text: "Writes are flushed after every line", why: "Buffering is unchanged; the guarantee is about closing, which flushes once at the end." },
+    { text: "The file is locked against other processes", why: "No lock is taken — that needs an operating-system call the with-block does not make." },
+  ]}
+/>
+
+## Recap
+
+- Build paths with `pathlib` and `/`, never string concatenation. `mkdir(parents=True,
+  exist_ok=True)` creates the whole chain safely.
+- `read_text`/`write_text` for small files; `with open(...)` for everything else, always with
+  `encoding="utf-8"`.
+- Iterating a file handle yields one line at a time, so file size stops being a constraint.
+- `json.dumps`/`loads` work on strings, `json.dump`/`load` on file handles. Tuples come back as
+  lists, and sets, dates and bytes need a `default=` converter.
+- JSONL — one JSON object per line — is how datasets, eval sets and logged outputs ship, because
+  every line stands alone.

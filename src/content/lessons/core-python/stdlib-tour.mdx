@@ -1,0 +1,369 @@
+---
+title: The standard library tour for AI work
+description: The dozen modules that turn up in every AI codebase — collections, statistics, random and seeding, hashlib for cache keys, re for cleaning text, and os.environ for the API key you must never hard-code.
+module: core-python
+order: 10
+level: intermediate
+minutes: 20
+objectives:
+  - Reach for Counter, defaultdict and deque instead of reinventing them
+  - Summarise numbers with statistics, and seed random for reproducible runs
+  - Hash content to build stable cache and de-duplication keys
+  - Clean and extract text with regular expressions
+  - Read configuration and secrets from the environment
+---
+
+Python ships with most of what an AI pipeline needs before you install anything. This is a tour
+of the parts you will actually use, and why each one turns up.
+
+## collections
+
+`Counter` counts, `defaultdict` groups, `deque` is a queue with a fixed memory:
+
+<Run id="cp-std-1" code={`from collections import Counter, defaultdict, deque
+
+tokens = "the model saw the token the model produced".split()
+
+counts = Counter(tokens)
+print(counts.most_common(3))
+print("vocabulary size:", len(counts))
+print("hapaxes:", [word for word, n in counts.items() if n == 1])
+
+# defaultdict: no "if key not in d" dance
+by_language = defaultdict(list)
+for doc in [("en", "intro"), ("si", "guide"), ("en", "faq")]:
+    by_language[doc[0]].append(doc[1])
+print(dict(by_language))
+
+# deque with maxlen: keep only the last N turns of a conversation
+window = deque(maxlen=3)
+for turn in ["t1", "t2", "t3", "t4", "t5"]:
+    window.append(turn)
+print(list(window))`} />
+
+A `deque(maxlen=n)` is the sliding context window in one line: append forever, and it silently
+drops the oldest.
+
+## statistics
+
+<Run id="cp-std-2" code={`import statistics
+
+latencies = [120, 95, 340, 110, 2100, 130, 105, 98]
+
+print("mean:  ", round(statistics.mean(latencies), 1))
+print("median:", statistics.median(latencies))
+print("stdev: ", round(statistics.stdev(latencies), 1))
+print("p95:   ", round(statistics.quantiles(latencies, n=20)[-1], 1))`} />
+
+The mean is 387 ms and the median is 115 ms. Report the median and a high percentile for
+latency — one slow request should not be allowed to describe the typical experience.
+
+## random, and seeding it
+
+<Run id="cp-std-3" code={`import random
+
+random.seed(42)
+print([round(random.random(), 4) for _ in range(3)])
+print(random.choice(["opus", "sonnet", "haiku"]))
+print(random.sample(range(100), 5))
+
+random.seed(42)                     # same seed, same sequence
+print([round(random.random(), 4) for _ in range(3)])
+
+# Shuffling a dataset reproducibly:
+examples = list(range(10))
+random.Random(7).shuffle(examples)  # an isolated generator, seeded
+print(examples)`} />
+
+<Callout type="ai" title="Why this matters for AI">
+Seeding is the difference between an experiment and an anecdote. The train/test split, the
+shuffle, the subsample you evaluated on, the dropout mask — all of them are random, and all of
+them change your reported score. Seed every source of randomness and record the seed next to the
+result. `random.Random(seed)` gives you a private generator, so seeding your pipeline does not
+quietly reseed a library's.
+</Callout>
+
+## hashlib
+
+A hash turns content into a short, stable fingerprint. It is how you build a cache key, spot a
+duplicate document, and give a chunk an id that does not change between runs:
+
+<Run id="cp-std-4" code={`import hashlib, json
+
+def fingerprint(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+a = "Retrieval augmented generation grounds an answer in your documents."
+b = "Retrieval augmented generation grounds an answer in your documents."
+c = "A different sentence entirely."
+
+print(fingerprint(a))
+print(fingerprint(b), "same content, same id")
+print(fingerprint(c))
+
+# A cache key for a whole request — sorted keys make it order-independent.
+def cache_key(model, prompt, **options):
+    payload = json.dumps({"model": model, "prompt": prompt, **options}, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+print(cache_key("claude-opus-5", "Hi", temperature=0, max_tokens=64))
+print(cache_key("claude-opus-5", "Hi", max_tokens=64, temperature=0), "order does not matter")`} />
+
+<Callout type="warning">
+`hash()`, the built-in, is **not** stable across processes — Python randomises string hashing for
+security, so the same string gives a different number in tomorrow's run. For anything you persist
+or compare across runs, use `hashlib`.
+</Callout>
+
+## Regular expressions
+
+`re` is for finding and reshaping patterns in text. Always write the pattern as a raw string, so
+backslashes reach the regex engine intact:
+
+<Run id="cp-std-5" code={`import re
+
+log = "run=42 model=claude-opus-5 latency=134ms tokens=412 status=ok"
+
+print(re.findall(r"(\\w+)=(\\S+)", log))
+print(dict(re.findall(r"(\\w+)=(\\S+)", log)))
+
+match = re.search(r"latency=(\\d+)ms", log)
+print("latency:", int(match.group(1)) if match else "not found")
+
+# Cleaning: collapse whitespace, strip control characters, drop URLs.
+messy = "  Visit   https://example.com for  the   docs.\\n\\n Thanks!  "
+cleaned = re.sub(r"https?://\\S+", "", messy)
+cleaned = re.sub(r"\\s+", " ", cleaned).strip()
+print(repr(cleaned))
+
+# Splitting a document into sentences, roughly.
+text = "First sentence. Second one! And a third? Yes."
+print(re.split(r"(?<=[.!?])\\s+", text))`} />
+
+<Callout type="tip">
+Reach for a string method first. `text.startswith(...)`, `.split()`, `.replace()` and `in` are
+faster to write, faster to run and far easier to read than the regex that does the same thing.
+</Callout>
+
+## datetime
+
+<Run id="cp-std-6" code={`from datetime import datetime, timezone, timedelta
+
+now = datetime.now(timezone.utc)          # always timezone-aware
+print(now.isoformat(timespec="seconds"))
+print(now.strftime("%Y-%m-%d %H:%M"))
+
+deadline = now + timedelta(minutes=30)
+print("30 minutes on:", deadline.isoformat(timespec="seconds"))
+print("difference:   ", deadline - now)
+
+parsed = datetime.fromisoformat("2026-03-01T09:30:00+00:00")
+print("parsed:", parsed, parsed.tzinfo)`} />
+
+Store timestamps in UTC and as ISO strings. A naive `datetime.now()` is ambiguous the moment your
+code runs on a machine in another timezone, which it will.
+
+## Timing
+
+<Run id="cp-std-7" code={`import time
+
+started = time.perf_counter()
+total = sum(n * n for n in range(300_000))
+elapsed = time.perf_counter() - started
+
+print(f"computed {total}")
+print(f"took {elapsed * 1000:.1f} ms")`} />
+
+Use `time.perf_counter()` for durations — it is monotonic, so it cannot go backwards when the
+system clock is adjusted. `time.time()` is for wall-clock timestamps, not measurement.
+
+## Environment variables
+
+Configuration and secrets come from the environment, never from the source file:
+
+<Run id="cp-std-8" code={`import os
+
+# Pretend the shell had already exported these.
+os.environ["MODEL"] = "claude-opus-5"
+
+print("model:     ", os.environ.get("MODEL", "claude-haiku-4-5"))
+print("max tokens:", int(os.environ.get("MAX_TOKENS", "1024")))
+print("debug:     ", os.environ.get("DEBUG", "").lower() in {"1", "true", "yes"})
+
+api_key = os.environ.get("ANTHROPIC_API_KEY")
+if api_key is None:
+    print("no API key set — running against fixtures instead")`} />
+
+Note that every value arrives as a **string**: `int(...)` for numbers, and an explicit comparison
+for booleans, because `bool("false")` is `True`.
+
+<Callout type="warning">
+Never write an API key into a source file, a notebook or a commit. Read it from the environment,
+keep it in an untracked `.env`, and make the code fall back to fixtures when it is absent — as
+this page does, since a static site has nowhere safe to put one.
+</Callout>
+
+## textwrap and uuid
+
+<Run id="cp-std-9" code={`import textwrap, uuid
+
+prompt = "You are a careful assistant. Answer only from the provided context, and say when you do not know."
+
+print(textwrap.fill(prompt, width=60))
+print()
+print(textwrap.shorten(prompt, width=50, placeholder=" …"))
+print()
+
+indented = textwrap.indent("line one\\nline two", "  | ")
+print(indented)
+print()
+
+print("run id:", uuid.uuid4().hex[:12])`} />
+
+`textwrap.dedent` is the one to remember for prompts written as triple-quoted strings — it strips
+the indentation your code has but your prompt should not:
+
+<Run id="cp-std-10" code={`import textwrap
+
+def build_prompt(question):
+    raw = f"""
+        You are a careful assistant.
+
+        Question: {question}
+        Answer:
+    """
+    return textwrap.dedent(raw).strip()
+
+print(repr(build_prompt("What is a token?")))
+print()
+print(build_prompt("What is a token?"))`} />
+
+## Try it yourself
+
+<Exercise
+  id="cp-std-ex1"
+  title="Exercise 1"
+  brief="Group the documents by language into <code>by_language</code> (a plain dict of language → list of ids), and build <code>totals</code>: a dict of language → total tokens."
+  code={`from collections import defaultdict
+
+documents = [
+    {"id": "intro", "lang": "en", "tokens": 412},
+    {"id": "guide", "lang": "si", "tokens": 980},
+    {"id": "faq", "lang": "en", "tokens": 120},
+    {"id": "api", "lang": "en", "tokens": 300},
+]
+
+by_language = {}
+totals = {}
+
+print(by_language)
+print(totals)`}
+  hint="Use two defaultdicts — one defaulting to list, one to int — then convert each with dict(...)."
+  solution={`from collections import defaultdict
+
+documents = [
+    {"id": "intro", "lang": "en", "tokens": 412},
+    {"id": "guide", "lang": "si", "tokens": 980},
+    {"id": "faq", "lang": "en", "tokens": 120},
+    {"id": "api", "lang": "en", "tokens": 300},
+]
+
+grouped = defaultdict(list)
+summed = defaultdict(int)
+for document in documents:
+    grouped[document["lang"]].append(document["id"])
+    summed[document["lang"]] += document["tokens"]
+
+by_language = dict(grouped)
+totals = dict(summed)
+
+print(by_language)
+print(totals)`}
+  tests={`assert by_language == {"en": ["intro", "faq", "api"], "si": ["guide"]}, (
+    f"Expected ids grouped by language, in document order. Got {by_language!r}."
+)
+assert totals == {"en": 832, "si": 980}, (
+    f"Expected en to total 832 and si to total 980. Got {totals!r}."
+)
+assert type(by_language) is dict and type(totals) is dict, (
+    "Convert the defaultdicts back to plain dicts with dict(...)."
+)`}
+/>
+
+<Exercise
+  id="cp-std-ex2"
+  title="Exercise 2"
+  brief="Write <code>cache_key(model, prompt, **options)</code>: a 16-character SHA-256 hex digest that is stable across runs and independent of the order the options are passed in."
+  code={`import hashlib, json
+
+def cache_key(model, prompt, **options):
+    # Build one canonical string from model, prompt and options,
+    # hash it with sha256, and return the first 16 hex characters.
+    ...
+
+
+print(cache_key("claude-opus-5", "Hi", temperature=0, max_tokens=64))`}
+  hint="json.dumps({...}, sort_keys=True) makes the string canonical; then hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]."
+  solution={`import hashlib, json
+
+def cache_key(model, prompt, **options):
+    payload = json.dumps({"model": model, "prompt": prompt, **options}, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+print(cache_key("claude-opus-5", "Hi", temperature=0, max_tokens=64))`}
+  tests={`key = cache_key("claude-opus-5", "Hi", temperature=0, max_tokens=64)
+
+assert isinstance(key, str), f"cache_key should return a string, got {type(key).__name__}."
+assert len(key) == 16, f"The key should be 16 characters, got {len(key)}."
+assert all(c in "0123456789abcdef" for c in key), f"Expected lowercase hex, got {key!r}."
+
+assert key == cache_key("claude-opus-5", "Hi", max_tokens=64, temperature=0), (
+    "Keyword order must not change the key — sort the keys before hashing."
+)
+assert key == cache_key("claude-opus-5", "Hi", temperature=0, max_tokens=64), (
+    "The same inputs must always give the same key."
+)
+assert key != cache_key("claude-opus-5", "Hi", temperature=1, max_tokens=64), (
+    "A different option value must give a different key."
+)
+assert key != cache_key("claude-haiku-4-5", "Hi", temperature=0, max_tokens=64), (
+    "A different model must give a different key."
+)
+assert key != cache_key("claude-opus-5", "Hello", temperature=0, max_tokens=64), (
+    "A different prompt must give a different key."
+)
+`}
+/>
+
+<Quiz
+  question="Why use hashlib.sha256 rather than the built-in hash() for a cache key you write to disk?"
+  choices={[
+    { text: "hash() is randomised per process, so the same string gives a different value in the next run", correct: true, why: "String hashing is salted for security, so a persisted key would never match again after a restart." },
+    { text: "hash() is slower", why: "It is considerably faster — it is simply not stable across processes." },
+    { text: "hash() cannot handle strings", why: "It handles any hashable object; the problem is only the per-process salt." },
+    { text: "hash() returns a value that is too short", why: "Length is not the issue; stability is." },
+  ]}
+/>
+
+<Quiz
+  question="You report a model's accuracy after shuffling the dataset without setting a seed. What is wrong?"
+  choices={[
+    { text: "Nothing, as long as the dataset is large", why: "Size reduces the variance but does not remove it, and it certainly does not make the run reproducible." },
+    { text: "The split differs on every run, so nobody — including you — can reproduce the number", correct: true, why: "Without a recorded seed the experiment cannot be repeated, and a rerun can report a different score for identical code." },
+    { text: "Shuffling always biases the result upwards", why: "It biases nothing systematically; it just makes the outcome irreproducible." },
+    { text: "random.shuffle cannot be used on a dataset", why: "It can — the omission is the seed, not the function." },
+  ]}
+/>
+
+## Recap
+
+- `Counter` counts, `defaultdict` groups without key checks, and `deque(maxlen=n)` is a sliding
+  window.
+- Report the median and a percentile for latency, not the mean.
+- Seed every source of randomness and record the seed; `random.Random(seed)` keeps it private.
+- `hashlib` gives stable fingerprints for cache keys and de-duplication; the built-in `hash()`
+  does not survive a restart.
+- Use raw strings for regex patterns, and a string method when one will do.
+- Keep timestamps timezone-aware and in UTC; measure durations with `time.perf_counter()`.
+- Read configuration and secrets from `os.environ`, converting the strings it hands you.

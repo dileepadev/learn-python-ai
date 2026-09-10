@@ -1,0 +1,391 @@
+---
+title: Modules, packages and virtual environments
+description: Split a script into files that import each other, understand how Python finds them, and pin an environment so your results reproduce on someone else's machine.
+module: core-python
+order: 4
+level: intermediate
+minutes: 18
+objectives:
+  - Import from the standard library and from your own files
+  - Write a module and a package, and import from both
+  - Explain how Python finds a module, and why a file named random.py breaks everything
+  - Guard script-only code with the main check
+  - Create a virtual environment and pin dependencies so a run reproduces
+---
+
+A script becomes software when it stops being one file. Modules are how Python splits code up,
+and environments are how you make sure the code that ran on your laptop runs on the machine that
+trains the model.
+
+## Importing
+
+<Run id="cp-mod-1" code={`import math
+print(math.sqrt(144), math.pi)
+
+from statistics import mean, median          # pull names into this file
+print(mean([0.71, 0.88, 0.93]), median([0.71, 0.88, 0.93]))
+
+import json as j                             # rename on import
+print(j.dumps({"model": "claude-opus-5"}))
+
+from collections import Counter              # the form you will use most
+print(Counter("mississippi").most_common(2))`} />
+
+`import x` keeps the module's namespace, so you write `x.thing` and a reader knows where `thing`
+came from. `from x import thing` is shorter at every use site. Prefer the second for a handful of
+well-known names, the first when the module name adds clarity.
+
+<Callout type="warning">
+Never write `from module import *`. It drops every public name into your file at once, so a
+reader cannot tell what came from where — and a later import can silently replace a name you
+were relying on.
+</Callout>
+
+## Your own modules
+
+A module is just a `.py` file. Python's virtual filesystem is available here, so you can write
+one and import it in the same program:
+
+<Run id="cp-mod-2" code={`from pathlib import Path
+import sys
+
+Path("metrics.py").write_text('''
+"""Scoring helpers."""
+
+THRESHOLD = 0.85
+
+def accuracy(correct, total):
+    return correct / total
+
+def passes(score):
+    return score >= THRESHOLD
+''')
+
+sys.path.insert(0, ".")          # make the current directory importable
+
+import metrics
+
+print(metrics.THRESHOLD)
+print(metrics.accuracy(43, 50))
+print(metrics.passes(0.86), metrics.passes(0.5))
+print(metrics.__doc__.strip())`} />
+
+Everything defined at the top level of that file — constants, functions, classes — becomes an
+attribute of the module object.
+
+## A module runs once
+
+The first `import` executes the file top to bottom. Every later import of the same name reuses
+the module object already in `sys.modules`:
+
+<Run id="cp-mod-3" code={`from pathlib import Path
+import sys
+
+Path("noisy.py").write_text('print("  noisy.py is being executed")\\n')
+sys.path.insert(0, ".")
+
+print("first import:")
+import noisy
+
+print("second import:")
+import noisy          # nothing prints — it is already loaded
+
+print("in sys.modules:", "noisy" in sys.modules)`} />
+
+That is why import-time work is dangerous: a module that opens a connection or loads a 2 GB
+checkpoint at the top level does it the moment anything imports it, including your test suite.
+
+## The main check
+
+A file can be imported *and* run directly. The difference is the `__name__` variable: it is
+`"__main__"` when the file is the program, and the module's name when it has been imported.
+
+<Run id="cp-mod-4" code={`from pathlib import Path
+import sys
+
+Path("tool.py").write_text('''
+def clean(text):
+    return " ".join(text.split()).lower()
+
+print("  top level: __name__ is", __name__)
+
+if __name__ == "__main__":
+    print("  running as a script")
+''')
+
+sys.path.insert(0, ".")
+import tool                       # imported, so __name__ is "tool"
+
+print("here, __name__ is", __name__)
+print(tool.clean("  RAGGED   text  "))`} />
+
+Put everything a script *does* behind `if __name__ == "__main__":` and everything it *offers*
+above the guard. Then the same file is both a command-line tool and an importable library.
+
+## Packages
+
+A package is a directory of modules. An `__init__.py` file makes it importable as one unit, and
+is the natural place to decide what the package exposes:
+
+<Run id="cp-mod-5" code={`from pathlib import Path
+import sys
+
+Path("rag").mkdir(exist_ok=True)
+Path("rag/chunking.py").write_text('''
+def split(text, size=20):
+    words = text.split()
+    return [" ".join(words[i:i + size]) for i in range(0, len(words), size)]
+''')
+Path("rag/scoring.py").write_text('''
+def overlap(a, b):
+    a_words, b_words = set(a.split()), set(b.split())
+    return len(a_words & b_words) / len(a_words | b_words)
+''')
+Path("rag/__init__.py").write_text('''
+"""A tiny retrieval package."""
+from .chunking import split
+from .scoring import overlap
+
+__all__ = ["split", "overlap"]
+''')
+
+sys.path.insert(0, ".")
+
+import rag
+print(rag.split("one two three four five six", size=2))
+print(round(rag.overlap("cat sat mat", "cat sat rug"), 3))
+
+from rag.scoring import overlap   # reach into a submodule directly
+print(round(overlap("a b", "a b"), 3))`} />
+
+The leading dot in `from .chunking import split` is a **relative import** — "the `chunking`
+module next to me". Use relative imports inside a package and absolute imports everywhere else.
+
+## How Python finds a module
+
+`sys.path` is searched in order, and the first match wins:
+
+<Run id="cp-mod-6" code={`import sys, json, statistics
+
+for entry in sys.path[:5]:
+    print(repr(entry))
+
+print()
+print("json lives at:      ", json.__file__)
+print("statistics lives at:", statistics.__file__)`} />
+
+Because the directory of your script comes first, a file of your own called `random.py` or
+`json.py` shadows the standard library module of that name — and the error it produces points
+somewhere else entirely:
+
+<Run id="cp-mod-7" code={`from pathlib import Path
+from importlib.machinery import PathFinder
+import sys
+
+Path("random.py").write_text("# my own notes about randomness\\n")
+sys.path.insert(0, ".")
+
+# What would "import random" actually load from here?
+print("random ->", PathFinder().find_spec("random", sys.path).origin)
+
+# ...and what it should have been, with our directory taken out of the search:
+clean_path = [entry for entry in sys.path if entry != "."]
+print("really  ->", PathFinder().find_spec("random", clean_path).origin)`} />
+
+A program that started from that directory would import the empty file, and every later
+`random.randint(...)` would fail with `AttributeError: module 'random' has no attribute
+'randint'` — pointing at a line that has nothing wrong with it.
+
+<Callout type="warning">
+If an import of a standard library module suddenly fails with `AttributeError` or
+`ImportError: cannot import name`, look for a file of your own with that name in the directory
+you are running from. It is almost always that.
+</Callout>
+
+## Virtual environments
+
+Installing packages system-wide means every project shares one set of versions, and two projects
+eventually want different ones. A virtual environment is a private directory of packages for one
+project.
+
+These commands run on your own machine, not in this page:
+
+```bash
+python -m venv .venv           # create it
+source .venv/bin/activate      # activate it (Linux/macOS)
+.venv\Scripts\activate         # activate it (Windows)
+
+pip install numpy pandas scikit-learn
+pip list                       # what is installed
+deactivate                     # leave it
+```
+
+Once active, `python` and `pip` refer to the environment's copies. `.venv/` is generated, so it
+belongs in `.gitignore`, never in a commit.
+
+## Pinning what you installed
+
+Recording versions is what makes a run repeatable:
+
+```bash
+pip freeze > requirements.txt        # exact versions of everything installed
+pip install -r requirements.txt      # recreate that environment elsewhere
+```
+
+A modern project declares its dependencies in `pyproject.toml` instead, separating what you
+*depend on* from what happened to get installed:
+
+```toml
+[project]
+name = "rag-service"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40,<1.0",
+    "numpy>=2.0",
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "mypy>=1.10"]
+```
+
+<Callout type="ai" title="Why this matters for AI">
+An evaluation result is only meaningful alongside the environment that produced it. A minor
+version bump in a tokeniser changes how text is split; a change in scikit-learn's default solver
+changes a model's coefficients; an SDK release changes a default `max_tokens`. "It scored 0.91"
+means nothing without a pinned environment. Pin your dependencies, commit the lock file, and
+record versions next to metrics.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="cp-mod-ex1"
+  title="Exercise 1"
+  brief="Write a module <code>tokens.py</code> that defines <code>count(text)</code> returning the number of whitespace-separated words, then import it and print <code>count: N</code> for the sample text."
+  code={`from pathlib import Path
+import sys
+
+# 1. Write tokens.py with a count(text) function.
+# 2. Make the current directory importable.
+# 3. Import it and print the count of the sample text.
+
+sample = "retrieval augmented generation needs a good chunker"
+
+`}
+  hint="Path('tokens.py').write_text('def count(text):\\n    return len(text.split())\\n'), then sys.path.insert(0, '.') before importing."
+  solution={`from pathlib import Path
+import sys
+
+Path("tokens.py").write_text('''
+def count(text):
+    return len(text.split())
+''')
+
+sys.path.insert(0, ".")
+
+import tokens
+
+sample = "retrieval augmented generation needs a good chunker"
+print(f"count: {tokens.count(sample)}")`}
+  tests={`import sys
+
+assert "tokens" in sys.modules, (
+    "Import your module so it appears in sys.modules — the name should be 'tokens'."
+)
+
+module = sys.modules["tokens"]
+assert hasattr(module, "count"), "tokens.py should define a function called count."
+assert module.count("one two three") == 3, (
+    f"count('one two three') should be 3, got {module.count('one two three')!r}."
+)
+assert module.count("") == 0, "Empty text has no words."
+assert _lines[-1] == "count: 7", (
+    f"The last line should be 'count: 7' for the sample text. Got: {_lines}."
+)`}
+/>
+
+<Exercise
+  id="cp-mod-ex2"
+  title="Exercise 2"
+  brief="Move the script body of <code>report.py</code> behind a main check, so importing it prints nothing but <code>summarise</code> is still available."
+  code={`from pathlib import Path
+import sys
+
+Path("report.py").write_text('''
+def summarise(scores):
+    return f"{len(scores)} runs, best {max(scores):.2f}"
+
+print(summarise([0.71, 0.88, 0.93]))
+''')
+
+sys.path.insert(0, ".")
+import report
+
+print("imported cleanly")`}
+  hint="Put the print inside an if __name__ == '__main__': guard in the text you write to report.py."
+  solution={`from pathlib import Path
+import sys
+
+Path("report.py").write_text('''
+def summarise(scores):
+    return f"{len(scores)} runs, best {max(scores):.2f}"
+
+if __name__ == "__main__":
+    print(summarise([0.71, 0.88, 0.93]))
+''')
+
+sys.path.insert(0, ".")
+import report
+
+print("imported cleanly")`}
+  tests={`import sys
+from pathlib import Path
+
+assert "report" in sys.modules, "report should still be imported."
+module = sys.modules["report"]
+assert hasattr(module, "summarise"), "summarise must still be importable from report."
+assert module.summarise([0.5, 0.9]) == "2 runs, best 0.90", (
+    f"summarise should be unchanged, got {module.summarise([0.5, 0.9])!r}."
+)
+
+source = Path("report.py").read_text()
+assert "__main__" in source, (
+    "report.py should guard its script body with if __name__ == \\"__main__\\":"
+)
+assert _lines == ["imported cleanly"], (
+    f"Importing report should now print nothing of its own. Got: {_lines}."
+)`}
+/>
+
+<Quiz
+  question="You add a file called json.py to your project, and an unrelated import of the standard library json starts failing. Why?"
+  choices={[
+    { text: "Your file shadows the standard library module, because the script's directory is searched first", correct: true, why: "sys.path puts the entry script's directory at the front, so your json.py is found before the real one." },
+    { text: "Python reserves module names and refuses to load yours", why: "Nothing is reserved — Python loads yours happily, which is exactly the problem." },
+    { text: "The standard library must be reinstalled", why: "It is untouched; it is simply never reached. Rename your file and the import works again." },
+    { text: "Only packages, not modules, may share a standard library name", why: "The shadowing rule is about sys.path order and applies equally to both." },
+  ]}
+/>
+
+<Quiz
+  question="What does if __name__ == '__main__': achieve in a file that is both a tool and a library?"
+  choices={[
+    { text: "It stops the file from being imported twice", why: "sys.modules already does that — a module's body executes at most once per process." },
+    { text: "It runs the block only when the file is executed directly, not when it is imported", correct: true, why: "__name__ is '__main__' only for the file Python was told to run; an import sets it to the module's name." },
+    { text: "It makes the functions above it public", why: "Every top-level name is already an attribute of the module; the guard changes nothing about visibility." },
+    { text: "It speeds up imports by skipping the function definitions", why: "Definitions above the guard still execute — that is the point, since they are what the importer wants." },
+  ]}
+/>
+
+## Recap
+
+- `import x` keeps the namespace; `from x import y` is shorter. Never `import *`.
+- A module is a `.py` file; its top-level names become attributes. A package is a directory with
+  an `__init__.py` that decides what the package exposes.
+- A module's body runs **once**, on first import — so avoid expensive work at import time.
+- `__name__` is `"__main__"` only when the file is the program. Guard script behaviour with it.
+- `sys.path` is searched in order and your own directory comes first, so never name a file after
+  a standard library module.
+- A virtual environment isolates a project's packages; pinned versions in `requirements.txt` or
+  `pyproject.toml` are what make a result reproducible.

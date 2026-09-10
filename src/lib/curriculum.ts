@@ -47,20 +47,8 @@ export const MODULES: Module[] = [
     description:
       "Move from scripts to software. Functions and scope, comprehensions and generators, modules and virtual environments, files and JSON, exceptions, classes and dataclasses, and the type hints that every AI codebase leans on.",
     level: "intermediate",
-    status: "planned",
+    status: "published",
     icon: "layers",
-    plannedLessons: [
-      "Functions, arguments and scope",
-      "Comprehensions and generator expressions",
-      "Iterators, generators and lazy pipelines",
-      "Modules, packages and virtual environments",
-      "Files, paths and JSON",
-      "Exceptions and defensive code",
-      "Classes, dunder methods and dataclasses",
-      "Type hints and static checking with mypy",
-      "Decorators and context managers",
-      "The standard library tour for AI work",
-    ],
   },
   {
     slug: "numerical-python",

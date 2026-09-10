@@ -1,0 +1,277 @@
+---
+title: Comprehensions and generator expressions
+description: Build a list, dict or set in one expression — and learn when swapping the brackets for parentheses turns the whole thing lazy.
+module: core-python
+order: 2
+level: intermediate
+minutes: 16
+objectives:
+  - Write list, dict and set comprehensions with filters
+  - Flatten and nest comprehensions without losing the plot
+  - Swap a list comprehension for a generator expression when the data is large
+  - Pair generator expressions with sum, any, all, min and max
+  - Recognise when a plain for loop is the more readable choice
+---
+
+You met a list comprehension briefly in module 1. It is worth a lesson of its own, because
+comprehensions are how most idiomatic Python builds a collection — and because the lazy version
+is what lets you process a corpus that does not fit in memory.
+
+<Run id="cp-comp-1" code={`lengths = []
+for word in ["embedding", "token", "prompt"]:
+    lengths.append(len(word))
+print(lengths)
+
+# The same thing, as one expression:
+lengths = [len(word) for word in ["embedding", "token", "prompt"]]
+print(lengths)`} />
+
+The shape is always `[` *what to collect* `for` *name* `in` *iterable* `]`.
+
+## Filtering
+
+Add `if` at the end to keep only some items:
+
+<Run id="cp-comp-2" code={`scores = [0.42, 0.91, 0.68, 0.99, 0.15, 0.77]
+
+good = [s for s in scores if s >= 0.7]
+print(good)
+
+# The expression can transform as well as filter:
+percentages = [f"{s:.0%}" for s in scores if s >= 0.7]
+print(percentages)`} />
+
+An `if` **before** the `for` is a different thing entirely — that is a conditional expression
+choosing what to collect, and it cannot skip items:
+
+<Run id="cp-comp-3" code={`scores = [0.42, 0.91, 0.68]
+
+print([s for s in scores if s > 0.5])          # filter: 2 items
+print(["pass" if s > 0.5 else "fail" for s in scores])   # map: 3 items`} />
+
+<Callout type="tip">
+Read it right to left when you are unsure: the `for` clause runs first, then the trailing `if`
+decides whether the item survives, then the leading expression decides what it becomes.
+</Callout>
+
+## Dictionaries and sets
+
+Change the brackets and you change the container:
+
+<Run id="cp-comp-4" code={`documents = ["intro.md", "setup.md", "api.md", "intro.md"]
+sizes = [120, 4300, 980, 120]
+
+# dict comprehension
+index = {name: size for name, size in zip(documents, sizes)}
+print(index)
+
+# set comprehension — duplicates collapse
+extensions = {name.split(".")[-1] for name in documents}
+print(extensions)
+
+# filtering a dictionary into a smaller one
+large = {name: size for name, size in index.items() if size > 500}
+print(large)`} />
+
+Inverting a dictionary is a one-liner, and a useful reminder that keys must stay unique:
+
+<Run id="cp-comp-5" code={`model_ids = {"opus": "claude-opus-5", "haiku": "claude-haiku-4-5"}
+
+by_id = {value: key for key, value in model_ids.items()}
+print(by_id)`} />
+
+## Nesting and flattening
+
+Two `for` clauses read in the same order you would write the nested loop:
+
+<Run id="cp-comp-6" code={`batches = [["a", "b"], ["c"], ["d", "e", "f"]]
+
+# Flatten: outer loop first, inner loop second.
+flat = [item for batch in batches for item in batch]
+print(flat)
+
+# The loop it replaces, for comparison:
+flat = []
+for batch in batches:
+    for item in batch:
+        flat.append(item)
+print(flat)`} />
+
+A comprehension whose *expression* is itself a comprehension builds a nested structure:
+
+<Run id="cp-comp-7" code={`grid = [[row * col for col in range(1, 5)] for row in range(1, 4)]
+for row in grid:
+    print(row)`} />
+
+<Callout type="warning">
+Two levels is the limit of what most people can read. Three nested `for` clauses with a filter
+on each is a loop wearing a disguise — write the loop.
+</Callout>
+
+## Generator expressions
+
+Swap the square brackets for parentheses and nothing is built. You get a **generator**: an object
+that produces items one at a time, on demand.
+
+<Run id="cp-comp-8" code={`squares_list = [n * n for n in range(10)]
+squares_gen = (n * n for n in range(10))
+
+print(squares_list)
+print(squares_gen)
+
+print(list(squares_gen))   # drain it
+print(list(squares_gen))   # ...and it is empty, because it was consumed`} />
+
+That last line is the whole trade-off. A list can be read many times; a generator is a
+one-pass stream. What you get in return is memory:
+
+<Run id="cp-comp-9" code={`import sys
+
+as_list = [n * n for n in range(100_000)]
+as_gen = (n * n for n in range(100_000))
+
+print("list:     ", sys.getsizeof(as_list), "bytes")
+print("generator:", sys.getsizeof(as_gen), "bytes")
+
+print("both sum to the same thing:", sum(as_list) == sum(n * n for n in range(100_000)))`} />
+
+<Callout type="ai" title="Why this matters for AI">
+Preparing a training set or an embedding batch means walking a corpus that is far larger than
+memory. `sum(len(chunk) for chunk in chunks)` counts tokens across a million documents in
+constant space; `sum([len(chunk) for chunk in chunks])` materialises the whole list first and
+falls over. The difference is two characters, and it decides whether the job runs.
+</Callout>
+
+## Generators inside other functions
+
+When a generator expression is the only argument, you can drop its parentheses. This is the form
+you will write most often:
+
+<Run id="cp-comp-10" code={`documents = [
+    {"id": "a", "tokens": 412, "lang": "en"},
+    {"id": "b", "tokens": 1180, "lang": "si"},
+    {"id": "c", "tokens": 95, "lang": "en"},
+]
+
+print("total tokens: ", sum(d["tokens"] for d in documents))
+print("largest:      ", max(documents, key=lambda d: d["tokens"])["id"])
+print("any Sinhala?  ", any(d["lang"] == "si" for d in documents))
+print("all under 2k? ", all(d["tokens"] < 2000 for d in documents))
+print("english ids:  ", ", ".join(d["id"] for d in documents if d["lang"] == "en"))`} />
+
+`any` and `all` stop as soon as the answer is settled, so pairing them with a generator means
+you never do more work than the question requires:
+
+<Run id="cp-comp-11" code={`def expensive(n):
+    print(f"  checking {n}")
+    return n > 2
+
+print("any:", any(expensive(n) for n in range(10)))
+print()
+print("all:", all(expensive(n) for n in range(10)))`} />
+
+## When a loop is better
+
+A comprehension should build one collection from one source. The moment it needs to do two
+things, keep running totals, or handle errors, write the loop:
+
+<Run id="cp-comp-12" code={`raw = ["412", "not-a-number", "95", "", "1180"]
+
+# A loop, because some items fail and we want to know which.
+tokens = []
+skipped = []
+for value in raw:
+    try:
+        tokens.append(int(value))
+    except ValueError:
+        skipped.append(value)
+
+print("parsed: ", tokens)
+print("skipped:", skipped)`} />
+
+## Try it yourself
+
+<Exercise
+  id="cp-comp-ex1"
+  title="Exercise 1"
+  brief="Build <code>long_docs</code>: a dictionary of id → tokens holding only the documents with more than 500 tokens. Use a dict comprehension."
+  code={`documents = [
+    {"id": "intro", "tokens": 412},
+    {"id": "setup", "tokens": 4300},
+    {"id": "api", "tokens": 980},
+    {"id": "faq", "tokens": 120},
+]
+
+long_docs = {}
+print(long_docs)`}
+  hint="{d['id']: d['tokens'] for d in documents if ...}"
+  solution={`documents = [
+    {"id": "intro", "tokens": 412},
+    {"id": "setup", "tokens": 4300},
+    {"id": "api", "tokens": 980},
+    {"id": "faq", "tokens": 120},
+]
+
+long_docs = {d["id"]: d["tokens"] for d in documents if d["tokens"] > 500}
+print(long_docs)`}
+  tests={`assert isinstance(long_docs, dict), f"long_docs should be a dict, got {type(long_docs).__name__}."
+assert long_docs == {"setup": 4300, "api": 980}, (
+    f"Expected setup and api only, got {long_docs!r}."
+)`}
+/>
+
+<Exercise
+  id="cp-comp-ex2"
+  title="Exercise 2"
+  brief="Print <code>chars: N</code> — the total number of characters across every chunk — without building an intermediate list."
+  code={`chunks = ["the first chunk", "another one here", "and a third"]
+
+# Use a generator expression inside sum(). No square brackets.
+total = 0
+
+print(f"chars: {total}")`}
+  hint="sum(len(chunk) for chunk in chunks) — note the absence of [ ]."
+  solution={`chunks = ["the first chunk", "another one here", "and a third"]
+
+total = sum(len(chunk) for chunk in chunks)
+
+print(f"chars: {total}")`}
+  tests={`assert _lines == ["chars: 42"], f"Expected 'chars: 42', got: {_lines}."
+assert total == 42, f"total should be 42, got {total!r}."
+
+# The same approach must scale lazily rather than materialising a list.
+big = (str(n) for n in range(10_000))
+assert sum(len(chunk) for chunk in big) == 38890, (
+    "A generator expression should work the same way over a large source."
+)`}
+/>
+
+<Quiz
+  question="What is the difference between sum([len(c) for c in chunks]) and sum(len(c) for c in chunks)?"
+  choices={[
+    { text: "Nothing — they are the same expression", why: "They give the same answer, but not by the same route, and the difference matters at scale." },
+    { text: "The first builds the whole list in memory; the second produces lengths one at a time", correct: true, why: "Square brackets materialise every item before sum sees any of them; parentheses hand them over lazily." },
+    { text: "The second is invalid syntax", why: "A sole generator expression argument may drop its own parentheses — this is the idiomatic form." },
+    { text: "The first is lazy and the second is eager", why: "It is the other way round: the list comprehension is the eager one." },
+  ]}
+/>
+
+<Quiz
+  question="After g = (n for n in range(3)), what does list(g) return the second time you call it?"
+  choices={[
+    { text: "[]", correct: true, why: "A generator is a one-pass stream. The first list(g) drained it, and there is nothing left." },
+    { text: "[0, 1, 2]", why: "That is the first call. Generators do not rewind — build a list if you need to read twice." },
+    { text: "A StopIteration", why: "list() handles exhaustion for you; it simply returns what remains, which is nothing." },
+    { text: "A RuntimeError", why: "Re-iterating a spent generator is legal and silent, which is exactly what makes it easy to miss." },
+  ]}
+/>
+
+## Recap
+
+- `[expr for x in items if cond]` builds a list; `{}` builds a dict or a set.
+- A trailing `if` filters; a leading `if … else` transforms and keeps every item.
+- Two `for` clauses read in the same order as the nested loop they replace. Stop at two.
+- Parentheses give a **generator expression**: lazy, one-pass, constant memory.
+- `sum`, `any`, `all`, `min`, `max` and `join` all take a generator directly, and `any`/`all`
+  stop early.
+- If the body needs error handling or two outputs, write the loop instead.

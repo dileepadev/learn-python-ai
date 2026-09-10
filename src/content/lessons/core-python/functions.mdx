@@ -1,0 +1,378 @@
+---
+title: Functions, arguments and scope
+description: Package behaviour behind a name — defaults, keyword-only arguments, *args and **kwargs, and the mutable-default bug that has broken more chat helpers than any other.
+module: core-python
+order: 1
+level: intermediate
+minutes: 18
+objectives:
+  - Define functions that take positional, keyword and default arguments
+  - Collect extra arguments with *args and **kwargs, and forward them on
+  - Force callers to be explicit with keyword-only parameters
+  - Explain what a name means inside a function, and what it does not
+  - Avoid the mutable default argument trap
+---
+
+A function gives a piece of behaviour a name, a set of inputs and one output. Everything after
+this lesson — classes, decorators, an agent loop — is built from them.
+
+<Run id="cp-fn-1" code={`def greet(name):
+    return f"Hello, {name}!"
+
+print(greet("Dileepa"))
+print(greet("world"))`} />
+
+`def` binds a name to a function object. `return` hands a value back. A function with no
+`return` hands back `None`, which is a real value and a real source of confusion:
+
+<Run id="cp-fn-2" code={`def shout(text):
+    print(text.upper())      # prints, but returns nothing
+
+result = shout("hello")
+print("returned:", result)
+
+def shout_properly(text):
+    return text.upper()      # hands the value back
+
+print("returned:", shout_properly("hello"))`} />
+
+<Callout type="tip">
+If a function's job is to *produce* a value, `return` it. Printing inside the function makes it
+impossible to reuse — you cannot store, test or transform something that only went to the
+screen.
+</Callout>
+
+## Arguments, positionally and by keyword
+
+<Run id="cp-fn-3" code={`def call(prompt, model, max_tokens):
+    return f"{model} <- {prompt!r} (limit {max_tokens})"
+
+# Positional: order is everything.
+print(call("Summarise this", "claude-opus-5", 512))
+
+# By keyword: order stops mattering, and the call documents itself.
+print(call(model="claude-opus-5", max_tokens=512, prompt="Summarise this"))
+
+# Mixed: positional arguments first, always.
+print(call("Summarise this", max_tokens=512, model="claude-opus-5"))`} />
+
+## Defaults
+
+A parameter with a default becomes optional:
+
+<Run id="cp-fn-4" code={`def call(prompt, model="claude-opus-5", max_tokens=1024, temperature=1.0):
+    return f"{model} | {max_tokens} tokens | temp {temperature} | {prompt!r}"
+
+print(call("Hello"))
+print(call("Hello", max_tokens=64))
+print(call("Hello", "claude-haiku-4-5", 256, 0.0))`} />
+
+Parameters with defaults must come after parameters without them, otherwise Python cannot work
+out which is which:
+
+<Run id="cp-fn-5" raises="SyntaxError" code={`def broken(model="claude-opus-5", prompt):
+    return prompt
+
+print(broken("Hello"))`} />
+
+## The mutable default trap
+
+This is the single most common bug in hand-rolled chat helpers, and it is worth meeting once
+deliberately rather than at midnight in production:
+
+<Run id="cp-fn-6" code={`def add_message(text, history=[]):     # <- the bug
+    history.append(text)
+    return history
+
+print(add_message("first"))
+print(add_message("second"))   # a brand new conversation... or is it?
+print(add_message("third"))`} />
+
+The default value is evaluated **once**, when the `def` line runs — not once per call. Every
+caller that omits `history` shares the same list, so conversations bleed into each other. The
+fix is `None` plus a fresh object inside:
+
+<Run id="cp-fn-7" code={`def add_message(text, history=None):
+    if history is None:
+        history = []
+    history.append(text)
+    return history
+
+print(add_message("first"))
+print(add_message("second"))
+
+ongoing = ["earlier turn"]
+print(add_message("next turn", ongoing))`} />
+
+<Callout type="warning">
+The rule: **never use a list, dict or set as a default argument.** Use `None` and build the real
+default inside the function. Numbers, strings, `True`, `False` and tuples are immutable, so they
+are safe.
+</Callout>
+
+## Collecting extra arguments
+
+`*args` gathers leftover positional arguments into a tuple. `**kwargs` gathers leftover keyword
+arguments into a dictionary:
+
+<Run id="cp-fn-8" code={`def inspect(*args, **kwargs):
+    print("positional:", args)
+    print("keyword:   ", kwargs)
+
+inspect(1, 2, 3)
+print()
+inspect("prompt", model="claude-opus-5", max_tokens=512)`} />
+
+The same two symbols run in reverse at a call site, unpacking a sequence or a dictionary into
+arguments. That is how you forward options through a wrapper:
+
+<Run id="cp-fn-9" code={`def call(prompt, model="claude-opus-5", max_tokens=1024, temperature=1.0):
+    return f"{model} | {max_tokens} | temp {temperature} | {prompt!r}"
+
+options = {"model": "claude-haiku-4-5", "max_tokens": 256}
+print(call("Hello", **options))
+
+def with_retries(prompt, attempts=3, **options):
+    """Pass every option we do not handle ourselves straight through."""
+    for attempt in range(1, attempts + 1):
+        print(f"attempt {attempt}: {call(prompt, **options)}")
+
+with_retries("Summarise", attempts=2, model="claude-haiku-4-5", temperature=0.0)`} />
+
+<Callout type="ai" title="Why this matters for AI">
+Every model SDK is a function with a long tail of optional keyword arguments — `model`,
+`max_tokens`, `temperature`, `stop_sequences`, `tools`. You will write wrappers around those
+calls constantly: a retry wrapper, a logging wrapper, a cost-tracking wrapper. `**options`
+forwarding is what lets your wrapper stay useful when the SDK gains a parameter you have never
+heard of.
+</Callout>
+
+## Keyword-only arguments
+
+A bare `*` in the parameter list means "everything after me must be passed by name". It is the
+cheapest readability win in Python:
+
+<Run id="cp-fn-10" raises="TypeError" code={`def embed(text, *, model="text-embedding-3", normalise=True, dimensions=1536):
+    return f"{text!r} -> {dimensions}d via {model}, normalised={normalise}"
+
+print(embed("hello"))
+print(embed("hello", dimensions=256, normalise=False))
+
+# Positional is now refused, which is the point:
+print(embed("hello", 256))`} />
+
+Compare `embed("hello", 256, False)` with `embed("hello", dimensions=256, normalise=False)`. Six
+months later only one of them is readable.
+
+## Scope: what a name means inside a function
+
+Names bound inside a function are local to it. They do not exist outside, and assigning to one
+does not touch anything above:
+
+<Run id="cp-fn-11" code={`model = "claude-opus-5"
+
+def rebind():
+    model = "claude-haiku-4-5"   # a new, local name
+    print("inside: ", model)
+
+rebind()
+print("outside:", model)`} />
+
+Reading is different from assigning. A function can *read* a name from the enclosing scope
+without doing anything special:
+
+<Run id="cp-fn-12" code={`DEFAULT_MODEL = "claude-opus-5"
+
+def describe(prompt):
+    return f"{DEFAULT_MODEL}: {prompt}"   # read, not assigned — fine
+
+print(describe("Hello"))`} />
+
+Python resolves a name by looking **local → enclosing → global → builtins**. The moment a
+function assigns to a name anywhere in its body, that name is local for the whole body — which
+produces this famous error:
+
+<Run id="cp-fn-13" raises="UnboundLocalError" code={`count = 0
+
+def increment():
+    count = count + 1   # "count" is local, and it has no value yet
+    return count
+
+print(increment())`} />
+
+If you really do mean the module-level name, say so with `global`. Usually the better answer is
+to take it as an argument and return the new value:
+
+<Run id="cp-fn-14" code={`def increment(count):
+    return count + 1
+
+count = 0
+count = increment(count)
+count = increment(count)
+print(count)`} />
+
+## Functions are values
+
+A function is an ordinary object. You can put one in a variable, in a list, or pass it to
+another function:
+
+<Run id="cp-fn-15" code={`def to_upper(text):
+    return text.upper()
+
+def strip_spaces(text):
+    return text.strip()
+
+def collapse(text):
+    return " ".join(text.split())
+
+PIPELINE = [strip_spaces, collapse, to_upper]
+
+def clean(text, steps):
+    for step in steps:
+        text = step(text)
+    return text
+
+print(repr(clean("   ragged    input   text ", PIPELINE)))
+print(to_upper.__name__, "takes", to_upper.__code__.co_argcount, "argument")`} />
+
+A `lambda` is a one-expression function without a name. Use it for a throwaway key, not for
+anything you would want to read twice:
+
+<Run id="cp-fn-16" code={`scores = [("baseline", 0.71), ("tuned", 0.88), ("ensemble", 0.93)]
+
+print(sorted(scores, key=lambda pair: pair[1], reverse=True))
+print(max(scores, key=lambda pair: pair[1]))`} />
+
+## Returning more than one value
+
+`return a, b` builds a tuple, and the caller can unpack it:
+
+<Run id="cp-fn-17" code={`def token_usage(prompt, reply):
+    prompt_tokens = len(prompt.split())
+    output_tokens = len(reply.split())
+    return prompt_tokens, output_tokens
+
+sent, received = token_usage("summarise this document", "here is a short summary")
+print(sent, received, sent + received)`} />
+
+## Try it yourself
+
+<Exercise
+  id="cp-fn-ex1"
+  title="Exercise 1"
+  brief="Write <code>summarise(text, *, max_words=5, suffix='…')</code>. Return the first <code>max_words</code> words joined by spaces, with <code>suffix</code> appended only if words were dropped."
+  code={`def summarise(text, *, max_words=5, suffix="…"):
+    # Split text into words. Keep the first max_words.
+    # If anything was left over, append suffix to the result.
+    ...
+
+
+print(summarise("the quick brown fox jumps over the lazy dog"))
+print(summarise("short enough"))
+print(summarise("one two three four", max_words=2, suffix=" [cut]"))`}
+  hint="words = text.split(); kept = words[:max_words]. Compare len(words) with max_words to decide whether to append the suffix."
+  solution={`def summarise(text, *, max_words=5, suffix="…"):
+    words = text.split()
+    kept = words[:max_words]
+    result = " ".join(kept)
+    if len(words) > max_words:
+        result += suffix
+    return result
+
+
+print(summarise("the quick brown fox jumps over the lazy dog"))
+print(summarise("short enough"))
+print(summarise("one two three four", max_words=2, suffix=" [cut]"))`}
+  tests={`assert callable(summarise), "summarise should be a function."
+
+got = summarise("the quick brown fox jumps over the lazy dog")
+assert got == "the quick brown fox jumps…", f"Default call gave {got!r}."
+
+got = summarise("short enough")
+assert got == "short enough", (
+    f"Nothing was dropped, so no suffix belongs on the end. Got {got!r}."
+)
+
+got = summarise("one two three four", max_words=2, suffix=" [cut]")
+assert got == "one two [cut]", f"With max_words=2 and a custom suffix, got {got!r}."
+
+try:
+    summarise("a b c", 2)
+except TypeError:
+    pass
+else:
+    raise AssertionError("max_words should be keyword-only — put a bare * before it.")`}
+/>
+
+<Exercise
+  id="cp-fn-ex2"
+  title="Exercise 2"
+  brief="Fix the shared-history bug. Each call without a <code>history</code> must start an empty conversation."
+  code={`def add_turn(role, text, history=[]):
+    history.append({"role": role, "text": text})
+    return history
+
+first = add_turn("user", "hello")
+second = add_turn("user", "a separate conversation")
+
+print(len(first), len(second))`}
+  hint="Default to None, then build a new list inside the function when the caller passed nothing."
+  solution={`def add_turn(role, text, history=None):
+    if history is None:
+        history = []
+    history.append({"role": role, "text": text})
+    return history
+
+first = add_turn("user", "hello")
+second = add_turn("user", "a separate conversation")
+
+print(len(first), len(second))`}
+  tests={`a = add_turn("user", "one")
+b = add_turn("user", "two")
+assert len(a) == 1 and len(b) == 1, (
+    f"Two independent calls should each hold one turn, got {len(a)} and {len(b)}. "
+    "The default list is still being shared between calls."
+)
+assert a is not b, "Each call should build its own list."
+
+ongoing = [{"role": "user", "text": "earlier"}]
+returned = add_turn("assistant", "later", ongoing)
+assert returned is ongoing and len(ongoing) == 2, (
+    "When a history is passed in, append to that list and return it."
+)
+assert ongoing[-1]["role"] == "assistant" and ongoing[-1]["text"] == "later", (
+    f"Expected the new turn to be appended, got {ongoing[-1]!r}."
+)`}
+/>
+
+<Quiz
+  question="What does this print?  def f(x, items=[]): items.append(x); return len(items)  — then print(f(1), f(2))"
+  choices={[
+    { text: "1 1", why: "That is what it would print if the default list were rebuilt each call. It is not." },
+    { text: "1 2", correct: true, why: "The default list is created once, when def runs, so both calls append to the same list." },
+    { text: "2 2", why: "Arguments are evaluated left to right, so the first call sees a list of length 1." },
+    { text: "A TypeError", why: "It is legal Python — that is exactly why the bug is so easy to ship." },
+  ]}
+/>
+
+<Quiz
+  question="Why write def embed(text, *, model='...') rather than def embed(text, model='...')?"
+  choices={[
+    { text: "It makes model required", why: "It still has a default, so it stays optional — it just cannot be passed positionally." },
+    { text: "It forces callers to name model at the call site", correct: true, why: "Everything after a bare * is keyword-only, so calls read as embed(text, model='…') and stay readable." },
+    { text: "It makes the function faster", why: "Argument binding cost is identical; this is purely about the call site reading clearly." },
+    { text: "It allows unlimited extra arguments", why: "That is *args. A bare * collects nothing — it only marks where keyword-only parameters begin." },
+  ]}
+/>
+
+## Recap
+
+- `def` binds a name to a function object; a function with no `return` returns `None`.
+- Positional arguments go first; keyword arguments make a call site self-documenting.
+- Defaults are evaluated **once**, at definition time — so never default to a list or a dict.
+  Use `None` and build the real default inside.
+- `*args` and `**kwargs` collect extras; at a call site the same symbols unpack, which is how
+  wrappers forward options they do not understand.
+- A bare `*` makes every following parameter keyword-only.
+- Assigning to a name anywhere in a function makes it local everywhere in that function.
+- Functions are values: store them, pass them, build pipelines out of them.
