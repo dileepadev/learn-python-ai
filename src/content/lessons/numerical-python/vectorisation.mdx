@@ -1,0 +1,376 @@
+---
+title: Vectorisation vs. Python loops
+description: Why the same arithmetic runs a hundred times faster as an array expression, which functions are genuinely vectorised, and how to write a numerically stable softmax.
+module: numerical-python
+order: 4
+level: intermediate
+minutes: 18
+objectives:
+  - Explain where a Python loop's time actually goes
+  - Replace loops with ufuncs and reductions
+  - Reduce along the right axis, and keep the result stable
+  - Recognise that np.vectorize is not a speed-up
+  - Write a numerically stable softmax
+---
+
+The same arithmetic written as an array expression instead of a loop typically runs one to two
+orders of magnitude faster. Understanding why tells you which loops are worth rewriting.
+
+## Measure it first
+
+<Run id="np-vec-1" code={`import numpy as np, time
+
+n = 300_000
+values = np.random.default_rng(0).random(n)
+
+started = time.perf_counter()
+squared_loop = [v * v for v in values]
+loop_ms = (time.perf_counter() - started) * 1000
+
+started = time.perf_counter()
+squared_array = values ** 2
+array_ms = (time.perf_counter() - started) * 1000
+
+print(f"loop:  {loop_ms:8.1f} ms")
+print(f"array: {array_ms:8.1f} ms")
+print(f"speed-up: {loop_ms / max(array_ms, 1e-9):.0f}x")
+print("same answer:", np.allclose(squared_loop, squared_array))`} />
+
+The loop is not slow because multiplication is slow. It is slow because each iteration boxes a
+float into a Python object, looks up `__mul__`, allocates a result object and appends it. The
+array expression does the multiplication in a compiled loop over raw memory, once.
+
+## Universal functions
+
+A ufunc applies elementwise to a whole array. Every one of these has a `math` equivalent that
+works on one number — and the array version does N of them in one call:
+
+<Run id="np-vec-2" code={`import numpy as np
+
+values = np.array([0.0, 0.5, 1.0, 2.0, 4.0])
+
+print("exp:  ", np.exp(values).round(3))
+print("log1p:", np.log1p(values).round(3))
+print("sqrt: ", np.sqrt(values).round(3))
+print("abs:  ", np.abs(values - 1))
+print("max:  ", np.maximum(values, 1.0))     # elementwise, not a reduction
+print("round:", np.round(values / 3, 2))`} />
+
+Note the difference between `np.maximum` (elementwise, two arrays) and `np.max` (a reduction over
+one array). Getting them confused is a classic bug that runs silently.
+
+<Run id="np-vec-3" code={`import numpy as np
+
+a = np.array([1.0, 5.0, 3.0])
+b = np.array([4.0, 2.0, 3.0])
+
+print("np.maximum(a, b):", np.maximum(a, b))   # pairwise
+print("np.max(a):       ", np.max(a))          # one number
+print("np.max([a, b], axis=0):", np.max([a, b], axis=0))`} />
+
+## Reductions and the axis argument
+
+<Run id="np-vec-4" code={`import numpy as np
+
+batch = np.array([
+    [1.0, 2.0, 3.0],
+    [4.0, 5.0, 6.0],
+])
+
+print("everything:   ", batch.sum())
+print("down columns: ", batch.sum(axis=0))    # collapses the rows
+print("across rows:  ", batch.sum(axis=1))    # collapses the columns
+print()
+print("mean per row: ", batch.mean(axis=1))
+print("max per column:", batch.max(axis=0))
+print("argmax per row:", batch.argmax(axis=1))
+print("cumulative:   ", batch.cumsum(axis=1).tolist())`} />
+
+<Callout type="tip">
+Remember `axis` as "the axis that disappears". `batch.sum(axis=0)` on a `(2, 3)` array leaves
+shape `(3,)` — axis 0 is gone. That reading survives into three and four dimensions, where
+"rows and columns" stops helping.
+</Callout>
+
+## Replacing a loop
+
+Most loops over numbers are one of three shapes: elementwise arithmetic, a reduction, or a dot
+product.
+
+<Run id="np-vec-5" code={`import numpy as np
+
+query = np.array([0.2, 0.5, 0.1, 0.8])
+documents = np.array([
+    [0.1, 0.4, 0.2, 0.9],
+    [0.9, 0.1, 0.0, 0.1],
+    [0.2, 0.5, 0.1, 0.8],
+])
+
+# The loop version:
+scores_loop = []
+for row in documents:
+    total = 0.0
+    for a, b in zip(row, query):
+        total += a * b
+    scores_loop.append(total)
+print("loop:      ", np.round(scores_loop, 3))
+
+# One matrix-vector product:
+scores_array = documents @ query
+print("vectorised:", scores_array.round(3))
+print("same:", np.allclose(scores_loop, scores_array))`} />
+
+When you truly must build up a result, preallocate rather than appending — the array already
+knows how big it is:
+
+<Run id="np-vec-6" code={`import numpy as np
+
+n = 5
+result = np.empty(n)              # allocate once
+for i in range(n):
+    result[i] = i ** 2            # fill in place
+print(result)
+
+# In-place arithmetic avoids allocating a new array each time:
+values = np.ones(5)
+values += 3                       # no new array
+values *= 2
+print(values)
+
+np.sqrt(values, out=values)       # even the ufunc can write in place
+print(values.round(3))`} />
+
+## `np.vectorize` is not vectorisation
+
+The name is misleading. It is a convenience wrapper that still calls your Python function once
+per element:
+
+<Run id="np-vec-7" code={`import numpy as np, time
+
+values = np.random.default_rng(0).random(100_000)
+
+def scale(x):
+    return x * 2 + 1
+
+vectorised = np.vectorize(scale)
+
+started = time.perf_counter()
+a = vectorised(values)
+fake_ms = (time.perf_counter() - started) * 1000
+
+started = time.perf_counter()
+b = values * 2 + 1
+real_ms = (time.perf_counter() - started) * 1000
+
+print(f"np.vectorize:      {fake_ms:8.1f} ms")
+print(f"array expression:  {real_ms:8.1f} ms")
+print("same answer:", np.allclose(a, b))`} />
+
+<Callout type="warning">
+`np.vectorize` is for convenience — making a scalar function accept arrays — never for speed. If
+you need a genuinely custom elementwise operation to be fast, express it with existing ufuncs, or
+reach for a compiled tool.
+</Callout>
+
+## Softmax, and why stability matters
+
+Softmax turns a vector of scores into probabilities. The textbook formula overflows on real
+logits:
+
+<Run id="np-vec-8" code={`import numpy as np
+
+def naive_softmax(logits):
+    exponentiated = np.exp(logits)
+    return exponentiated / exponentiated.sum()
+
+small = np.array([1.0, 2.0, 3.0])
+print("small logits:", naive_softmax(small).round(4))
+
+large = np.array([1000.0, 1001.0, 1002.0])
+print("large logits:", naive_softmax(large))`} />
+
+`np.exp(1000)` is larger than float64 can hold, so it becomes `inf`, and `inf / inf` is `nan`.
+Subtracting the maximum first changes nothing mathematically — the same constant cancels top and
+bottom — but keeps every exponent at zero or below:
+
+<Run id="np-vec-9" code={`import numpy as np
+
+def softmax(logits, axis=-1):
+    shifted = logits - np.max(logits, axis=axis, keepdims=True)
+    exponentiated = np.exp(shifted)
+    return exponentiated / exponentiated.sum(axis=axis, keepdims=True)
+
+print("small:", softmax(np.array([1.0, 2.0, 3.0])).round(4))
+print("large:", softmax(np.array([1000.0, 1001.0, 1002.0])).round(4))
+print()
+
+batch = np.array([[1.0, 2.0, 3.0], [1000.0, 1001.0, 1002.0]])
+probabilities = softmax(batch, axis=1)
+print(probabilities.round(4))
+print("each row sums to:", probabilities.sum(axis=1))`} />
+
+<Callout type="ai" title="Why this matters for AI">
+Every token a model emits comes out of a softmax over a vocabulary of a hundred thousand logits,
+and that softmax is written exactly like the one above — the `max` subtraction is not an
+optimisation, it is what stops the whole distribution becoming `nan`. The same instinct applies
+throughout: prefer `np.log1p(x)` to `np.log(1 + x)` for small `x`, work in log-space when
+multiplying many probabilities, and check for `inf` and `nan` before they propagate silently
+through a training run.
+</Callout>
+
+## When a loop is the right answer
+
+Vectorising is not free: it costs readability, and it often costs memory, because intermediate
+arrays are materialised. A loop is fine when the data is small, when each step depends on the
+last, or when the body is genuinely complicated:
+
+<Run id="np-vec-10" code={`import numpy as np
+
+# Sequential by nature: each step depends on the previous one.
+values = np.array([0.5, 0.3, 0.9, 0.2])
+smoothed = np.empty_like(values)
+previous = 0.0
+for i, value in enumerate(values):
+    previous = 0.7 * previous + 0.3 * value
+    smoothed[i] = previous
+
+print(smoothed.round(4))
+
+# For this particular case NumPy has an answer, but many recurrences do not:
+print(np.cumsum(values).round(4))`} />
+
+## Try it yourself
+
+<Exercise
+  id="np-vec-ex1"
+  title="Exercise 1"
+  brief="Replace the loop with a single array expression that produces the same <code>scores</code>: each document's dot product with the query, divided by the document's length."
+  refactor
+  code={`import numpy as np
+
+query = np.array([0.2, 0.5, 0.1, 0.8])
+documents = np.array([
+    [0.1, 0.4, 0.2, 0.9],
+    [0.9, 0.1, 0.0, 0.1],
+    [0.2, 0.5, 0.1, 0.8],
+])
+
+scores = []
+for row in documents:
+    dot = 0.0
+    for a, b in zip(row, query):
+        dot += a * b
+    scores.append(dot / np.sqrt((row ** 2).sum()))
+scores = np.array(scores)
+
+print(scores.round(4))`}
+  hint="documents @ query gives every dot product at once; np.linalg.norm(documents, axis=1) gives every length."
+  solution={`import numpy as np
+
+query = np.array([0.2, 0.5, 0.1, 0.8])
+documents = np.array([
+    [0.1, 0.4, 0.2, 0.9],
+    [0.9, 0.1, 0.0, 0.1],
+    [0.2, 0.5, 0.1, 0.8],
+])
+
+scores = (documents @ query) / np.linalg.norm(documents, axis=1)
+
+print(scores.round(4))`}
+  tests={`import numpy as np
+
+expected = np.array([
+    (documents[i] @ query) / np.linalg.norm(documents[i]) for i in range(len(documents))
+])
+assert isinstance(scores, np.ndarray), "scores should be a NumPy array."
+assert scores.shape == (3,), f"Expected one score per document — shape (3,), got {scores.shape}."
+assert np.allclose(scores, expected), f"Expected {expected.round(4)}, got {np.asarray(scores).round(4)}."
+
+# The same expression must work unchanged on a larger batch.
+rng = np.random.default_rng(0)
+big_docs = rng.random((50, 4))
+big_expected = (big_docs @ query) / np.linalg.norm(big_docs, axis=1)
+assert big_expected.shape == (50,), "A vectorised solution scales to any number of documents."`}
+/>
+
+<Exercise
+  id="np-vec-ex2"
+  title="Exercise 2"
+  brief="Write <code>softmax(logits)</code> so it works on a 1-D array and does not overflow on large values. Every result must sum to 1."
+  code={`import numpy as np
+
+def softmax(logits):
+    # Subtract the maximum before exponentiating, then normalise.
+    ...
+
+
+print(softmax(np.array([1.0, 2.0, 3.0])).round(4))
+print(softmax(np.array([1000.0, 1001.0, 1002.0])).round(4))`}
+  hint="shifted = logits - np.max(logits); then np.exp(shifted) divided by its own sum."
+  solution={`import numpy as np
+
+def softmax(logits):
+    shifted = logits - np.max(logits)
+    exponentiated = np.exp(shifted)
+    return exponentiated / exponentiated.sum()
+
+
+print(softmax(np.array([1.0, 2.0, 3.0])).round(4))
+print(softmax(np.array([1000.0, 1001.0, 1002.0])).round(4))`}
+  tests={`import numpy as np
+
+small = softmax(np.array([1.0, 2.0, 3.0]))
+assert np.isclose(small.sum(), 1.0), f"The results should sum to 1, got {small.sum()}."
+assert np.allclose(small, [0.09003057, 0.24472847, 0.66524096]), (
+    f"Expected the standard softmax of [1, 2, 3], got {small.round(6)}."
+)
+
+large = softmax(np.array([1000.0, 1001.0, 1002.0]))
+assert not np.isnan(large).any(), (
+    "Large logits overflowed to nan — subtract the maximum before calling np.exp."
+)
+assert np.allclose(large, small), (
+    "Adding a constant to every logit must not change the result; "
+    f"got {large.round(6)} against {small.round(6)}."
+)
+
+flat = softmax(np.zeros(4))
+assert np.allclose(flat, 0.25), f"Equal logits should give a uniform distribution, got {flat}."
+
+shifted = softmax(np.array([-5.0, -4.0, -3.0]))
+assert np.allclose(shifted, small), "Softmax is invariant to a constant shift in either direction."`}
+/>
+
+<Quiz
+  question="Why is `values ** 2` on a 300,000-element array so much faster than the equivalent list comprehension?"
+  choices={[
+    { text: "The array loops over raw numbers in compiled code, while Python boxes and unboxes an object per element", correct: true, why: "The arithmetic is the cheap part; the per-element Python object overhead is what disappears." },
+    { text: "NumPy runs the operation across every CPU core", why: "Basic elementwise arithmetic is single-threaded; the win is the absence of interpreter overhead." },
+    { text: "NumPy caches the result", why: "Nothing is cached — run it on fresh data and the difference is identical." },
+    { text: "The list comprehension is quadratic", why: "Both are linear in the number of elements; the constant factor is what differs." },
+  ]}
+/>
+
+<Quiz
+  question="Why does a softmax subtract the maximum logit before exponentiating?"
+  choices={[
+    { text: "To keep every exponent at most 0, so np.exp cannot overflow to inf", correct: true, why: "The constant cancels between numerator and denominator, so the result is unchanged while the intermediate values stay finite." },
+    { text: "To make the outputs sum to 1", why: "Dividing by the sum does that; the subtraction is purely about numerical range." },
+    { text: "To make the largest probability exactly 1", why: "The largest probability is still less than 1 unless the others are vanishingly small." },
+    { text: "To speed up the exponential", why: "The cost is identical; only the numerical behaviour changes." },
+  ]}
+/>
+
+## Recap
+
+- A Python loop's time goes on object overhead, not arithmetic. Array expressions remove it.
+- Ufuncs apply elementwise; reductions collapse an axis. `np.maximum` and `np.max` are different
+  functions.
+- Read `axis` as "the axis that disappears".
+- Preallocate with `np.empty` rather than appending, and use `+=` or `out=` to avoid allocating
+  intermediates.
+- `np.vectorize` is a convenience, not a speed-up.
+- Subtract the maximum before `np.exp` — the difference between a probability distribution and a
+  vector of `nan`.
+- Keep the loop when steps depend on each other, when the data is small, or when the vectorised
+  version would be unreadable or allocate too much.

@@ -57,17 +57,8 @@ export const MODULES: Module[] = [
     description:
       "The mental model that separates people who use ML libraries from people who understand them: shapes, dtypes, broadcasting, and why a vectorised expression beats a Python loop by two orders of magnitude.",
     level: "intermediate",
-    status: "planned",
+    status: "published",
     icon: "grid",
-    plannedLessons: [
-      "Arrays, shapes and dtypes",
-      "Indexing, slicing and boolean masks",
-      "Broadcasting rules",
-      "Vectorisation vs. Python loops",
-      "Linear algebra you actually need",
-      "Random number generation and seeding",
-      "Matrix calculus intuition for gradients",
-    ],
   },
   {
     slug: "data-wrangling",

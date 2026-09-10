@@ -1,0 +1,404 @@
+---
+title: Matrix calculus intuition for gradients
+description: What a gradient is, how the chain rule composes one, and how to check an analytic gradient against a numerical one — the intuition every training loop rests on.
+module: numerical-python
+order: 7
+level: intermediate
+minutes: 20
+objectives:
+  - Describe a derivative as a slope, and estimate one numerically
+  - Read a gradient as the vector of partial derivatives
+  - Apply the chain rule to compose gradients through a pipeline
+  - Derive the gradient of a mean-squared-error loss and take a descent step
+  - Verify an analytic gradient with a numerical gradient check
+---
+
+Training a model means repeatedly asking "if I nudge this number, does the loss go up or down,
+and by how much?". The answer is a gradient. You will rarely derive one by hand in practice — a
+framework does it — but knowing what it *is* turns a training loop from magic into mechanics.
+
+## A derivative is a slope
+
+<Run id="np-grad-1" code={`import numpy as np
+
+def f(x):
+    return x ** 2
+
+def numerical_derivative(f, x, eps=1e-6):
+    return (f(x + eps) - f(x - eps)) / (2 * eps)
+
+for x in [-2.0, -0.5, 0.0, 1.0, 3.0]:
+    print(f"x={x:5.1f}  f(x)={f(x):6.2f}  slope={numerical_derivative(f, x):7.3f}  (exact 2x = {2 * x:5.1f})")`} />
+
+The slope is positive where the curve rises and negative where it falls, and it is zero at the
+minimum. That last fact is the whole idea: **step in the opposite direction of the slope and the
+value goes down.**
+
+<Run id="np-grad-2" code={`import numpy as np
+
+x = 3.0
+learning_rate = 0.2
+
+for step in range(8):
+    gradient = 2 * x
+    x = x - learning_rate * gradient
+    print(f"step {step + 1}: x={x:8.5f}  f(x)={x ** 2:8.5f}")`} />
+
+## Gradients of several variables
+
+With more than one input, the derivative becomes a vector of partial derivatives — one per input,
+each answering "if I nudge only this one, what happens?".
+
+<Run id="np-grad-3" code={`import numpy as np
+
+def loss(w):
+    # 3*w0^2 + w1^2 + 2*w0*w1
+    return 3 * w[0] ** 2 + w[1] ** 2 + 2 * w[0] * w[1]
+
+def analytic_gradient(w):
+    return np.array([6 * w[0] + 2 * w[1], 2 * w[1] + 2 * w[0]])
+
+def numerical_gradient(f, w, eps=1e-6):
+    gradient = np.zeros_like(w, dtype=float)
+    for i in range(w.size):
+        step = np.zeros_like(w, dtype=float)
+        step[i] = eps
+        gradient[i] = (f(w + step) - f(w - step)) / (2 * eps)
+    return gradient
+
+w = np.array([1.0, 2.0])
+print("loss:      ", loss(w))
+print("analytic:  ", analytic_gradient(w))
+print("numerical: ", numerical_gradient(loss, w).round(6))`} />
+
+The gradient points in the direction of **steepest increase**, so descent subtracts it:
+
+<Run id="np-grad-4" code={`import numpy as np
+
+def loss(w):
+    return 3 * w[0] ** 2 + w[1] ** 2 + 2 * w[0] * w[1]
+
+def gradient(w):
+    return np.array([6 * w[0] + 2 * w[1], 2 * w[1] + 2 * w[0]])
+
+w = np.array([1.0, 2.0])
+for step in range(6):
+    w = w - 0.1 * gradient(w)
+    print(f"step {step + 1}: w={w.round(5)}  loss={loss(w):.6f}")`} />
+
+## The chain rule
+
+A pipeline of functions has a gradient that is the product of each stage's gradient. If
+`y = g(f(x))`, then `dy/dx = dg/df * df/dx`:
+
+<Run id="np-grad-5" code={`import numpy as np
+
+# Forward: x -> u = 2x + 1 -> y = u^2
+def forward(x):
+    u = 2 * x + 1
+    y = u ** 2
+    return u, y
+
+# Backward: dy/du = 2u, du/dx = 2, so dy/dx = 2u * 2
+def backward(x):
+    u = 2 * x + 1
+    dy_du = 2 * u
+    du_dx = 2.0
+    return dy_du * du_dx
+
+def numerical_derivative(f, x, eps=1e-6):
+    return (f(x + eps) - f(x - eps)) / (2 * eps)
+
+x = 3.0
+u, y = forward(x)
+print(f"x={x}  u={u}  y={y}")
+print("chain rule: ", backward(x))
+print("numerical:  ", round(numerical_derivative(lambda v: forward(v)[1], x), 6))`} />
+
+<Callout type="ai" title="Why this matters for AI">
+Backpropagation is the chain rule applied to a graph. A forward pass records what each layer
+computed; the backward pass walks the graph in reverse, multiplying each stage's local gradient
+into the gradient flowing back from the loss. Everything a framework's autograd does is this,
+bookkept automatically. Two consequences you will meet in practice fall straight out of the
+multiplication: many small local gradients multiply towards zero — the vanishing gradient — and
+many large ones explode, which is why gradients are clipped.
+</Callout>
+
+## The gradient of a squared-error loss
+
+This is the one worth knowing by heart, because it is the loss behind linear regression and the
+final layer of countless models.
+
+For predictions `p = X @ w` and targets `y`, with `loss = mean((p - y)^2)`:
+
+- `d loss / d p = 2 * (p - y) / n`
+- `d p / d w = X`
+- so `d loss / d w = X.T @ (2 * (p - y) / n)`
+
+<Run id="np-grad-6" code={`import numpy as np
+
+rng = np.random.default_rng(0)
+
+n, features = 50, 3
+X = rng.normal(size=(n, features))
+true_w = np.array([2.0, -1.0, 0.5])
+y = X @ true_w + rng.normal(scale=0.1, size=n)
+
+def loss(w):
+    predictions = X @ w
+    return np.mean((predictions - y) ** 2)
+
+def gradient(w):
+    predictions = X @ w
+    return X.T @ (2 * (predictions - y) / n)
+
+w = np.zeros(features)
+print(f"start: loss={loss(w):.4f}  w={w}")
+
+for step in range(1, 61):
+    w = w - 0.1 * gradient(w)
+    if step % 15 == 0:
+        print(f"step {step:3}: loss={loss(w):.6f}  w={w.round(4)}")
+
+print()
+print("recovered:", w.round(3))
+print("true:     ", true_w)`} />
+
+That is a complete training loop: forward pass, loss, gradient, update. Everything module 5 adds
+is more layers and a smarter optimiser.
+
+## Gradient checking
+
+When you write a gradient by hand, check it against a numerical one. The numerical version is far
+too slow to train with — it costs two forward passes per parameter — but it is the ground truth
+for a bug hunt:
+
+<Run id="np-grad-7" code={`import numpy as np
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(20, 3))
+y = rng.normal(size=20)
+
+def loss(w):
+    return np.mean((X @ w - y) ** 2)
+
+def analytic_gradient(w):
+    return X.T @ (2 * (X @ w - y) / len(y))
+
+def numerical_gradient(f, w, eps=1e-6):
+    gradient = np.zeros_like(w, dtype=float)
+    for i in range(w.size):
+        step = np.zeros_like(w, dtype=float)
+        step[i] = eps
+        gradient[i] = (f(w + step) - f(w - step)) / (2 * eps)
+    return gradient
+
+w = rng.normal(size=3)
+analytic = analytic_gradient(w)
+numeric = numerical_gradient(loss, w)
+
+print("analytic: ", analytic.round(8))
+print("numerical:", numeric.round(8))
+print("max difference:", np.abs(analytic - numeric).max())
+print("agree:", np.allclose(analytic, numeric, atol=1e-5))`} />
+
+And here is what a wrong gradient looks like, so you know the failure when you see it:
+
+<Run id="np-grad-8" code={`import numpy as np
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(20, 3))
+y = rng.normal(size=20)
+
+def loss(w):
+    return np.mean((X @ w - y) ** 2)
+
+def buggy_gradient(w):
+    return X.T @ (X @ w - y) / len(y)          # forgot the factor of 2
+
+def numerical_gradient(f, w, eps=1e-6):
+    gradient = np.zeros_like(w, dtype=float)
+    for i in range(w.size):
+        step = np.zeros_like(w, dtype=float)
+        step[i] = eps
+        gradient[i] = (f(w + step) - f(w - step)) / (2 * eps)
+    return gradient
+
+w = rng.normal(size=3)
+print("buggy:    ", buggy_gradient(w).round(6))
+print("numerical:", numerical_gradient(loss, w).round(6))
+print("ratio:    ", (numerical_gradient(loss, w) / buggy_gradient(w)).round(4))`} />
+
+A constant ratio of exactly 2 is the signature of a missing factor. A gradient that is wrong by a
+constant still trains — just at the wrong learning rate — which is why this class of bug survives
+so long.
+
+<Callout type="warning">
+Choose `eps` carefully. Too large and the estimate is inaccurate; too small and floating-point
+cancellation destroys it. Around `1e-6` on float64 is the usual sweet spot, and the two-sided
+formula above is far more accurate than the one-sided version.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="np-grad-ex1"
+  title="Exercise 1"
+  brief="Write <code>numerical_gradient(f, w, eps=1e-6)</code> using the two-sided formula, returning one partial derivative per element of <code>w</code>."
+  code={`import numpy as np
+
+def numerical_gradient(f, w, eps=1e-6):
+    # For each element i, nudge only that element up and down by eps,
+    # and estimate the slope as (f(up) - f(down)) / (2 * eps).
+    ...
+
+
+def loss(w):
+    return 3 * w[0] ** 2 + w[1] ** 2 + 2 * w[0] * w[1]
+
+print(numerical_gradient(loss, np.array([1.0, 2.0])).round(5))`}
+  hint="Build a zero array the same shape as w, loop over range(w.size), set step[i] = eps, and fill gradient[i]."
+  solution={`import numpy as np
+
+def numerical_gradient(f, w, eps=1e-6):
+    gradient = np.zeros_like(w, dtype=float)
+    for i in range(w.size):
+        step = np.zeros_like(w, dtype=float)
+        step[i] = eps
+        gradient[i] = (f(w + step) - f(w - step)) / (2 * eps)
+    return gradient
+
+
+def loss(w):
+    return 3 * w[0] ** 2 + w[1] ** 2 + 2 * w[0] * w[1]
+
+print(numerical_gradient(loss, np.array([1.0, 2.0])).round(5))`}
+  tests={`import numpy as np
+
+def quadratic(w):
+    return 3 * w[0] ** 2 + w[1] ** 2 + 2 * w[0] * w[1]
+
+w = np.array([1.0, 2.0])
+result = numerical_gradient(quadratic, w)
+
+assert isinstance(result, np.ndarray), "Return a NumPy array."
+assert result.shape == w.shape, f"One partial derivative per input — expected {w.shape}, got {result.shape}."
+assert np.allclose(result, [10.0, 6.0], atol=1e-4), (
+    f"At w=[1, 2] the gradient is [6*1 + 2*2, 2*2 + 2*1] = [10, 6]. Got {result.round(6)}."
+)
+
+# It must not modify the array it was given.
+original = np.array([1.0, 2.0])
+numerical_gradient(quadratic, original)
+assert np.array_equal(original, [1.0, 2.0]), (
+    "Nudge a copy — the caller's array should come back unchanged."
+)
+
+# And it must work for any number of inputs.
+def cubic(w):
+    return float((w ** 3).sum())
+
+point = np.array([1.0, 2.0, 3.0])
+assert np.allclose(numerical_gradient(cubic, point), 3 * point ** 2, atol=1e-3), (
+    "The gradient of sum(w**3) is 3*w**2 — check the loop covers every element."
+)`}
+/>
+
+<Exercise
+  id="np-grad-ex2"
+  title="Exercise 2"
+  brief="Complete <code>gradient(w)</code> for the mean squared error of <code>X @ w</code> against <code>y</code>, then take 100 descent steps at a learning rate of 0.1 into <code>w</code>."
+  code={`import numpy as np
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(40, 2))
+true_w = np.array([1.5, -0.5])
+y = X @ true_w
+
+def loss(w):
+    return np.mean((X @ w - y) ** 2)
+
+def gradient(w):
+    # d/dw of mean((X @ w - y) ** 2)
+    ...
+
+
+w = np.zeros(2)
+# Take 100 steps of gradient descent with a learning rate of 0.1.
+
+print(w.round(3))
+print(f"loss: {loss(w):.8f}")`}
+  hint="The gradient is X.T @ (2 * (X @ w - y) / len(y)). Then loop: w = w - 0.1 * gradient(w)."
+  solution={`import numpy as np
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(40, 2))
+true_w = np.array([1.5, -0.5])
+y = X @ true_w
+
+def loss(w):
+    return np.mean((X @ w - y) ** 2)
+
+def gradient(w):
+    return X.T @ (2 * (X @ w - y) / len(y))
+
+
+w = np.zeros(2)
+for _ in range(100):
+    w = w - 0.1 * gradient(w)
+
+print(w.round(3))
+print(f"loss: {loss(w):.8f}")`}
+  tests={`import numpy as np
+
+# The gradient must match a numerical estimate.
+def numerical(f, point, eps=1e-6):
+    out = np.zeros_like(point, dtype=float)
+    for i in range(point.size):
+        step = np.zeros_like(point, dtype=float)
+        step[i] = eps
+        out[i] = (f(point + step) - f(point - step)) / (2 * eps)
+    return out
+
+probe = np.array([0.3, -0.7])
+assert np.allclose(gradient(probe), numerical(loss, probe), atol=1e-4), (
+    f"The analytic gradient {np.asarray(gradient(probe)).round(6)} disagrees with the numerical "
+    f"estimate {numerical(loss, probe).round(6)} — check the factor of 2 and the division by n."
+)
+
+assert np.allclose(w, true_w, atol=1e-3), (
+    f"After 100 steps w should have converged to {true_w}, got {np.asarray(w).round(4)}."
+)
+assert loss(w) < 1e-6, f"The loss should be essentially zero by now, got {loss(w):.8f}."`}
+/>
+
+<Quiz
+  question="Your analytic gradient is consistently exactly half the numerical one. What does that tell you?"
+  choices={[
+    { text: "A constant factor is missing — the model still trains, just at half the effective learning rate", correct: true, why: "A constant ratio points at an algebra slip such as a dropped factor of 2, and because it only rescales the step it hides rather than crashes." },
+    { text: "The numerical gradient is wrong; eps is too large", why: "A bad eps gives noisy disagreement, not a clean constant ratio across every element." },
+    { text: "The loss function is not differentiable", why: "A non-differentiable point gives wild disagreement at that point, not a uniform factor." },
+    { text: "Nothing — a factor of 2 does not matter", why: "It does not stop training, but it silently changes the effective learning rate and any comparison against a correct implementation." },
+  ]}
+/>
+
+<Quiz
+  question="Why is a numerical gradient useless for actually training a model?"
+  choices={[
+    { text: "It costs two forward passes per parameter, which is impossible for millions of parameters", correct: true, why: "Backpropagation gets every partial derivative from roughly one extra pass over the whole graph, regardless of parameter count." },
+    { text: "It gives the wrong direction", why: "It gives very nearly the right answer — the problem is entirely the cost of getting it." },
+    { text: "It only works for functions of one variable", why: "It extends to any number of variables; that is exactly what makes it so expensive." },
+    { text: "It cannot handle non-linear functions", why: "It handles any function you can evaluate; differentiability at the point is the only requirement." },
+  ]}
+/>
+
+## Recap
+
+- A derivative is a slope: positive going up, negative going down, zero at a minimum.
+- A gradient is the vector of partial derivatives, pointing towards steepest **increase** — so
+  descent subtracts it, scaled by a learning rate.
+- The chain rule multiplies each stage's local gradient; backpropagation is that applied to a
+  graph, and it explains both vanishing and exploding gradients.
+- For `loss = mean((X @ w - y) ** 2)`, the gradient is `X.T @ (2 * (X @ w - y) / n)`.
+- Check a hand-written gradient against a two-sided numerical estimate with `eps` around `1e-6`.
+  A constant ratio means a missing factor, which trains anyway and hides for months.
