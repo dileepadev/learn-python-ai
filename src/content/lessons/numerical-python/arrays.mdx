@@ -1,0 +1,326 @@
+---
+title: Arrays, shapes and dtypes
+description: The three questions to ask about any array — what shape, what dtype, is it a view — and why float32 halves the memory bill of every embedding you store.
+module: numerical-python
+order: 1
+level: intermediate
+minutes: 18
+objectives:
+  - Create arrays and read their shape, ndim, size and dtype
+  - Choose a dtype deliberately, and know what float32 costs and saves
+  - Reshape, transpose and add axes without copying data
+  - Stack and concatenate arrays along the right axis
+  - Tell a view from a copy, and avoid changing data you did not mean to
+---
+
+A Python list holds references to objects scattered across memory. A NumPy array holds raw
+numbers of one type, side by side. That single difference is what makes array code both far
+faster and far more memory-efficient — and it is the model every tensor library inherits.
+
+## Making arrays
+
+<Run id="np-arr-1" code={`import numpy as np
+
+scores = np.array([0.71, 0.88, 0.93])
+print(scores)
+print(type(scores))
+
+grid = np.array([[1, 2, 3], [4, 5, 6]])
+print(grid)
+
+print("zeros: ", np.zeros(4))
+print("ones:  ", np.ones((2, 3)))
+print("full:  ", np.full(3, 7))
+print("arange:", np.arange(0, 10, 2))
+print("linspace:", np.linspace(0, 1, 5))
+print("eye:")
+print(np.eye(3))`} />
+
+`arange` counts by step and excludes the stop, like `range`. `linspace` takes the number of
+points you want and includes both ends — the one you want for plotting and for sweeping a
+hyperparameter.
+
+## The three questions
+
+Whenever an array surprises you, ask: what **shape**, what **dtype**, and is it a **view**?
+
+<Run id="np-arr-2" code={`import numpy as np
+
+batch = np.zeros((32, 768), dtype=np.float32)   # 32 embeddings of 768 dimensions
+
+print("shape:   ", batch.shape)      # (rows, columns)
+print("ndim:    ", batch.ndim)       # how many axes
+print("size:    ", batch.size)       # total elements
+print("dtype:   ", batch.dtype)      # the type of every element
+print("itemsize:", batch.itemsize, "bytes each")
+print("nbytes:  ", batch.nbytes, "bytes total")`} />
+
+Shape is a tuple, read outside-in: `(32, 768)` is 32 rows of 768 numbers. In AI code the first
+axis is almost always the batch.
+
+<Run id="np-arr-3" code={`import numpy as np
+
+print("a scalar:      ", np.array(5.0).shape, "-> 0 axes")
+print("one embedding: ", np.zeros(768).shape, "-> 1 axis")
+print("a batch:       ", np.zeros((32, 768)).shape, "-> 2 axes")
+print("a batch of images:", np.zeros((8, 28, 28, 3)).shape, "-> 4 axes")`} />
+
+## dtypes
+
+An array is one type throughout. Choosing it is a real decision:
+
+<Run id="np-arr-4" code={`import numpy as np
+
+print(np.array([1, 2, 3]).dtype)              # integers -> int64
+print(np.array([1.0, 2, 3]).dtype)            # one float makes it all float
+print(np.array([True, False]).dtype)
+print(np.array(["a", "bc"]).dtype)            # fixed-width text
+
+as_32 = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+as_64 = np.array([0.1, 0.2, 0.3], dtype=np.float64)
+print(as_32.dtype, as_32.nbytes, "bytes")
+print(as_64.dtype, as_64.nbytes, "bytes")
+
+print("converted:", as_64.astype(np.float32).dtype)`} />
+
+Precision is what you pay for the saving:
+
+<Run id="np-arr-5" code={`import numpy as np
+
+value = 0.1234567890123456789
+
+print("float64:", np.float64(value))
+print("float32:", np.float32(value))
+print("float16:", np.float16(value))
+
+big = np.float32(1e30)
+print("float32 squared:", big * big)          # overflows to inf`} />
+
+<Callout type="ai" title="Why this matters for AI">
+A million embeddings of 1536 dimensions is 6.1 GB in float64 and 3.1 GB in float32 — the
+difference between fitting in memory and not. Embedding models emit roughly six significant
+figures of meaningful signal, so float32 loses nothing you had, and float16 is standard for model
+weights. Store embeddings as float32 unless you have measured a reason not to.
+</Callout>
+
+<Run id="np-arr-6" code={`import numpy as np
+
+rows, dims = 1_000_000, 1536
+for dtype in (np.float64, np.float32, np.float16):
+    bytes_needed = rows * dims * np.dtype(dtype).itemsize
+    print(f"{np.dtype(dtype).name:>8}: {bytes_needed / 1e9:5.2f} GB")`} />
+
+Integer types overflow silently, which is worth seeing once:
+
+<Run id="np-arr-7" code={`import numpy as np
+
+small = np.array([120, 125], dtype=np.int8)    # int8 holds -128..127
+print(small)
+print(small + 10)                              # wraps around
+
+print(np.iinfo(np.int8))
+print(np.finfo(np.float32).max)`} />
+
+## Reshaping
+
+`reshape` reinterprets the same numbers with a different shape. `-1` means "work this one out":
+
+<Run id="np-arr-8" code={`import numpy as np
+
+flat = np.arange(12)
+print(flat)
+
+print(flat.reshape(3, 4))
+print()
+print(flat.reshape(4, -1))       # -1 becomes 3
+print()
+print(flat.reshape(2, 2, 3).shape)
+print("back to flat:", flat.reshape(3, 4).ravel())`} />
+
+Transposing swaps axes, and `T` is the shorthand you will use constantly:
+
+<Run id="np-arr-9" code={`import numpy as np
+
+batch = np.arange(6).reshape(2, 3)
+print(batch)
+print("shape:", batch.shape)
+print()
+print(batch.T)
+print("shape:", batch.T.shape)`} />
+
+Adding a length-1 axis is how you make shapes line up for broadcasting, which is the next
+lesson:
+
+<Run id="np-arr-10" code={`import numpy as np
+
+vector = np.array([1.0, 2.0, 3.0])
+print("vector:      ", vector.shape)
+
+print("as a row:    ", vector[np.newaxis, :].shape)   # (1, 3)
+print("as a column: ", vector[:, np.newaxis].shape)   # (3, 1)
+print("same thing:  ", vector.reshape(1, -1).shape)
+print("and back:    ", vector[np.newaxis, :].squeeze().shape)`} />
+
+## Stacking and joining
+
+<Run id="np-arr-11" code={`import numpy as np
+
+a = np.array([[1, 2], [3, 4]])
+b = np.array([[5, 6], [7, 8]])
+
+print("concatenate axis=0 (more rows):")
+print(np.concatenate([a, b], axis=0))
+print()
+print("concatenate axis=1 (wider rows):")
+print(np.concatenate([a, b], axis=1))
+print()
+print("stack makes a new axis:", np.stack([a, b]).shape)
+
+# Building a batch out of individual embeddings:
+embeddings = [np.ones(4) * n for n in range(3)]
+batch = np.stack(embeddings)
+print(batch.shape)
+print(batch)`} />
+
+`concatenate` joins along an axis that already exists; `stack` creates a new one. Reach for
+`np.stack(list_of_embeddings)` whenever you turn per-item vectors into a batch.
+
+## Views and copies
+
+Slicing an array does **not** copy it. You get a view onto the same memory, and writing through
+the view changes the original:
+
+<Run id="np-arr-12" code={`import numpy as np
+
+original = np.arange(6)
+window = original[1:4]
+
+print("original:", original)
+print("window:  ", window)
+
+window[0] = 99
+print("after writing to the window:")
+print("original:", original)          # changed
+print("shares memory:", np.shares_memory(original, window))
+
+independent = original[1:4].copy()
+independent[0] = -1
+print("with a copy, the original is untouched:", original)`} />
+
+<Callout type="warning">
+This is the most common source of "my data changed and I do not know why". Fancy indexing (with
+a list or a boolean mask) always copies; basic slicing, `reshape` and `T` give views. When in
+doubt, `np.shares_memory(a, b)` answers it, and `.copy()` settles it.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="np-arr-ex1"
+  title="Exercise 1"
+  brief="Build <code>batch</code>: the numbers 0 to 11 as a float32 array of shape (3, 4). Then print its shape, dtype and total bytes, one per line."
+  code={`import numpy as np
+
+# Build a (3, 4) float32 array holding 0 .. 11 in order.
+batch = None
+
+print(batch.shape)
+print(batch.dtype)
+print(batch.nbytes)`}
+  hint="np.arange(12) gives the numbers; .reshape(3, 4) gives the shape; .astype(np.float32) — or dtype= on arange — gives the type."
+  solution={`import numpy as np
+
+batch = np.arange(12, dtype=np.float32).reshape(3, 4)
+
+print(batch.shape)
+print(batch.dtype)
+print(batch.nbytes)`}
+  tests={`import numpy as np
+
+assert isinstance(batch, np.ndarray), f"batch should be a NumPy array, got {type(batch).__name__}."
+assert batch.shape == (3, 4), f"Expected shape (3, 4), got {batch.shape}."
+assert batch.dtype == np.float32, f"Expected dtype float32, got {batch.dtype}."
+assert np.array_equal(batch, np.arange(12, dtype=np.float32).reshape(3, 4)), (
+    f"Expected 0 to 11 in order across the rows, got:\\n{batch}"
+)
+assert batch.nbytes == 48, f"12 float32 values are 48 bytes, got {batch.nbytes}."
+assert _lines == ["(3, 4)", "float32", "48"], f"Expected three lines of output, got: {_lines}."`}
+/>
+
+<Exercise
+  id="np-arr-ex2"
+  title="Exercise 2"
+  brief="Turn the list of three 1-D embeddings into one (3, 4) float32 batch, then print <code>saved: N</code> — the bytes saved versus keeping it in float64."
+  code={`import numpy as np
+
+embeddings = [
+    np.array([0.1, 0.2, 0.3, 0.4]),
+    np.array([0.5, 0.6, 0.7, 0.8]),
+    np.array([0.9, 1.0, 1.1, 1.2]),
+]
+
+batch = None       # a (3, 4) float32 array
+saved = 0          # bytes saved compared with float64
+
+print(batch.shape, batch.dtype)
+print(f"saved: {saved}")`}
+  hint="np.stack(embeddings) builds the batch; .astype(np.float32) converts it. The saving is the float64 nbytes minus the float32 nbytes."
+  solution={`import numpy as np
+
+embeddings = [
+    np.array([0.1, 0.2, 0.3, 0.4]),
+    np.array([0.5, 0.6, 0.7, 0.8]),
+    np.array([0.9, 1.0, 1.1, 1.2]),
+]
+
+as_64 = np.stack(embeddings)
+batch = as_64.astype(np.float32)
+saved = as_64.nbytes - batch.nbytes
+
+print(batch.shape, batch.dtype)
+print(f"saved: {saved}")`}
+  tests={`import numpy as np
+
+assert isinstance(batch, np.ndarray), "batch should be a NumPy array."
+assert batch.shape == (3, 4), f"Stacking three 4-element vectors gives (3, 4), got {batch.shape}."
+assert batch.dtype == np.float32, f"Expected float32, got {batch.dtype}."
+assert np.allclose(batch, np.stack(embeddings)), (
+    "The values should match the original embeddings, only in a smaller dtype."
+)
+assert saved == 48, (
+    f"96 bytes as float64 minus 48 as float32 is 48 saved, got {saved!r}."
+)
+assert _lines[-1] == "saved: 48", f"The last line should be 'saved: 48'. Got: {_lines}."`}
+/>
+
+<Quiz
+  question="window = batch[0:2] and then window[0, 0] = 99. What happened to batch?"
+  choices={[
+    { text: "batch[0, 0] is now 99 — basic slicing returns a view onto the same memory", correct: true, why: "Slicing never copies, so writing through the view writes through to the original array." },
+    { text: "batch is unchanged; slicing copies", why: "Lists copy on slice, arrays do not — that difference catches nearly everyone once." },
+    { text: "NumPy raises an error for writing through a slice", why: "It is entirely legal, which is exactly why it is easy to do by accident." },
+    { text: "It depends on the dtype", why: "The dtype makes no difference; basic slicing always gives a view." },
+  ]}
+/>
+
+<Quiz
+  question="You store one million 1536-dimension embeddings. Why float32 rather than float64?"
+  choices={[
+    { text: "It halves memory to about 3 GB, and embeddings carry nowhere near float64's precision anyway", correct: true, why: "The extra bits hold noise, not signal, so you pay 3 GB for nothing you can use." },
+    { text: "float64 cannot represent values between -1 and 1", why: "It represents them with more precision than float32, not less." },
+    { text: "NumPy cannot allocate arrays larger than 4 GB", why: "There is no such limit; the constraint is the memory you actually have." },
+    { text: "Cosine similarity requires float32", why: "It works in any float dtype — the choice is purely about memory against precision." },
+  ]}
+/>
+
+## Recap
+
+- An array holds one dtype in contiguous memory; that is where the speed and the memory savings
+  come from.
+- Ask three questions: what shape, what dtype, is it a view.
+- `reshape(-1)` infers a dimension; `T` transposes; `[:, np.newaxis]` adds a length-1 axis.
+- `concatenate` joins along an existing axis, `stack` adds a new one — `np.stack` is how a list
+  of embeddings becomes a batch.
+- Basic slicing, `reshape` and `T` give **views**; fancy indexing copies. `.copy()` when you mean
+  it, and `np.shares_memory` when you are unsure.
+- float32 halves the memory of float64 and loses nothing an embedding model actually produced.

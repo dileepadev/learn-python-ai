@@ -1,0 +1,343 @@
+---
+title: Broadcasting rules
+description: How NumPy stretches a small array to meet a large one, the two-line rule that decides whether it will, and the keepdims trick that makes row-normalising a batch of embeddings a one-liner.
+module: numerical-python
+order: 3
+level: intermediate
+minutes: 18
+objectives:
+  - State the broadcasting rule and apply it to any pair of shapes
+  - Predict the result shape before running the code
+  - Use keepdims so a reduction still broadcasts back
+  - Add a length-1 axis deliberately to control how shapes meet
+  - Read and fix a broadcasting error message
+---
+
+Broadcasting is how NumPy makes arrays of different shapes work together without copying data or
+writing loops. It is the single most useful idea in the library, and the one that produces the
+most confusing error messages until you know the rule.
+
+## The simplest case
+
+<Run id="np-bc-1" code={`import numpy as np
+
+scores = np.array([0.71, 0.88, 0.93])
+
+print(scores + 0.1)        # the scalar is applied to every element
+print(scores * 100)
+print(scores > 0.8)`} />
+
+Nothing was copied and no loop ran: the scalar was *broadcast* across the array.
+
+## The rule
+
+Line the shapes up **from the right**. Two dimensions are compatible when they are equal, or when
+one of them is 1. A missing dimension on the left counts as 1.
+
+```text
+      batch  (32, 768)
+      bias   (    768,)   ->  treated as (1, 768)
+      result (32, 768)    ->  the bias is reused for every row
+
+      batch  (32, 768)
+      norms  (32,   1)
+      result (32, 768)    ->  each row divided by its own number
+
+      a      (5, 1)
+      b      (1, 3)
+      result (5, 3)       ->  both are stretched
+```
+
+<Run id="np-bc-2" code={`import numpy as np
+
+batch = np.ones((4, 3))
+bias = np.array([10.0, 20.0, 30.0])
+
+print("batch shape:", batch.shape, " bias shape:", bias.shape)
+print(batch + bias)
+print("result shape:", (batch + bias).shape)`} />
+
+The bias has three numbers and the batch has three columns, so the bias is applied to every row.
+This is exactly what adding a bias vector to a layer's output does.
+
+<Run id="np-bc-3" code={`import numpy as np
+
+column = np.array([[1], [2], [3]])        # (3, 1)
+row = np.array([[10, 20, 30, 40]])        # (1, 4)
+
+print("column shape:", column.shape)
+print("row shape:   ", row.shape)
+print()
+print(column + row)                        # (3, 4)
+print("result shape:", (column + row).shape)`} />
+
+Both were stretched: the column across four columns, the row down three rows. That gives you
+every combination — an outer operation, with no loop.
+
+## When it fails
+
+<Run id="np-bc-4" raises="ValueError" code={`import numpy as np
+
+batch = np.ones((4, 3))
+wrong = np.array([1.0, 2.0])       # 2 does not match 3, and is not 1
+
+print(batch + wrong)`} />
+
+Read the message right to left: it names the axis where the sizes disagree. The fix is always
+either to transpose one array, or to add a length-1 axis so the sizes line up as you intended.
+
+<Run id="np-bc-5" code={`import numpy as np
+
+batch = np.ones((4, 3))
+per_row = np.array([1.0, 2.0, 3.0, 4.0])      # one number per row
+
+# (4, 3) against (4,) lines up as (4, 3) against (1, 4) -> incompatible.
+print("as given:", batch.shape, per_row.shape)
+
+fixed = per_row[:, np.newaxis]                 # (4, 1)
+print("reshaped:", batch.shape, fixed.shape)
+print(batch * fixed)`} />
+
+<Callout type="tip">
+When a per-row value has shape `(n,)` and you want it applied down the rows, you always need
+`[:, np.newaxis]` — or `reshape(-1, 1)`. NumPy aligns from the right, so a bare `(n,)` array
+lines up with the *columns*.
+</Callout>
+
+## keepdims
+
+A reduction removes the axis it reduced, which is usually what you want — until you need the
+result to broadcast back against the original:
+
+<Run id="np-bc-6" code={`import numpy as np
+
+batch = np.array([[1.0, 2.0, 3.0], [10.0, 20.0, 30.0]])
+
+totals = batch.sum(axis=1)
+print("sum(axis=1):          ", totals, totals.shape)
+
+totals_kept = batch.sum(axis=1, keepdims=True)
+print("sum(axis=1, keepdims):", totals_kept.tolist(), totals_kept.shape)
+print()
+
+print("this is what you want:")
+print(batch / totals_kept)                 # each row sums to 1`} />
+
+Without `keepdims`, `batch / totals` would line `(2, 3)` up against `(2,)` and fail — or worse,
+succeed for the wrong shape and silently divide the wrong way.
+
+## Normalising a batch of embeddings
+
+This is the broadcasting expression you will write most often in AI work:
+
+<Run id="np-bc-7" code={`import numpy as np
+
+embeddings = np.array([
+    [3.0, 4.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [1.0, 1.0, 1.0],
+])
+
+norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+print("norms:", norms.ravel())
+
+unit = embeddings / norms
+print(unit.round(3))
+print("every row now has length:", np.linalg.norm(unit, axis=1).round(6))`} />
+
+<Callout type="ai" title="Why this matters for AI">
+Cosine similarity is a dot product *of unit vectors*, so normalising a batch is the first thing
+any vector index does. Written with broadcasting it is one line that runs at C speed over a
+million embeddings; written as a loop it is a minute of Python per query. The same pattern
+appears again in softmax, in layer normalisation, and in centring features before training —
+subtract a per-row or per-column statistic that you kept an axis for.
+</Callout>
+
+## Centring and standardising
+
+<Run id="np-bc-8" code={`import numpy as np
+
+features = np.array([
+    [120.0, 0.9],
+    [4300.0, 0.2],
+    [980.0, 0.75],
+    [75.0, 0.4],
+])
+
+mean = features.mean(axis=0)                 # per column
+std = features.std(axis=0)
+
+print("mean:", mean.round(2))
+print("std: ", std.round(2))
+print()
+
+standardised = (features - mean) / std
+print(standardised.round(3))
+print("new mean:", standardised.mean(axis=0).round(6))
+print("new std: ", standardised.std(axis=0).round(6))`} />
+
+Here the statistic is per **column**, with shape `(2,)`, and NumPy's right-alignment does the
+right thing with no `newaxis` at all. Per-column needs nothing; per-row needs `keepdims`.
+
+## Similarity without a loop
+
+One query against every document, in a single expression:
+
+<Run id="np-bc-9" code={`import numpy as np
+
+documents = np.array([
+    [1.0, 0.0, 0.0],
+    [0.9, 0.1, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+])
+query = np.array([1.0, 0.1, 0.0])
+
+docs_unit = documents / np.linalg.norm(documents, axis=1, keepdims=True)
+query_unit = query / np.linalg.norm(query)
+
+similarity = docs_unit @ query_unit          # (4, 3) @ (3,) -> (4,)
+print(similarity.round(3))
+print("best document:", similarity.argmax())`} />
+
+And every pair of documents against each other, which is how de-duplication works:
+
+<Run id="np-bc-10" code={`import numpy as np
+
+documents = np.array([
+    [1.0, 0.0, 0.0],
+    [0.9, 0.1, 0.0],
+    [0.0, 1.0, 0.0],
+])
+unit = documents / np.linalg.norm(documents, axis=1, keepdims=True)
+
+pairwise = unit @ unit.T
+print(pairwise.round(3))
+
+# Squared euclidean distances, via broadcasting rather than a double loop:
+diff = documents[:, np.newaxis, :] - documents[np.newaxis, :, :]   # (3, 3, 3)
+print()
+print("difference tensor shape:", diff.shape)
+print((diff ** 2).sum(axis=-1).round(3))`} />
+
+`documents[:, np.newaxis, :]` has shape `(3, 1, 3)` and `documents[np.newaxis, :, :]` has shape
+`(1, 3, 3)`. Broadcasting stretches both to `(3, 3, 3)` — every pair, without a loop.
+
+<Callout type="warning">
+That last trick allocates an array of size n × n × d. For 10,000 documents of 768 dimensions
+that is 460 GB. Broadcasting hides the allocation, so check the result shape before you run it on
+real data — and prefer the matrix-multiplication form, which is n × n.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="np-bc-ex1"
+  title="Exercise 1"
+  brief="Set <code>unit</code> to <code>embeddings</code> with every row scaled to length 1, using one broadcasting expression."
+  code={`import numpy as np
+
+embeddings = np.array([
+    [3.0, 4.0],
+    [0.0, 5.0],
+    [6.0, 8.0],
+])
+
+unit = None
+
+print(unit.round(3))
+print(np.linalg.norm(unit, axis=1).round(6))`}
+  hint="np.linalg.norm(embeddings, axis=1, keepdims=True) gives a (3, 1) column of lengths; divide by it."
+  solution={`import numpy as np
+
+embeddings = np.array([
+    [3.0, 4.0],
+    [0.0, 5.0],
+    [6.0, 8.0],
+])
+
+unit = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+
+print(unit.round(3))
+print(np.linalg.norm(unit, axis=1).round(6))`}
+  tests={`import numpy as np
+
+assert isinstance(unit, np.ndarray), "unit should be a NumPy array."
+assert unit.shape == (3, 2), f"The shape should be unchanged at (3, 2), got {unit.shape}."
+assert np.allclose(np.linalg.norm(unit, axis=1), 1.0), (
+    f"Every row should have length 1, got {np.linalg.norm(unit, axis=1)}."
+)
+assert np.allclose(unit, [[0.6, 0.8], [0.0, 1.0], [0.6, 0.8]]), (
+    f"Expected each row divided by its own length, got:\\n{unit.round(3)}"
+)`}
+/>
+
+<Exercise
+  id="np-bc-ex2"
+  title="Exercise 2"
+  brief="Build <code>table</code>: a (4, 3) array where <code>table[i, j]</code> is <code>lengths[i] * weights[j]</code>. Use broadcasting, not a loop."
+  code={`import numpy as np
+
+lengths = np.array([100, 200, 300, 400])
+weights = np.array([0.5, 1.0, 2.0])
+
+table = None
+
+print(table.shape)
+print(table)`}
+  hint="Make lengths a column with [:, np.newaxis] so it lines up against weights as a row."
+  solution={`import numpy as np
+
+lengths = np.array([100, 200, 300, 400])
+weights = np.array([0.5, 1.0, 2.0])
+
+table = lengths[:, np.newaxis] * weights
+
+print(table.shape)
+print(table)`}
+  tests={`import numpy as np
+
+assert isinstance(table, np.ndarray), "table should be a NumPy array."
+assert table.shape == (4, 3), (
+    f"Expected (4, 3) — one row per length, one column per weight. Got {table.shape}."
+)
+
+expected = np.array([[l * w for w in weights] for l in lengths], dtype=float)
+assert np.allclose(table, expected), f"Expected:\\n{expected}\\ngot:\\n{table}"
+
+# It has to come from broadcasting, so the same expression must scale.
+big = np.arange(1000)[:, np.newaxis] * weights
+assert big.shape == (1000, 3), "The same approach should work for any length of input."`}
+/>
+
+<Quiz
+  question="An array of shape (32, 768) is added to one of shape (768,). What is the result shape?"
+  choices={[
+    { text: "(32, 768) — the shorter array is treated as (1, 768) and reused for every row", correct: true, why: "Shapes align from the right, and a missing leading dimension counts as 1, so one bias vector serves all 32 rows." },
+    { text: "(768, 32)", why: "Broadcasting never transposes; it only stretches length-1 dimensions." },
+    { text: "(32, 768, 768)", why: "No new axis is created — that only happens when you add one yourself with newaxis." },
+    { text: "It raises ValueError", why: "768 matches 768 on the right, so the shapes are compatible." },
+  ]}
+/>
+
+<Quiz
+  question="Why does dividing a (2, 3) batch by batch.sum(axis=1) fail, while keepdims=True works?"
+  choices={[
+    { text: "Without keepdims the sum has shape (2,), which aligns against the columns, not the rows", correct: true, why: "Right-alignment compares 2 with 3 and refuses; keepdims leaves it as (2, 1), which stretches down the rows as intended." },
+    { text: "keepdims makes the sum a float instead of an int", why: "The dtype is unaffected; only the shape changes." },
+    { text: "sum(axis=1) returns a scalar without keepdims", why: "It returns one value per row — an array of shape (2,), not a scalar." },
+    { text: "Division always needs identical shapes", why: "It does not — that is the whole point of broadcasting; the shapes just have to be compatible." },
+  ]}
+/>
+
+## Recap
+
+- Align shapes from the right. Dimensions are compatible when equal or when one is 1, and a
+  missing leading dimension counts as 1.
+- A `(n,)` array lines up with the **columns**. For a per-row value use `[:, np.newaxis]` or
+  `keepdims=True`.
+- `keepdims=True` is what lets a reduction broadcast back against the array it came from.
+- `embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)` normalises a batch — the
+  expression behind every cosine similarity.
+- Per-column statistics broadcast with no help; per-row statistics always need the extra axis.
+- Broadcasting hides allocations: check the result shape before running it on real data.
