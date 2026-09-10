@@ -77,19 +77,8 @@ export const MODULES: Module[] = [
     description:
       "Fit your first models, then take the lid off. Train/test discipline, pipelines, metrics that match the problem, and gradient descent and backpropagation implemented from scratch in NumPy.",
     level: "advanced",
-    status: "planned",
+    status: "published",
     icon: "activity",
-    plannedLessons: [
-      "The estimator API and your first model",
-      "Train, validation and test splits",
-      "Pipelines and preprocessing",
-      "Choosing metrics that match the problem",
-      "Cross-validation and hyperparameter search",
-      "Overfitting, regularisation and the bias-variance trade-off",
-      "Gradient descent from scratch",
-      "A neural network in pure NumPy",
-      "PyTorch: tensors, autograd and a training loop",
-    ],
   },
   {
     slug: "llm-engineering",

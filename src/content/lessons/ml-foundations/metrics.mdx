@@ -1,0 +1,384 @@
+---
+title: Choosing metrics that match the problem
+description: Why accuracy lies on imbalanced data, what precision and recall actually trade off, and how to pick a threshold from the cost of each kind of mistake.
+module: ml-foundations
+order: 4
+level: advanced
+minutes: 20
+objectives:
+  - Read a confusion matrix and compute precision, recall and F1 from it
+  - Explain why accuracy is misleading when classes are imbalanced
+  - Move the decision threshold deliberately, and see what it costs
+  - Choose between ROC-AUC and precision-recall AUC
+  - Pick regression metrics that match what you care about
+---
+
+A metric is a claim about what counts as good. Choosing the wrong one is how a model that
+optimises beautifully turns out to be useless — and the failure is invisible, because the number
+goes up either way.
+
+## Accuracy on imbalanced data
+
+<Run id="ml-met-1" code={`import numpy as np
+from sklearn.dummy import DummyClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+X, y = make_classification(n_samples=2000, n_features=8, n_informative=4,
+                           weights=[0.97, 0.03], flip_y=0.01, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3,
+                                                     random_state=0, stratify=y)
+
+print("abuse rate in the test set:", round(y_test.mean(), 4))
+print()
+
+dummy = DummyClassifier(strategy="most_frequent").fit(X_train, y_train)
+model = LogisticRegression(max_iter=1000).fit(X_train, y_train)
+
+print("dummy accuracy:   ", round(accuracy_score(y_test, dummy.predict(X_test)), 4))
+print("model accuracy:   ", round(accuracy_score(y_test, model.predict(X_test)), 4))
+print()
+print("abusive requests the dummy caught:", int(dummy.predict(X_test)[y_test == 1].sum()))
+print("abusive requests the model caught:", int(model.predict(X_test)[y_test == 1].sum()),
+      "of", int(y_test.sum()))`} />
+
+Both score around 0.97. One of them has never flagged anything.
+
+## The confusion matrix
+
+Everything else is derived from four numbers:
+
+<Run id="ml-met-2" code={`import numpy as np
+from sklearn.metrics import confusion_matrix
+
+truth =      np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
+prediction = np.array([0, 0, 0, 1, 1, 0, 0, 1, 1, 1])
+
+matrix = confusion_matrix(truth, prediction)
+print(matrix)
+print()
+
+tn, fp, fn, tp = matrix.ravel()
+print(f"true negatives  {tn}   correctly left alone")
+print(f"false positives {fp}   flagged, but fine")
+print(f"false negatives {fn}   missed")
+print(f"true positives  {tp}   correctly flagged")`} />
+
+<Run id="ml-met-3" code={`import numpy as np
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
+
+truth =      np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
+prediction = np.array([0, 0, 0, 1, 1, 0, 0, 1, 1, 1])
+tn, fp, fn, tp = confusion_matrix(truth, prediction).ravel()
+
+precision = tp / (tp + fp)     # of what I flagged, how much was right?
+recall = tp / (tp + fn)        # of what was there, how much did I find?
+f1 = 2 * precision * recall / (precision + recall)
+
+print(f"precision {precision:.4f}   by hand, and {precision_score(truth, prediction):.4f} from sklearn")
+print(f"recall    {recall:.4f}   by hand, and {recall_score(truth, prediction):.4f} from sklearn")
+print(f"f1        {f1:.4f}   by hand, and {f1_score(truth, prediction):.4f} from sklearn")`} />
+
+The two questions are worth memorising in plain words:
+
+- **Precision** — when the model says yes, how often is it right?
+- **Recall** — of everything that really was a yes, how much did the model find?
+
+<Run id="ml-met-4" code={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report
+
+X, y = make_classification(n_samples=2000, n_features=8, n_informative=4,
+                           weights=[0.97, 0.03], flip_y=0.01, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3,
+                                                     random_state=0, stratify=y)
+model = LogisticRegression(max_iter=1000).fit(X_train, y_train)
+
+print(classification_report(y_test, model.predict(X_test),
+                            target_names=["benign", "abusive"], digits=3))`} />
+
+Read the `support` column: the metrics for the rare class are computed from a handful of
+examples, so they are noisy. `macro avg` treats both classes equally; `weighted avg` weights by
+support and therefore looks almost exactly like accuracy.
+
+## The threshold
+
+`predict` uses 0.5, but nothing makes 0.5 special. Moving it trades precision against recall:
+
+<Run id="ml-met-5" code={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import precision_score, recall_score
+
+X, y = make_classification(n_samples=3000, n_features=8, n_informative=4,
+                           weights=[0.95, 0.05], flip_y=0.02, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3,
+                                                     random_state=0, stratify=y)
+model = LogisticRegression(max_iter=1000).fit(X_train, y_train)
+scores = model.predict_proba(X_test)[:, 1]
+
+print(f"{'threshold':>10} {'flagged':>8} {'precision':>10} {'recall':>8}")
+for threshold in [0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9]:
+    predicted = (scores >= threshold).astype(int)
+    flagged = int(predicted.sum())
+    p = precision_score(y_test, predicted, zero_division=0)
+    r = recall_score(y_test, predicted, zero_division=0)
+    print(f"{threshold:>10} {flagged:>8} {p:>10.3f} {r:>8.3f}")`} />
+
+<Callout type="ai" title="Why this matters for AI">
+The threshold is a product decision, not a modelling one, and the two mistakes almost never cost
+the same. A content filter that wrongly blocks a legitimate request annoys one user; one that
+misses genuine abuse can be a serious incident — so you accept low precision to buy recall. A
+system that auto-refunds customers is the opposite: a false positive costs real money, so you set
+the threshold high and route the rest to a human. Decide which error you are buying down
+**before** you look at the curve.
+</Callout>
+
+## Precision-recall and ROC curves
+
+<Run id="ml-met-6" code={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+X, y = make_classification(n_samples=4000, n_features=8, n_informative=4,
+                           weights=[0.98, 0.02], flip_y=0.01, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3,
+                                                     random_state=0, stratify=y)
+model = LogisticRegression(max_iter=1000).fit(X_train, y_train)
+scores = model.predict_proba(X_test)[:, 1]
+
+print("positive rate:", round(y_test.mean(), 4))
+print()
+print("ROC AUC:            ", round(roc_auc_score(y_test, scores), 4))
+print("average precision:  ", round(average_precision_score(y_test, scores), 4))
+print("a random model's AP:", round(y_test.mean(), 4), "(the positive rate)")
+print("a random model's ROC AUC: 0.5")`} />
+
+ROC-AUC looks impressive on imbalanced data because the false-positive rate has a huge
+denominator — a thousand extra false positives barely moves it. Average precision does not
+flatter you in the same way.
+
+<Run id="ml-met-7" code={`import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import precision_recall_curve, roc_curve
+
+X, y = make_classification(n_samples=4000, n_features=8, n_informative=4,
+                           weights=[0.98, 0.02], flip_y=0.01, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3,
+                                                     random_state=0, stratify=y)
+model = LogisticRegression(max_iter=1000).fit(X_train, y_train)
+scores = model.predict_proba(X_test)[:, 1]
+
+precision, recall, _ = precision_recall_curve(y_test, scores)
+fpr, tpr, _ = roc_curve(y_test, scores)
+
+fig, axes = plt.subplots(1, 2, figsize=(8, 3.2))
+axes[0].plot(recall, precision, linewidth=2)
+axes[0].axhline(y_test.mean(), linestyle="--", linewidth=1, color="#8a8f98")
+axes[0].set_title("precision-recall")
+axes[0].set_xlabel("recall")
+axes[0].set_ylabel("precision")
+
+axes[1].plot(fpr, tpr, linewidth=2)
+axes[1].plot([0, 1], [0, 1], linestyle="--", linewidth=1, color="#8a8f98")
+axes[1].set_title("ROC")
+axes[1].set_xlabel("false positive rate")
+axes[1].set_ylabel("true positive rate")`} />
+
+## Regression metrics
+
+<Run id="ml-met-8" code={`import numpy as np
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+truth = np.array([100.0, 200.0, 300.0, 400.0, 500.0])
+close = np.array([110.0, 190.0, 310.0, 390.0, 510.0])
+one_disaster = np.array([100.0, 200.0, 300.0, 400.0, 900.0])
+
+for name, predicted in [("uniformly close", close), ("one huge error", one_disaster)]:
+    mae = mean_absolute_error(truth, predicted)
+    rmse = np.sqrt(mean_squared_error(truth, predicted))
+    print(f"{name:18} MAE {mae:7.2f}   RMSE {rmse:7.2f}   R² {r2_score(truth, predicted):6.3f}")`} />
+
+Both have the same total absolute error. RMSE punishes the second far more, because squaring
+makes one big miss count for more than several small ones. Choose accordingly: RMSE when a large
+error is disproportionately bad, MAE when errors should count equally.
+
+<Callout type="tip">
+Report the metric in the units people think in. "Median latency error of 38 ms" lands; "R² of
+0.86" does not. R² is useful for comparing models on the same data and almost useless for
+explaining a model to anyone else.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="ml-met-ex1"
+  title="Exercise 1"
+  brief="From the confusion matrix counts, compute <code>precision</code>, <code>recall</code> and <code>f1</code> by hand. Do not call scikit-learn's metric functions."
+  code={`from sklearn.metrics import confusion_matrix
+import numpy as np
+
+truth =      np.array([0, 0, 0, 0, 0, 0, 1, 1, 1, 1])
+prediction = np.array([0, 0, 0, 0, 1, 1, 0, 1, 1, 1])
+
+tn, fp, fn, tp = confusion_matrix(truth, prediction).ravel()
+
+precision = None
+recall = None
+f1 = None
+
+print(f"precision {precision}")
+print(f"recall    {recall}")
+print(f"f1        {f1}")`}
+  hint="precision = tp / (tp + fp); recall = tp / (tp + fn); f1 = 2 * precision * recall / (precision + recall)."
+  solution={`from sklearn.metrics import confusion_matrix
+import numpy as np
+
+truth =      np.array([0, 0, 0, 0, 0, 0, 1, 1, 1, 1])
+prediction = np.array([0, 0, 0, 0, 1, 1, 0, 1, 1, 1])
+
+tn, fp, fn, tp = confusion_matrix(truth, prediction).ravel()
+
+precision = tp / (tp + fp)
+recall = tp / (tp + fn)
+f1 = 2 * precision * recall / (precision + recall)
+
+print(f"precision {precision}")
+print(f"recall    {recall}")
+print(f"f1        {f1}")`}
+  tests={`from sklearn.metrics import precision_score, recall_score, f1_score
+
+assert abs(float(precision) - precision_score(truth, prediction)) < 1e-9, (
+    f"Of the 5 flagged rows, 3 are really positive, so precision is 0.6. Got {precision!r}."
+)
+assert abs(float(recall) - recall_score(truth, prediction)) < 1e-9, (
+    f"Of the 4 real positives, 3 were found, so recall is 0.75. Got {recall!r}."
+)
+assert abs(float(f1) - f1_score(truth, prediction)) < 1e-9, (
+    f"F1 is the harmonic mean of precision and recall. Got {f1!r}."
+)
+assert int(tp) == 3 and int(fp) == 2 and int(fn) == 1 and int(tn) == 4, (
+    f"Check the unpacking order — confusion_matrix ravels to tn, fp, fn, tp. "
+    f"Got tn={tn}, fp={fp}, fn={fn}, tp={tp}."
+)`}
+/>
+
+<Exercise
+  id="ml-met-ex2"
+  title="Exercise 2"
+  brief="Find the <em>lowest</em> threshold from the list whose precision is at least 0.80, and put it in <code>chosen</code>. Set <code>chosen_recall</code> to the recall it achieves."
+  code={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import precision_score, recall_score
+
+X, y = make_classification(n_samples=3000, n_features=8, n_informative=4,
+                           weights=[0.9, 0.1], flip_y=0.02, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3,
+                                                     random_state=0, stratify=y)
+model = LogisticRegression(max_iter=1000).fit(X_train, y_train)
+scores = model.predict_proba(X_test)[:, 1]
+
+thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+chosen = None
+chosen_recall = None
+
+print("chosen:", chosen, "recall:", chosen_recall)`}
+  hint="Loop through the thresholds in order; for each, predict with (scores >= t) and measure precision. Stop at the first one that reaches 0.80."
+  solution={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import precision_score, recall_score
+
+X, y = make_classification(n_samples=3000, n_features=8, n_informative=4,
+                           weights=[0.9, 0.1], flip_y=0.02, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3,
+                                                     random_state=0, stratify=y)
+model = LogisticRegression(max_iter=1000).fit(X_train, y_train)
+scores = model.predict_proba(X_test)[:, 1]
+
+thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+chosen = None
+chosen_recall = None
+for threshold in thresholds:
+    predicted = (scores >= threshold).astype(int)
+    if precision_score(y_test, predicted, zero_division=0) >= 0.80:
+        chosen = threshold
+        chosen_recall = recall_score(y_test, predicted, zero_division=0)
+        break
+
+print("chosen:", chosen, "recall:", chosen_recall)`}
+  tests={`import numpy as np
+from sklearn.metrics import precision_score, recall_score
+
+assert chosen is not None, "No threshold was chosen — at least one reaches 0.80 precision."
+assert chosen in thresholds, f"chosen should come from the list, got {chosen!r}."
+
+predicted = (scores >= chosen).astype(int)
+achieved = precision_score(y_test, predicted, zero_division=0)
+assert achieved >= 0.80, (
+    f"Threshold {chosen} only reaches precision {achieved:.3f}, below the 0.80 target."
+)
+
+# It must be the lowest qualifying threshold, so recall is as high as possible.
+for lower in thresholds:
+    if lower >= chosen:
+        break
+    lower_precision = precision_score(y_test, (scores >= lower).astype(int), zero_division=0)
+    assert lower_precision < 0.80, (
+        f"Threshold {lower} already reaches precision {lower_precision:.3f} and would give more "
+        f"recall than {chosen}. Take the lowest threshold that clears the bar."
+    )
+
+expected_recall = recall_score(y_test, predicted, zero_division=0)
+assert abs(float(chosen_recall) - expected_recall) < 1e-9, (
+    f"chosen_recall should be {expected_recall:.4f} at that threshold, got {chosen_recall!r}."
+)`}
+/>
+
+<Quiz
+  question="Your fraud detector scores 0.994 accuracy on data that is 0.6% fraud. What does that tell you?"
+  choices={[
+    { text: "Almost nothing — always predicting 'not fraud' scores 0.994 too", correct: true, why: "On this imbalance accuracy is dominated by the majority class; only recall on the fraud class says whether anything is being caught." },
+    { text: "The model is excellent", why: "It is indistinguishable by this metric from a model that never fires at all." },
+    { text: "The model is overfitting", why: "Overfitting shows as a train/test gap; this number is uninformative on either split." },
+    { text: "The threshold is too low", why: "A low threshold would produce more false positives and *lower* accuracy — the metric itself is the problem." },
+  ]}
+/>
+
+<Quiz
+  question="A content filter must catch as much genuine abuse as possible; wrongly flagging a benign request is a minor annoyance. Which way do you move the threshold, and what do you buy?"
+  choices={[
+    { text: "Lower it — accepting worse precision in exchange for higher recall", correct: true, why: "A lower threshold flags more requests, catching more real abuse while letting more benign ones through the filter." },
+    { text: "Raise it — higher precision means fewer mistakes overall", why: "Raising it reduces false positives but misses more abuse, which is the expensive error here." },
+    { text: "Leave it at 0.5, which is balanced", why: "0.5 is an arbitrary default, not a balance point — it reflects no judgement about what each error costs." },
+    { text: "Move it until accuracy is maximised", why: "Maximising accuracy on imbalanced data pushes the threshold towards never flagging anything." },
+  ]}
+/>
+
+## Recap
+
+- Accuracy is dominated by the majority class; on imbalanced data it says almost nothing.
+- Everything comes from the confusion matrix. Precision: when it says yes, is it right. Recall:
+  of everything that was a yes, how much did it find.
+- The threshold is a product decision, driven by what each kind of error costs. `predict` just
+  uses 0.5.
+- On imbalanced data prefer average precision over ROC-AUC — a random model's AP is the positive
+  rate, not 0.5.
+- RMSE punishes a single large error more than MAE does; pick the one matching what actually
+  hurts.
+- Report metrics in units people can act on.

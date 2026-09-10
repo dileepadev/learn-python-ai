@@ -1,0 +1,584 @@
+---
+title: "PyTorch: tensors, autograd and a training loop"
+description: Build a working autograd engine in eighty lines so nothing about PyTorch is mysterious, then read the real training loop you will run on your own machine.
+module: ml-foundations
+order: 9
+level: advanced
+minutes: 24
+objectives:
+  - Explain what a tensor adds over a NumPy array
+  - Build a reverse-mode autograd engine and see backward() work
+  - Recognise the five lines every PyTorch training loop contains
+  - Read nn.Module, an optimiser and a loss function
+  - Run the real thing locally, including on a GPU
+---
+
+<Callout type="warning" title="This one runs differently">
+PyTorch is a large compiled package and is not available in the browser sandbox, so the runnable
+code on this page is a **miniature autograd engine written in NumPy** that deliberately mirrors
+PyTorch's API. Everything it teaches is real; the PyTorch listings alongside it are there to run
+on your own machine, after `pip install torch`.
+</Callout>
+
+## What a tensor adds
+
+A tensor is an array that remembers where it came from. That is the entire difference, and it is
+what makes `loss.backward()` possible: every operation records enough to send a gradient back
+through it.
+
+<Run id="ml-torch-1" code={`import numpy as np
+
+def unbroadcast(grad, shape):
+    """Sum a gradient back down to the shape it was broadcast from."""
+    while grad.ndim > len(shape):
+        grad = grad.sum(axis=0)
+    for axis, size in enumerate(shape):
+        if size == 1 and grad.shape[axis] != 1:
+            grad = grad.sum(axis=axis, keepdims=True)
+    return grad.reshape(shape)
+
+class Tensor:
+    """An array that records the operations applied to it."""
+
+    def __init__(self, data, parents=()):
+        self.data = np.asarray(data, dtype=float)
+        self.grad = np.zeros_like(self.data)
+        self._parents = tuple(parents)
+        self._backward = lambda: None
+
+    def __repr__(self):
+        return f"Tensor(shape={self.data.shape})"
+
+    def __add__(self, other):
+        other = other if isinstance(other, Tensor) else Tensor(other)
+        out = Tensor(self.data + other.data, (self, other))
+        def _backward():
+            self.grad = self.grad + unbroadcast(out.grad, self.data.shape)
+            other.grad = other.grad + unbroadcast(out.grad, other.data.shape)
+        out._backward = _backward
+        return out
+
+    def __matmul__(self, other):
+        out = Tensor(self.data @ other.data, (self, other))
+        def _backward():
+            self.grad = self.grad + out.grad @ other.data.T
+            other.grad = other.grad + self.data.T @ out.grad
+        out._backward = _backward
+        return out
+
+    def relu(self):
+        out = Tensor(np.maximum(self.data, 0.0), (self,))
+        def _backward():
+            self.grad = self.grad + out.grad * (self.data > 0)
+        out._backward = _backward
+        return out
+
+    def backward(self):
+        """Walk the graph in reverse, handing each node its gradient."""
+        order, seen = [], set()
+        def visit(node):
+            if id(node) in seen:
+                return
+            seen.add(id(node))
+            for parent in node._parents:
+                visit(parent)
+            order.append(node)
+        visit(self)
+
+        self.grad = np.ones_like(self.data)
+        for node in reversed(order):
+            node._backward()
+
+a = Tensor([[1.0, 2.0]])
+b = Tensor([[3.0], [4.0]])
+c = a @ b
+
+print(a, b, c)
+print("value:", c.data)
+c.backward()
+print("da:", a.grad)      # = b.T
+print("db:", b.grad)      # = a.T`} />
+
+`c.backward()` walked back through the single `@` and filled in both gradients. Nothing was
+written by hand — the operation recorded how to reverse itself when it happened.
+
+## The graph
+
+Every operation adds a node. `backward()` sorts them topologically and visits them in reverse, so
+each node's gradient is complete before it passes anything on:
+
+<Run id="ml-torch-2" code={`import numpy as np
+
+class Tensor:
+    def __init__(self, data, parents=()):
+        self.data = np.asarray(data, dtype=float)
+        self.grad = np.zeros_like(self.data)
+        self._parents = tuple(parents)
+        self._backward = lambda: None
+
+    def __add__(self, other):
+        out = Tensor(self.data + other.data, (self, other))
+        def _backward():
+            self.grad = self.grad + out.grad
+            other.grad = other.grad + out.grad
+        out._backward = _backward
+        return out
+
+    def __mul__(self, other):
+        out = Tensor(self.data * other.data, (self, other))
+        def _backward():
+            self.grad = self.grad + out.grad * other.data
+            other.grad = other.grad + out.grad * self.data
+        out._backward = _backward
+        return out
+
+    def backward(self):
+        order, seen = [], set()
+        def visit(node):
+            if id(node) in seen:
+                return
+            seen.add(id(node))
+            for parent in node._parents:
+                visit(parent)
+            order.append(node)
+        visit(self)
+        self.grad = np.ones_like(self.data)
+        for node in reversed(order):
+            node._backward()
+
+# f = (x + y) * x, with x = 3 and y = 2.
+# df/dx = (x + y) + x = 8;  df/dy = x = 3.
+x, y = Tensor(3.0), Tensor(2.0)
+f = (x + y) * x
+f.backward()
+
+print("f     =", f.data)
+print("df/dx =", x.grad, "(expected 8)")
+print("df/dy =", y.grad, "(expected 3)")`} />
+
+Note that `x` is used twice and its gradient accumulates from both paths. That accumulation is
+why PyTorch needs `zero_grad()`: gradients add up by design, and forgetting to clear them silently
+sums the gradients of every batch you have ever seen.
+
+## Training with it
+
+Now the same two-moons network as the last lesson, written against the autograd engine. Compare
+this with the hand-derived backward pass — the forward pass is all that is left:
+
+<Run id="ml-torch-3" code={`import numpy as np
+from sklearn.datasets import make_moons
+from sklearn.model_selection import train_test_split
+
+def unbroadcast(grad, shape):
+    while grad.ndim > len(shape):
+        grad = grad.sum(axis=0)
+    for axis, size in enumerate(shape):
+        if size == 1 and grad.shape[axis] != 1:
+            grad = grad.sum(axis=axis, keepdims=True)
+    return grad.reshape(shape)
+
+class Tensor:
+    def __init__(self, data, parents=()):
+        self.data = np.asarray(data, dtype=float)
+        self.grad = np.zeros_like(self.data)
+        self._parents = tuple(parents)
+        self._backward = lambda: None
+
+    def __add__(self, other):
+        out = Tensor(self.data + other.data, (self, other))
+        def _backward():
+            self.grad = self.grad + unbroadcast(out.grad, self.data.shape)
+            other.grad = other.grad + unbroadcast(out.grad, other.data.shape)
+        out._backward = _backward
+        return out
+
+    def __matmul__(self, other):
+        out = Tensor(self.data @ other.data, (self, other))
+        def _backward():
+            self.grad = self.grad + out.grad @ other.data.T
+            other.grad = other.grad + self.data.T @ out.grad
+        out._backward = _backward
+        return out
+
+    def relu(self):
+        out = Tensor(np.maximum(self.data, 0.0), (self,))
+        def _backward():
+            self.grad = self.grad + out.grad * (self.data > 0)
+        out._backward = _backward
+        return out
+
+    def backward(self):
+        order, seen = [], set()
+        def visit(node):
+            if id(node) in seen:
+                return
+            seen.add(id(node))
+            for parent in node._parents:
+                visit(parent)
+            order.append(node)
+        visit(self)
+        self.grad = np.ones_like(self.data)
+        for node in reversed(order):
+            node._backward()
+
+def cross_entropy(logits, targets):
+    """Softmax plus cross-entropy, with the combined gradient."""
+    n = len(targets)
+    shifted = logits.data - logits.data.max(axis=1, keepdims=True)
+    probabilities = np.exp(shifted)
+    probabilities /= probabilities.sum(axis=1, keepdims=True)
+    value = -np.mean(np.log(np.clip(probabilities[np.arange(n), targets], 1e-12, 1.0)))
+
+    out = Tensor(value, (logits,))
+    def _backward():
+        onehot = np.zeros_like(probabilities)
+        onehot[np.arange(n), targets] = 1.0
+        logits.grad = logits.grad + out.grad * (probabilities - onehot) / n
+    out._backward = _backward
+    return out
+
+X, y = make_moons(n_samples=600, noise=0.2, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25,
+                                                     random_state=0, stratify=y)
+
+rng = np.random.default_rng(0)
+hidden = 16
+W1 = Tensor(rng.normal(0, np.sqrt(2 / 2), (2, hidden)))
+b1 = Tensor(np.zeros(hidden))
+W2 = Tensor(rng.normal(0, np.sqrt(2 / hidden), (hidden, 2)))
+b2 = Tensor(np.zeros(2))
+parameters = [W1, b1, W2, b2]
+
+inputs = Tensor(X_train)
+learning_rate = 0.5
+
+for epoch in range(1, 401):
+    # forward
+    logits = (inputs @ W1 + b1).relu() @ W2 + b2
+    loss = cross_entropy(logits, y_train)
+
+    # backward
+    for parameter in parameters:
+        parameter.grad = np.zeros_like(parameter.data)
+    loss.backward()
+
+    # step
+    for parameter in parameters:
+        parameter.data -= learning_rate * parameter.grad
+
+    if epoch % 100 == 0:
+        print(f"epoch {epoch:3}  loss {loss.data:.4f}")
+
+hidden_out = np.maximum(X_test @ W1.data + b1.data, 0.0)
+predictions = (hidden_out @ W2.data + b2.data).argmax(axis=1)
+print()
+print("test accuracy:", round(float((predictions == y_test).mean()), 4))`} />
+
+Five lines carry the whole loop, and they are the same five in every PyTorch program ever
+written:
+
+```text
+logits = model(inputs)        forward
+loss   = criterion(logits, y) measure
+optimizer.zero_grad()         clear last step's gradients
+loss.backward()               fill in this step's
+optimizer.step()              move the parameters
+```
+
+## The real thing
+
+Here is the identical network in PyTorch. Run it on your own machine:
+
+```python
+import torch
+import torch.nn as nn
+from sklearn.datasets import make_moons
+from sklearn.model_selection import train_test_split
+
+X, y = make_moons(n_samples=600, noise=0.2, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.25, random_state=0, stratify=y
+)
+
+torch.manual_seed(0)
+inputs = torch.tensor(X_train, dtype=torch.float32)
+targets = torch.tensor(y_train, dtype=torch.long)
+
+model = nn.Sequential(
+    nn.Linear(2, 16),
+    nn.ReLU(),
+    nn.Linear(16, 2),
+)
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.SGD(model.parameters(), lr=0.5)
+
+for epoch in range(1, 401):
+    logits = model(inputs)
+    loss = criterion(logits, targets)
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if epoch % 100 == 0:
+        print(f"epoch {epoch:3}  loss {loss.item():.4f}")
+
+model.eval()
+with torch.no_grad():
+    test_logits = model(torch.tensor(X_test, dtype=torch.float32))
+    accuracy = (test_logits.argmax(dim=1).numpy() == y_test).mean()
+print("test accuracy:", round(float(accuracy), 4))
+```
+
+Four things in that listing are worth naming:
+
+- **`nn.Module`** — a container that knows its parameters. `nn.Sequential` is the simplest one;
+  writing your own means subclassing `nn.Module` and defining `forward`.
+- **`nn.CrossEntropyLoss`** expects **raw logits**, not probabilities. It applies the log-softmax
+  internally, for exactly the numerical-stability reasons module 3 covered. Passing it a softmax
+  output is a real and common bug.
+- **`optimizer.zero_grad()`** must come before `backward()`, because gradients accumulate.
+- **`torch.no_grad()`** switches off graph recording for evaluation, which saves memory and time.
+
+A custom module, for when `Sequential` is not enough:
+
+```python
+class MoonNet(nn.Module):
+    def __init__(self, hidden: int = 16) -> None:
+        super().__init__()
+        self.first = nn.Linear(2, hidden)
+        self.second = nn.Linear(hidden, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.second(torch.relu(self.first(x)))
+
+model = MoonNet()
+print(sum(p.numel() for p in model.parameters()), "parameters")
+```
+
+And the parts you meet as soon as the data does not fit in one batch:
+
+```python
+from torch.utils.data import TensorDataset, DataLoader
+
+dataset = TensorDataset(inputs, targets)
+loader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = model.to(device)
+
+for epoch in range(20):
+    for batch_inputs, batch_targets in loader:
+        batch_inputs = batch_inputs.to(device)
+        batch_targets = batch_targets.to(device)
+
+        loss = criterion(model(batch_inputs), batch_targets)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+torch.save(model.state_dict(), "moonnet.pt")
+```
+
+<Callout type="ai" title="Why this matters for AI">
+That loop is the whole of deep learning, unchanged from two hundred parameters to two hundred
+billion. Training a large language model differs in the data loader, the model class, the
+optimiser (AdamW rather than SGD), a learning-rate schedule, mixed precision and the number of
+machines — but `forward, loss, zero_grad, backward, step` is identical. Fine-tuning is this loop
+starting from downloaded weights, and even inference is just the forward half under
+`torch.no_grad()`.
+</Callout>
+
+<Callout type="tip">
+Three things that catch nearly everyone: a tensor on the GPU and one on the CPU cannot be
+combined, so `.to(device)` both; `nn.CrossEntropyLoss` wants logits and class indices, not
+probabilities and one-hot vectors; and `loss.item()` pulls a Python number out of a
+single-element tensor, which is what you want for logging.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="ml-torch-ex1"
+  title="Exercise 1"
+  brief="Write <code>matmul_backward(grad, A, B)</code>, returning the gradients with respect to <code>A</code> and <code>B</code> for <code>C = A @ B</code>."
+  code={`import numpy as np
+
+def matmul_backward(grad, A, B):
+    # C = A @ B. Given dL/dC, return (dL/dA, dL/dB).
+    # Work the shapes out: dA must match A, and dB must match B.
+    ...
+
+
+A = np.array([[1.0, 2.0], [3.0, 4.0]])
+B = np.array([[5.0, 6.0], [7.0, 8.0]])
+grad = np.ones((2, 2))
+
+dA, dB = matmul_backward(grad, A, B)
+print(dA)
+print(dB)`}
+  hint="dA = grad @ B.T and dB = A.T @ grad — the only arrangement where the shapes work out."
+  solution={`import numpy as np
+
+def matmul_backward(grad, A, B):
+    return grad @ B.T, A.T @ grad
+
+
+A = np.array([[1.0, 2.0], [3.0, 4.0]])
+B = np.array([[5.0, 6.0], [7.0, 8.0]])
+grad = np.ones((2, 2))
+
+dA, dB = matmul_backward(grad, A, B)
+print(dA)
+print(dB)`}
+  tests={`import numpy as np
+
+A = np.array([[1.0, 2.0], [3.0, 4.0]])
+B = np.array([[5.0, 6.0], [7.0, 8.0]])
+grad = np.ones((2, 2))
+
+dA, dB = matmul_backward(grad, A, B)
+assert np.allclose(dA, grad @ B.T), f"dA should be grad @ B.T, got {np.asarray(dA)}."
+assert np.allclose(dB, A.T @ grad), f"dB should be A.T @ grad, got {np.asarray(dB)}."
+
+# Non-square shapes are where a transposed-the-wrong-way answer falls over.
+rng = np.random.default_rng(0)
+A2 = rng.normal(size=(4, 3))
+B2 = rng.normal(size=(3, 5))
+g2 = rng.normal(size=(4, 5))
+dA2, dB2 = matmul_backward(g2, A2, B2)
+assert np.asarray(dA2).shape == A2.shape, f"dA must match A's shape {A2.shape}, got {np.asarray(dA2).shape}."
+assert np.asarray(dB2).shape == B2.shape, f"dB must match B's shape {B2.shape}, got {np.asarray(dB2).shape}."
+
+# Check against a numerical gradient of sum(A @ B) weighted by g2.
+def loss(a, b):
+    return float((g2 * (a @ b)).sum())
+
+eps = 1e-6
+numeric = np.zeros_like(A2)
+for i in range(A2.shape[0]):
+    for j in range(A2.shape[1]):
+        up, down = A2.copy(), A2.copy()
+        up[i, j] += eps
+        down[i, j] -= eps
+        numeric[i, j] = (loss(up, B2) - loss(down, B2)) / (2 * eps)
+
+assert np.allclose(dA2, numeric, atol=1e-5), (
+    "dA disagrees with a numerical gradient — check which operand is transposed."
+)`}
+/>
+
+<Exercise
+  id="ml-torch-ex2"
+  title="Exercise 2"
+  brief="Write <code>sgd_step(parameters, learning_rate)</code>: move each parameter against its gradient, then zero that gradient — what <code>optimizer.step()</code> and <code>zero_grad()</code> do together."
+  code={`import numpy as np
+
+class Parameter:
+    def __init__(self, data):
+        self.data = np.asarray(data, dtype=float)
+        self.grad = np.zeros_like(self.data)
+
+
+def sgd_step(parameters, learning_rate):
+    # For each parameter: subtract learning_rate * grad from data,
+    # then reset grad to zeros.
+    ...
+
+
+weights = Parameter([[1.0, 2.0], [3.0, 4.0]])
+bias = Parameter([0.5, -0.5])
+weights.grad = np.array([[0.1, 0.1], [0.2, 0.2]])
+bias.grad = np.array([1.0, -1.0])
+
+sgd_step([weights, bias], 0.1)
+print(weights.data)
+print(bias.data)
+print(weights.grad, bias.grad)`}
+  hint="Loop over the parameters: parameter.data = parameter.data - learning_rate * parameter.grad, then parameter.grad = np.zeros_like(parameter.data)."
+  solution={`import numpy as np
+
+class Parameter:
+    def __init__(self, data):
+        self.data = np.asarray(data, dtype=float)
+        self.grad = np.zeros_like(self.data)
+
+
+def sgd_step(parameters, learning_rate):
+    for parameter in parameters:
+        parameter.data = parameter.data - learning_rate * parameter.grad
+        parameter.grad = np.zeros_like(parameter.data)
+
+
+weights = Parameter([[1.0, 2.0], [3.0, 4.0]])
+bias = Parameter([0.5, -0.5])
+weights.grad = np.array([[0.1, 0.1], [0.2, 0.2]])
+bias.grad = np.array([1.0, -1.0])
+
+sgd_step([weights, bias], 0.1)
+print(weights.data)
+print(bias.data)
+print(weights.grad, bias.grad)`}
+  tests={`import numpy as np
+
+p = Parameter([[1.0, 2.0]])
+p.grad = np.array([[0.5, -0.5]])
+sgd_step([p], 0.2)
+
+assert np.allclose(p.data, [[0.9, 2.1]]), (
+    f"data should move against the gradient: 1 - 0.2*0.5 = 0.9. Got {p.data}."
+)
+assert np.allclose(p.grad, 0.0), (
+    f"The gradient must be zeroed after the step, got {p.grad}."
+)
+
+# Several parameters, all updated.
+a, b = Parameter([1.0]), Parameter([10.0])
+a.grad = np.array([1.0])
+b.grad = np.array([-2.0])
+sgd_step([a, b], 0.5)
+assert np.allclose(a.data, [0.5]) and np.allclose(b.data, [11.0]), (
+    f"Every parameter should be updated, got a={a.data}, b={b.data}."
+)
+assert np.allclose(a.grad, 0.0) and np.allclose(b.grad, 0.0), "Both gradients should be cleared."
+
+# A second step with a zeroed gradient must change nothing — which is exactly
+# what forgetting zero_grad() would break.
+before = b.data.copy()
+sgd_step([b], 0.5)
+assert np.allclose(b.data, before), (
+    "With a zeroed gradient a further step should not move the parameter."
+)`}
+/>
+
+<Quiz
+  question="Why does PyTorch require optimizer.zero_grad() before loss.backward()?"
+  choices={[
+    { text: "Gradients accumulate into .grad by design, so last step's values would be added to this step's", correct: true, why: "Accumulation is deliberate — it lets one parameter used several times collect from every path, and lets you split a large batch — but it means you must clear between steps." },
+    { text: "It frees GPU memory", why: "Zeroing writes to existing buffers; the memory saving comes from torch.no_grad()." },
+    { text: "backward() raises an error if gradients are non-zero", why: "It runs quite happily, which is what makes the omission so easy to miss." },
+    { text: "It resets the model's weights", why: "Weights are untouched; only the .grad buffers are cleared." },
+  ]}
+/>
+
+<Quiz
+  question="You pass softmax probabilities to nn.CrossEntropyLoss and training goes badly. Why?"
+  choices={[
+    { text: "It expects raw logits and applies log-softmax itself, so the softmax is applied twice", correct: true, why: "Double-softmaxing flattens the distribution and the gradients, so learning is slow and weak — and it discards the numerical stability the fused version provides." },
+    { text: "It expects one-hot targets, not class indices", why: "Class indices are exactly what it wants; the problem is on the prediction side." },
+    { text: "Probabilities cannot be differentiated", why: "They differentiate fine; the issue is applying the transformation twice." },
+    { text: "It requires float64 inputs", why: "float32 is the norm and works correctly." },
+  ]}
+/>
+
+## Recap
+
+- A tensor is an array that records the operations applied to it; that record is what
+  `backward()` walks.
+- `backward()` topologically sorts the graph and visits it in reverse, so each node's gradient is
+  complete before it passes anything back.
+- Gradients **accumulate**, which is why `zero_grad()` exists and why forgetting it corrupts
+  training silently.
+- Every PyTorch loop is forward, loss, `zero_grad`, `backward`, `step` — unchanged at any scale.
+- `nn.CrossEntropyLoss` takes raw logits and class indices; wrap evaluation in `torch.no_grad()`.
+- The autograd on this page is not a simplification of the idea, only of the engineering.

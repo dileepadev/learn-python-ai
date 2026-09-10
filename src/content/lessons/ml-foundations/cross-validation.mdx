@@ -1,0 +1,440 @@
+---
+title: Cross-validation and hyperparameter search
+description: Get an estimate with an error bar instead of one number from one lucky split, and search a parameter grid without leaking the validation set into the model.
+module: ml-foundations
+order: 5
+level: advanced
+minutes: 20
+objectives:
+  - Explain what cross-validation estimates and why one split is not enough
+  - Use cross_val_score and cross_validate with the right splitter
+  - Search hyperparameters with GridSearchCV and RandomizedSearchCV
+  - Cross-validate a whole pipeline so preprocessing stays honest
+  - Recognise when a nested cross-validation is needed
+---
+
+A single train/test split gives you one number, and that number moves depending on which rows
+happened to land where. Cross-validation gives you several, so you can tell a real improvement
+from noise.
+
+## One split is one sample
+
+<Run id="ml-cv-1" code={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=300, n_features=8, n_informative=4,
+                           flip_y=0.15, random_state=0)
+
+scores = []
+for seed in range(10):
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=seed)
+    scores.append(LogisticRegression(max_iter=1000).fit(X_train, y_train).score(X_test, y_test))
+
+scores = np.array(scores)
+print("scores from ten different splits:", scores.round(3))
+print(f"lowest {scores.min():.3f}  highest {scores.max():.3f}  spread {np.ptp(scores):.3f}")
+print(f"mean {scores.mean():.3f} ± {scores.std():.3f}")`} />
+
+The same model on the same data ranges over several points depending on the seed. If you compare
+two models on one split each, you are mostly comparing the splits.
+
+## K-fold cross-validation
+
+Split the data into k parts; train on k−1 and test on the remaining one, k times, so every row is
+tested exactly once:
+
+<Run id="ml-cv-2" code={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=300, n_features=8, n_informative=4,
+                           flip_y=0.15, random_state=0)
+
+splitter = StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
+scores = cross_val_score(LogisticRegression(max_iter=1000), X, y, cv=splitter, scoring="accuracy")
+
+print("fold scores:", scores.round(4))
+print(f"mean {scores.mean():.4f} ± {scores.std():.4f}")`} />
+
+<Callout type="tip">
+Use `StratifiedKFold` for classification — it keeps each fold's class balance the same as the
+whole — and always pass `shuffle=True` with a `random_state`. Without shuffling, data that
+arrives sorted by class or by date produces folds that are nothing like each other.
+</Callout>
+
+`cross_validate` reports several metrics at once, and can hand back the training scores so you
+can see the overfitting gap:
+
+<Run id="ml-cv-3" code={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import cross_validate, StratifiedKFold
+from sklearn.tree import DecisionTreeClassifier
+
+X, y = make_classification(n_samples=600, n_features=8, n_informative=4,
+                           flip_y=0.15, random_state=0)
+
+results = cross_validate(
+    DecisionTreeClassifier(random_state=0),
+    X, y,
+    cv=StratifiedKFold(5, shuffle=True, random_state=0),
+    scoring=["accuracy", "precision", "recall", "f1"],
+    return_train_score=True,
+)
+
+for key in sorted(results):
+    if key.startswith(("test_", "train_")):
+        values = results[key]
+        print(f"{key:18} {values.mean():.4f} ± {values.std():.4f}")`} />
+
+Training accuracy of 1.0 against test accuracy well below it is the tree memorising, visible in
+one table.
+
+## Cross-validating a pipeline
+
+This is the part that matters most. Passing a `Pipeline` to `cross_val_score` re-fits the
+preprocessing inside every fold, on that fold's training rows only:
+
+<Run id="ml-cv-4" code={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(0)
+# 200 features, only 5 of which mean anything, and only 120 rows.
+X = rng.normal(size=(120, 200))
+y = (X[:, :5].sum(axis=1) > 0).astype(int)
+
+# Wrong: choose the features using every row, then cross-validate.
+selector = SelectKBest(f_classif, k=10).fit(X, y)
+leaky = cross_val_score(
+    LogisticRegression(max_iter=1000), selector.transform(X), y,
+    cv=StratifiedKFold(5, shuffle=True, random_state=0),
+)
+
+# Right: selection happens inside each fold.
+honest = cross_val_score(
+    make_pipeline(SelectKBest(f_classif, k=10), StandardScaler(), LogisticRegression(max_iter=1000)),
+    X, y, cv=StratifiedKFold(5, shuffle=True, random_state=0),
+)
+
+print(f"selection outside the folds: {leaky.mean():.4f}")
+print(f"selection inside the folds:  {honest.mean():.4f}")`} />
+
+<Callout type="warning">
+Feature selection is the most dangerous thing to do outside a fold. Picking the 10 features that
+correlate best with `y` across the whole dataset uses the held-out labels — and with enough
+candidate features it produces a strong cross-validated score from pure noise. Everything that
+learns from data belongs inside the pipeline.
+</Callout>
+
+## Grid search
+
+`GridSearchCV` cross-validates every combination of the settings you give it, then refits the
+best on all the data:
+
+<Run id="ml-cv-5" code={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=1200, n_features=12, n_informative=6,
+                           flip_y=0.1, random_state=0)
+X_rest, X_test, y_rest, y_test = train_test_split(X, y, test_size=0.2,
+                                                   random_state=0, stratify=y)
+
+pipeline = Pipeline([
+    ("scale", StandardScaler()),
+    ("classify", LogisticRegression(max_iter=2000)),
+])
+
+# "step__parameter" reaches into a named step.
+grid = {
+    "classify__C": [0.01, 0.1, 1.0, 10.0],
+    "classify__penalty": ["l1", "l2"],
+    "classify__solver": ["liblinear"],
+}
+
+search = GridSearchCV(
+    pipeline, grid,
+    cv=StratifiedKFold(5, shuffle=True, random_state=0),
+    scoring="f1",
+    n_jobs=1,
+)
+search.fit(X_rest, y_rest)
+
+print("best settings:", search.best_params_)
+print("best cross-validated f1:", round(search.best_score_, 4))
+print()
+print("held-out f1 of the refitted model:", round(search.score(X_test, y_test), 4))`} />
+
+The double underscore is how you address a parameter inside a step: `classify__C` is the `C` of
+the step named `classify`. It nests as deep as your pipeline does.
+
+<Run id="ml-cv-6" code={`import pandas as pd
+import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=800, n_features=10, n_informative=5, flip_y=0.1, random_state=0)
+
+search = GridSearchCV(
+    Pipeline([("scale", StandardScaler()), ("classify", LogisticRegression(max_iter=2000))]),
+    {"classify__C": [0.01, 0.1, 1.0, 10.0, 100.0]},
+    cv=StratifiedKFold(5, shuffle=True, random_state=0),
+    scoring="accuracy",
+).fit(X, y)
+
+results = pd.DataFrame(search.cv_results_)[
+    ["param_classify__C", "mean_test_score", "std_test_score", "rank_test_score"]
+]
+print(results.sort_values("rank_test_score").round(4).to_string(index=False))`} />
+
+Look at `std_test_score` before celebrating: when the standard deviations overlap, the ranking is
+noise and the top setting is not meaningfully better than the second.
+
+## Randomised search
+
+With many parameters, a grid explodes combinatorially. Sampling a fixed budget usually finds an
+equally good setting for a fraction of the work:
+
+<Run id="ml-cv-7" code={`import numpy as np
+from scipy.stats import loguniform, randint
+from sklearn.datasets import make_classification
+from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold
+from sklearn.ensemble import RandomForestClassifier
+
+X, y = make_classification(n_samples=800, n_features=12, n_informative=6, flip_y=0.1, random_state=0)
+
+search = RandomizedSearchCV(
+    RandomForestClassifier(random_state=0),
+    {
+        "n_estimators": randint(50, 300),
+        "max_depth": randint(2, 16),
+        "min_samples_leaf": randint(1, 20),
+    },
+    n_iter=12,
+    cv=StratifiedKFold(3, shuffle=True, random_state=0),
+    scoring="f1",
+    random_state=0,
+).fit(X, y)
+
+print("best settings:", search.best_params_)
+print("best f1:", round(search.best_score_, 4))
+print("combinations tried:", len(search.cv_results_["params"]))`} />
+
+<Callout type="ai" title="Why this matters for AI">
+The same discipline transfers directly to prompt and retrieval engineering. Trying eight prompt
+variants on one fixed eval set and shipping the best is a grid search with a single fold — the
+winner is partly the prompt and partly which twenty questions you happened to pick. Split your
+eval set, choose on one half, and report on the other. Chunk size, overlap, top-k and re-ranking
+depth are hyperparameters, and they deserve the same treatment.
+</Callout>
+
+## Nested cross-validation
+
+When you both tune and estimate performance, the tuning has to happen inside the outer loop, or
+the estimate is optimistic:
+
+<Run id="ml-cv-8" code={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import GridSearchCV, cross_val_score, StratifiedKFold
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=400, n_features=10, n_informative=4, flip_y=0.2, random_state=0)
+
+inner = GridSearchCV(
+    make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000)),
+    {"logisticregression__C": [0.01, 0.1, 1.0, 10.0]},
+    cv=StratifiedKFold(3, shuffle=True, random_state=0),
+    scoring="accuracy",
+)
+
+# The optimistic number: the best of four, measured on the folds that chose it.
+inner.fit(X, y)
+print("best inner score (optimistic):", round(inner.best_score_, 4))
+
+# The honest number: the whole search is re-run inside each outer fold.
+nested = cross_val_score(inner, X, y, cv=StratifiedKFold(5, shuffle=True, random_state=1))
+print("nested cross-validation:      ", round(nested.mean(), 4), "±", round(nested.std(), 4))`} />
+
+## Try it yourself
+
+<Exercise
+  id="ml-cv-ex1"
+  title="Exercise 1"
+  brief="Cross-validate a scaler-plus-logistic-regression pipeline with 5 stratified, shuffled folds seeded 0. Put the fold scores in <code>scores</code> and their mean in <code>mean_score</code>."
+  code={`from sklearn.datasets import make_classification
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=600, n_features=8, n_informative=4,
+                           flip_y=0.1, random_state=0)
+
+scores = None
+mean_score = None
+
+print(scores.round(4))
+print("mean:", round(mean_score, 4))`}
+  hint="make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000)) passed to cross_val_score with cv=StratifiedKFold(5, shuffle=True, random_state=0)."
+  solution={`from sklearn.datasets import make_classification
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=600, n_features=8, n_informative=4,
+                           flip_y=0.1, random_state=0)
+
+scores = cross_val_score(
+    make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000)),
+    X, y,
+    cv=StratifiedKFold(5, shuffle=True, random_state=0),
+)
+mean_score = scores.mean()
+
+print(scores.round(4))
+print("mean:", round(mean_score, 4))`}
+  tests={`import numpy as np
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+assert scores is not None, "scores was never set."
+scores_array = np.asarray(scores)
+assert scores_array.shape == (5,), f"Five folds give five scores, got shape {scores_array.shape}."
+
+expected = cross_val_score(
+    make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000)),
+    X, y, cv=StratifiedKFold(5, shuffle=True, random_state=0),
+)
+assert np.allclose(scores_array, expected), (
+    f"Expected {expected.round(4)} — check the splitter is StratifiedKFold(5, shuffle=True, "
+    f"random_state=0). Got {scores_array.round(4)}."
+)
+assert abs(float(mean_score) - expected.mean()) < 1e-9, (
+    f"mean_score should be {expected.mean():.4f}, got {mean_score!r}."
+)`}
+/>
+
+<Exercise
+  id="ml-cv-ex2"
+  title="Exercise 2"
+  brief="Grid-search <code>C</code> over the given values with 5 stratified shuffled folds seeded 0, scoring on f1. Put the search in <code>search</code>, the winning C in <code>best_c</code>."
+  code={`from sklearn.datasets import make_classification
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=800, n_features=10, n_informative=5,
+                           flip_y=0.1, random_state=0)
+
+pipeline = Pipeline([
+    ("scale", StandardScaler()),
+    ("classify", LogisticRegression(max_iter=2000)),
+])
+values = [0.001, 0.01, 0.1, 1.0, 10.0]
+
+search = None
+best_c = None
+
+print("best C:", best_c)
+print("best f1:", round(search.best_score_, 4))`}
+  hint="The grid key is 'classify__C' — the step name, two underscores, the parameter. Then read search.best_params_."
+  solution={`from sklearn.datasets import make_classification
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=800, n_features=10, n_informative=5,
+                           flip_y=0.1, random_state=0)
+
+pipeline = Pipeline([
+    ("scale", StandardScaler()),
+    ("classify", LogisticRegression(max_iter=2000)),
+])
+values = [0.001, 0.01, 0.1, 1.0, 10.0]
+
+search = GridSearchCV(
+    pipeline,
+    {"classify__C": values},
+    cv=StratifiedKFold(5, shuffle=True, random_state=0),
+    scoring="f1",
+).fit(X, y)
+best_c = search.best_params_["classify__C"]
+
+print("best C:", best_c)
+print("best f1:", round(search.best_score_, 4))`}
+  tests={`from sklearn.model_selection import GridSearchCV
+
+assert isinstance(search, GridSearchCV), (
+    f"search should be a GridSearchCV, got {type(search).__name__}."
+)
+assert hasattr(search, "best_params_"), "The search has not been fitted — call .fit(X, y)."
+assert search.scoring == "f1", f"Score on f1, got scoring={search.scoring!r}."
+assert len(search.cv_results_["params"]) == len(values), (
+    f"All {len(values)} values of C should have been tried, got "
+    f"{len(search.cv_results_['params'])}."
+)
+assert "classify__C" in search.best_params_, (
+    f"The grid key should address the step: 'classify__C'. Got {list(search.best_params_)}."
+)
+assert best_c == search.best_params_["classify__C"], (
+    f"best_c should be the winning C, got {best_c!r}."
+)
+assert best_c in values, f"The winner should come from the list, got {best_c!r}."
+assert search.best_score_ > 0.7, (
+    f"This problem is learnable; an f1 of {search.best_score_:.3f} suggests something is wrong."
+)`}
+/>
+
+<Quiz
+  question="You select the 10 best-correlated features from the whole dataset, then cross-validate. Why is the score inflated?"
+  choices={[
+    { text: "The selection used the labels of every row, including the ones each fold holds out", correct: true, why: "The held-out labels influenced which features exist, so no fold is truly held out — put the selector inside the pipeline." },
+    { text: "Ten features is too few", why: "The count is not the issue; when the choice was made is." },
+    { text: "Cross-validation always inflates scores", why: "Done properly it is close to unbiased — this inflation comes from the leak." },
+    { text: "The folds are not stratified", why: "Stratification affects variance across folds, not this systematic optimism." },
+  ]}
+/>
+
+<Quiz
+  question="Five folds give accuracies of 0.81, 0.79, 0.86, 0.78 and 0.83. A second model averages 0.83 with a similar spread. What can you conclude?"
+  choices={[
+    { text: "Very little — the fold-to-fold spread is as large as the difference between the models", correct: true, why: "With a standard deviation around 0.03 a two-point gap is well inside the noise; you need more folds, more data, or a paired comparison." },
+    { text: "The second model is better and should be shipped", why: "That treats a difference smaller than the measurement noise as a result." },
+    { text: "The first model is overfitting", why: "Nothing here is about the training scores; both were measured the same way." },
+    { text: "The folds are badly constructed", why: "Some spread across folds is entirely normal, particularly on a small dataset." },
+  ]}
+/>
+
+## Recap
+
+- One split gives one noisy number; k-fold gives a mean and a spread.
+- `StratifiedKFold(shuffle=True, random_state=...)` for classification, always.
+- `cross_validate` reports several metrics and can return training scores, which is where the
+  overfitting gap shows.
+- Cross-validate the **pipeline**, so scaling, imputation and feature selection are re-fitted
+  inside every fold.
+- `GridSearchCV` addresses a step's parameter as `step__parameter`; check `std_test_score` before
+  believing the ranking.
+- `RandomizedSearchCV` covers a large space on a fixed budget.
+- Tuning and estimating with the same folds is optimistic; nest the search inside an outer loop
+  for an honest figure.

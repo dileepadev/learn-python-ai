@@ -1,0 +1,489 @@
+---
+title: Overfitting, regularisation and the bias-variance trade-off
+description: Watch a model memorise noise as you give it more capacity, read a learning curve to tell whether more data would help, and use regularisation to buy generalisation with a little bias.
+module: ml-foundations
+order: 6
+level: advanced
+minutes: 20
+objectives:
+  - Recognise overfitting and underfitting from training and validation scores
+  - Read a validation curve to choose model complexity
+  - Read a learning curve to decide whether more data would help
+  - Apply L2 and L1 regularisation, and explain what each does
+  - Describe the bias-variance trade-off in terms you can act on
+---
+
+A model that fits its training data perfectly has usually learned the noise as well as the
+signal. This lesson is about seeing that happen, measuring it, and doing something about it.
+
+## Watching it happen
+
+Fit polynomials of increasing degree to twelve noisy points:
+
+<Run id="ml-fit-1" code={`import numpy as np
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
+
+rng = np.random.default_rng(0)
+
+def true_function(x):
+    return np.sin(1.5 * np.pi * x)
+
+x_train = np.sort(rng.random(12))
+y_train = true_function(x_train) + rng.normal(0, 0.2, 12)
+x_test = np.sort(rng.random(200))
+y_test = true_function(x_test) + rng.normal(0, 0.2, 200)
+
+print(f"{'degree':>7} {'train MSE':>11} {'test MSE':>11}")
+for degree in [1, 3, 5, 9, 11]:
+    model = make_pipeline(PolynomialFeatures(degree), LinearRegression())
+    model.fit(x_train.reshape(-1, 1), y_train)
+    train = mean_squared_error(y_train, model.predict(x_train.reshape(-1, 1)))
+    test = mean_squared_error(y_test, model.predict(x_test.reshape(-1, 1)))
+    print(f"{degree:>7} {train:>11.4f} {test:>11.4f}")`} />
+
+Training error falls the whole way. Test error falls, bottoms out, then climbs — and at degree 11
+the model passes exactly through all twelve points and is useless everywhere else.
+
+<Run id="ml-fit-2" code={`import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import LinearRegression
+
+rng = np.random.default_rng(0)
+true_function = lambda x: np.sin(1.5 * np.pi * x)
+
+x_train = np.sort(rng.random(12))
+y_train = true_function(x_train) + rng.normal(0, 0.2, 12)
+grid = np.linspace(0, 1, 300)
+
+fig, axes = plt.subplots(1, 3, figsize=(9, 3), sharey=True)
+for ax, degree, label in zip(axes, [1, 4, 11], ["underfit", "about right", "overfit"]):
+    model = make_pipeline(PolynomialFeatures(degree), LinearRegression())
+    model.fit(x_train.reshape(-1, 1), y_train)
+    ax.plot(grid, true_function(grid), linestyle="--", linewidth=1.5, label="truth")
+    ax.plot(grid, model.predict(grid.reshape(-1, 1)), linewidth=2, label="model")
+    ax.scatter(x_train, y_train, s=25, zorder=3, color="#ef4444")
+    ax.set_ylim(-2, 2)
+    ax.set_title(f"degree {degree} — {label}")
+axes[0].legend()`} />
+
+- **Underfitting** — high error on both training and held-out data. The model cannot represent
+  the pattern. That is **bias**.
+- **Overfitting** — low training error, high held-out error. The model represents this sample
+  rather than the pattern. That is **variance**.
+
+## The validation curve
+
+Sweeping one complexity parameter and plotting both scores is how you find the turning point:
+
+<Run id="ml-fit-3" code={`import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import validation_curve, StratifiedKFold
+from sklearn.tree import DecisionTreeClassifier
+
+X, y = make_classification(n_samples=800, n_features=12, n_informative=6,
+                           flip_y=0.15, random_state=0)
+
+depths = [1, 2, 3, 4, 6, 8, 12, 16, 24]
+train_scores, test_scores = validation_curve(
+    DecisionTreeClassifier(random_state=0), X, y,
+    param_name="max_depth", param_range=depths,
+    cv=StratifiedKFold(5, shuffle=True, random_state=0), scoring="accuracy",
+)
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+ax.plot(depths, train_scores.mean(axis=1), marker="o", label="training")
+ax.plot(depths, test_scores.mean(axis=1), marker="o", label="validation")
+ax.set_xlabel("max_depth")
+ax.set_ylabel("accuracy")
+ax.set_title("Validation curve")
+ax.legend()
+ax.grid(True, alpha=0.3)
+
+best = depths[int(test_scores.mean(axis=1).argmax())]
+print("best depth:", best)
+print("validation accuracy there:", round(test_scores.mean(axis=1).max(), 4))
+print("training accuracy there:  ", round(train_scores.mean(axis=1)[depths.index(best)], 4))
+print("training accuracy at 24:  ", round(train_scores.mean(axis=1)[-1], 4))`} />
+
+## The learning curve
+
+A learning curve answers a different question: would collecting more data help?
+
+<Run id="ml-fit-4" code={`import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import learning_curve, StratifiedKFold
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=2000, n_features=12, n_informative=6,
+                           flip_y=0.12, random_state=0)
+
+fig, axes = plt.subplots(1, 2, figsize=(8.5, 3.2), sharey=True)
+
+for ax, (name, model) in zip(axes, [
+    ("high variance (deep tree)", DecisionTreeClassifier(random_state=0)),
+    ("high bias (linear)", LogisticRegression(max_iter=2000)),
+]):
+    sizes, train_scores, test_scores = learning_curve(
+        model, X, y, train_sizes=np.linspace(0.1, 1.0, 8),
+        cv=StratifiedKFold(5, shuffle=True, random_state=0), scoring="accuracy",
+    )
+    ax.plot(sizes, train_scores.mean(axis=1), marker="o", label="training")
+    ax.plot(sizes, test_scores.mean(axis=1), marker="o", label="validation")
+    ax.set_title(name)
+    ax.set_xlabel("training examples")
+    ax.grid(True, alpha=0.3)
+
+axes[0].set_ylabel("accuracy")
+axes[0].legend()`} />
+
+Read it like this:
+
+- A **wide gap** that is still narrowing means high variance — more data will help.
+- **Both curves flat and low**, close together, means high bias — more data will not help. You
+  need a better model or better features.
+
+## Regularisation
+
+Regularisation penalises large coefficients, which limits how wiggly a model can be:
+
+<Run id="ml-fit-5" code={`import numpy as np
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.metrics import mean_squared_error
+
+rng = np.random.default_rng(0)
+true_function = lambda x: np.sin(1.5 * np.pi * x)
+
+x_train = np.sort(rng.random(12)).reshape(-1, 1)
+y_train = true_function(x_train.ravel()) + rng.normal(0, 0.2, 12)
+x_test = np.sort(rng.random(200)).reshape(-1, 1)
+y_test = true_function(x_test.ravel()) + rng.normal(0, 0.2, 200)
+
+plain = make_pipeline(PolynomialFeatures(11), StandardScaler(), LinearRegression()).fit(x_train, y_train)
+print(f"{'alpha':>10} {'test MSE':>10} {'largest coefficient':>21}")
+print(f"{'none':>10} {mean_squared_error(y_test, plain.predict(x_test)):>10.4f} "
+      f"{np.abs(plain[-1].coef_).max():>21.1f}")
+
+for alpha in [1e-4, 1e-2, 1.0, 100.0]:
+    model = make_pipeline(PolynomialFeatures(11), StandardScaler(), Ridge(alpha=alpha)).fit(x_train, y_train)
+    mse = mean_squared_error(y_test, model.predict(x_test))
+    print(f"{alpha:>10} {mse:>10.4f} {np.abs(model[-1].coef_).max():>21.1f}")`} />
+
+The degree-11 model is rescued by a penalty that stops its coefficients reaching into the
+thousands. Two penalties are worth knowing:
+
+- **L2 (ridge)** shrinks every coefficient towards zero, smoothly. Nothing quite reaches zero.
+- **L1 (lasso)** drives many coefficients to exactly zero, which selects features.
+
+<Run id="ml-fit-6" code={`import numpy as np
+from sklearn.linear_model import Ridge, Lasso
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+
+rng = np.random.default_rng(0)
+n, features = 120, 40
+X = rng.normal(size=(n, features))
+true_coefficients = np.zeros(features)
+true_coefficients[:5] = [3.0, -2.0, 1.5, -1.0, 2.5]     # only 5 matter
+y = X @ true_coefficients + rng.normal(0, 0.5, n)
+
+ridge = make_pipeline(StandardScaler(), Ridge(alpha=1.0)).fit(X, y)
+lasso = make_pipeline(StandardScaler(), Lasso(alpha=0.1)).fit(X, y)
+
+print("coefficients that are exactly zero:")
+print(f"  ridge {int(np.sum(np.abs(ridge[-1].coef_) < 1e-10)):>3} of {features}")
+print(f"  lasso {int(np.sum(np.abs(lasso[-1].coef_) < 1e-10)):>3} of {features}")
+print()
+print("lasso kept:", sorted(np.flatnonzero(np.abs(lasso[-1].coef_) > 1e-10).tolist()))
+print("truly useful:", [0, 1, 2, 3, 4])`} />
+
+<Callout type="warning">
+Regularisation compares coefficients across features, so the features must be on comparable
+scales. Always put a `StandardScaler` before a penalised model — otherwise the penalty falls
+almost entirely on whichever feature happens to be measured in small units.
+</Callout>
+
+In `LogisticRegression` and the support vector machines, the parameter is `C`, which is the
+**inverse** of the penalty strength — small `C` means heavy regularisation:
+
+<Run id="ml-fit-7" code={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=200, n_features=60, n_informative=8,
+                           flip_y=0.1, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3,
+                                                     random_state=0, stratify=y)
+
+print(f"{'C':>8} {'train':>8} {'test':>8} {'|coef| mean':>12}")
+for C in [0.001, 0.01, 0.1, 1.0, 100.0]:
+    model = make_pipeline(StandardScaler(), LogisticRegression(C=C, max_iter=5000))
+    model.fit(X_train, y_train)
+    print(f"{C:>8} {model.score(X_train, y_train):>8.3f} {model.score(X_test, y_test):>8.3f} "
+          f"{np.abs(model[-1].coef_).mean():>12.4f}")`} />
+
+<Callout type="ai" title="Why this matters for AI">
+The same failure has a prompt-engineering form, and it is everywhere. You try twenty prompt
+variants against a fifty-question eval set and ship the one that scores best. That prompt is
+overfitted to those fifty questions: some of its advantage is real and some is the particular
+wording of the examples it was tuned against. The remedies are identical — hold out a set you do
+not tune on, prefer the simpler prompt when scores are close, and treat a difference smaller than
+the fold-to-fold spread as no difference at all.
+</Callout>
+
+## The trade-off, stated plainly
+
+Held-out error decomposes into three parts: **bias** (the model cannot represent the truth),
+**variance** (the model changes a lot with the sample) and **irreducible noise**. Adding capacity
+lowers bias and raises variance; regularising does the reverse.
+
+<Run id="ml-fit-8" code={`import numpy as np
+from sklearn.tree import DecisionTreeRegressor
+
+rng = np.random.default_rng(0)
+true_function = lambda x: np.sin(1.5 * np.pi * x)
+grid = np.linspace(0, 1, 100).reshape(-1, 1)
+
+def spread_over_samples(depth, repeats=40):
+    """How much does the fitted model move when the training sample changes?"""
+    predictions = []
+    for seed in range(repeats):
+        local = np.random.default_rng(seed)
+        x = np.sort(local.random(25)).reshape(-1, 1)
+        y = true_function(x.ravel()) + local.normal(0, 0.2, 25)
+        predictions.append(DecisionTreeRegressor(max_depth=depth, random_state=0).fit(x, y).predict(grid))
+    predictions = np.array(predictions)
+    average = predictions.mean(axis=0)
+    bias_squared = np.mean((average - true_function(grid.ravel())) ** 2)
+    variance = np.mean(predictions.var(axis=0))
+    return bias_squared, variance
+
+print(f"{'depth':>6} {'bias²':>9} {'variance':>10} {'total':>9}")
+for depth in [1, 2, 3, 5, 10]:
+    bias_squared, variance = spread_over_samples(depth)
+    print(f"{depth:>6} {bias_squared:>9.4f} {variance:>10.4f} {bias_squared + variance:>9.4f}")`} />
+
+Bias falls and variance rises with depth, and their sum has a minimum in the middle. That
+minimum is what every choice in this lesson is looking for.
+
+## Try it yourself
+
+<Exercise
+  id="ml-fit-ex1"
+  title="Exercise 1"
+  brief="Fit a polynomial of each degree and record the held-out MSE in <code>test_errors</code>, then set <code>best_degree</code> to the degree with the lowest error."
+  code={`import numpy as np
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
+
+rng = np.random.default_rng(0)
+true_function = lambda x: np.sin(1.5 * np.pi * x)
+
+x_train = np.sort(rng.random(14)).reshape(-1, 1)
+y_train = true_function(x_train.ravel()) + rng.normal(0, 0.2, 14)
+x_test = np.sort(rng.random(300)).reshape(-1, 1)
+y_test = true_function(x_test.ravel()) + rng.normal(0, 0.2, 300)
+
+degrees = [1, 2, 3, 4, 5, 7, 9, 12]
+
+test_errors = {}      # degree -> held-out MSE
+best_degree = None
+
+print(test_errors)
+print("best degree:", best_degree)`}
+  hint="For each degree, make_pipeline(PolynomialFeatures(degree), LinearRegression()).fit(x_train, y_train), then mean_squared_error against the test predictions. min(test_errors, key=test_errors.get) gives the best."
+  solution={`import numpy as np
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
+
+rng = np.random.default_rng(0)
+true_function = lambda x: np.sin(1.5 * np.pi * x)
+
+x_train = np.sort(rng.random(14)).reshape(-1, 1)
+y_train = true_function(x_train.ravel()) + rng.normal(0, 0.2, 14)
+x_test = np.sort(rng.random(300)).reshape(-1, 1)
+y_test = true_function(x_test.ravel()) + rng.normal(0, 0.2, 300)
+
+degrees = [1, 2, 3, 4, 5, 7, 9, 12]
+
+test_errors = {}
+for degree in degrees:
+    model = make_pipeline(PolynomialFeatures(degree), LinearRegression()).fit(x_train, y_train)
+    test_errors[degree] = mean_squared_error(y_test, model.predict(x_test))
+
+best_degree = min(test_errors, key=test_errors.get)
+
+print(test_errors)
+print("best degree:", best_degree)`}
+  tests={`import numpy as np
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
+
+assert isinstance(test_errors, dict), f"test_errors should be a dict, got {type(test_errors).__name__}."
+assert set(test_errors) == set(degrees), (
+    f"Every degree should have an entry. Got {sorted(test_errors)}."
+)
+
+for degree in degrees:
+    model = make_pipeline(PolynomialFeatures(degree), LinearRegression()).fit(x_train, y_train)
+    expected = mean_squared_error(y_test, model.predict(x_test))
+    assert abs(test_errors[degree] - expected) < 1e-9, (
+        f"Degree {degree} should give a held-out MSE of {expected:.6f}, got {test_errors[degree]}."
+    )
+
+assert best_degree == min(test_errors, key=test_errors.get), (
+    f"best_degree should be the one with the lowest error, got {best_degree!r}."
+)
+assert test_errors[12] > test_errors[best_degree], (
+    "The highest degree should be worse on held-out data than the best one — that is the "
+    "overfitting this exercise is about."
+)
+assert test_errors[1] > test_errors[best_degree], (
+    "A straight line should underfit a sine wave."
+)`}
+/>
+
+<Exercise
+  id="ml-fit-ex2"
+  title="Exercise 2"
+  brief="For each alpha, fit a scaled <code>Ridge</code> on the training data and record <code>(train_mse, test_mse)</code> in <code>results</code>. Then set <code>best_alpha</code> to the one with the lowest held-out error."
+  code={`import numpy as np
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error
+
+rng = np.random.default_rng(0)
+true_function = lambda x: np.sin(1.5 * np.pi * x)
+
+x_train = np.sort(rng.random(14)).reshape(-1, 1)
+y_train = true_function(x_train.ravel()) + rng.normal(0, 0.2, 14)
+x_test = np.sort(rng.random(300)).reshape(-1, 1)
+y_test = true_function(x_test.ravel()) + rng.normal(0, 0.2, 300)
+
+alphas = [1e-6, 1e-4, 1e-2, 1.0, 100.0]
+
+results = {}      # alpha -> (train_mse, test_mse)
+best_alpha = None
+
+for alpha, (train_mse, test_mse) in results.items():
+    print(f"alpha {alpha:<8} train {train_mse:.4f}  test {test_mse:.4f}")
+print("best alpha:", best_alpha)`}
+  hint="make_pipeline(PolynomialFeatures(11), StandardScaler(), Ridge(alpha=alpha)) for each alpha; store both errors as a tuple; pick the alpha whose second element is smallest."
+  solution={`import numpy as np
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error
+
+rng = np.random.default_rng(0)
+true_function = lambda x: np.sin(1.5 * np.pi * x)
+
+x_train = np.sort(rng.random(14)).reshape(-1, 1)
+y_train = true_function(x_train.ravel()) + rng.normal(0, 0.2, 14)
+x_test = np.sort(rng.random(300)).reshape(-1, 1)
+y_test = true_function(x_test.ravel()) + rng.normal(0, 0.2, 300)
+
+alphas = [1e-6, 1e-4, 1e-2, 1.0, 100.0]
+
+results = {}
+for alpha in alphas:
+    model = make_pipeline(
+        PolynomialFeatures(11), StandardScaler(), Ridge(alpha=alpha)
+    ).fit(x_train, y_train)
+    results[alpha] = (
+        mean_squared_error(y_train, model.predict(x_train)),
+        mean_squared_error(y_test, model.predict(x_test)),
+    )
+
+best_alpha = min(results, key=lambda a: results[a][1])
+
+for alpha, (train_mse, test_mse) in results.items():
+    print(f"alpha {alpha:<8} train {train_mse:.4f}  test {test_mse:.4f}")
+print("best alpha:", best_alpha)`}
+  tests={`import numpy as np
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error
+
+assert isinstance(results, dict), f"results should be a dict, got {type(results).__name__}."
+assert set(results) == set(alphas), f"Every alpha needs an entry. Got {sorted(results)}."
+
+for alpha in alphas:
+    pair = results[alpha]
+    assert isinstance(pair, (tuple, list)) and len(pair) == 2, (
+        f"Each entry should be a (train_mse, test_mse) pair, got {pair!r} for alpha {alpha}."
+    )
+    model = make_pipeline(
+        PolynomialFeatures(11), StandardScaler(), Ridge(alpha=alpha)
+    ).fit(x_train, y_train)
+    expected = (
+        mean_squared_error(y_train, model.predict(x_train)),
+        mean_squared_error(y_test, model.predict(x_test)),
+    )
+    assert abs(pair[0] - expected[0]) < 1e-8 and abs(pair[1] - expected[1]) < 1e-8, (
+        f"For alpha {alpha} expected {tuple(round(v, 6) for v in expected)}, "
+        f"got {tuple(round(float(v), 6) for v in pair)}."
+    )
+
+assert best_alpha == min(results, key=lambda a: results[a][1]), (
+    f"best_alpha should minimise the *held-out* error, got {best_alpha!r}."
+)
+
+weakest, strongest = results[alphas[0]], results[alphas[-1]]
+assert weakest[0] < strongest[0], (
+    "Almost no penalty should fit the training points more closely than a heavy one."
+)`}
+/>
+
+<Quiz
+  question="Training accuracy is 1.00 and validation accuracy is 0.71, and the gap is not closing as you add data. What should you try?"
+  choices={[
+    { text: "Reduce capacity or add regularisation — the model is memorising", correct: true, why: "A large, persistent gap is the signature of variance; a shallower tree, a stronger penalty or fewer features all help." },
+    { text: "Increase model capacity so it can fit the validation data too", why: "More capacity increases variance, which widens exactly the gap you are trying to close." },
+    { text: "Collect more data — it always closes the gap", why: "It usually helps, but the question says the gap has stopped narrowing, so more rows are not buying anything." },
+    { text: "Lower the decision threshold", why: "The threshold trades precision against recall; it does nothing about the train/validation gap." },
+  ]}
+/>
+
+<Quiz
+  question="What does lasso (L1) do that ridge (L2) does not?"
+  choices={[
+    { text: "Drives some coefficients to exactly zero, so it selects features", correct: true, why: "The L1 penalty has a corner at zero, which makes exact zeros optimal — ridge shrinks smoothly but never quite reaches zero." },
+    { text: "Prevents overfitting, which ridge does not", why: "Both penalise complexity; they differ in the shape of the solution, not in whether they regularise." },
+    { text: "Works without scaling the features", why: "L1 is if anything more sensitive to scale, because the penalty is compared directly across coefficients." },
+    { text: "Applies only to classification", why: "Both apply to regression and classification alike." },
+  ]}
+/>
+
+## Recap
+
+- Underfitting is high error everywhere (bias); overfitting is low training error with high
+  held-out error (variance).
+- A **validation curve** over one complexity parameter shows where held-out performance turns.
+- A **learning curve** says whether more data would help: a closing gap yes, two flat converged
+  curves no.
+- Regularisation trades a little bias for less variance. L2 shrinks smoothly; L1 zeroes
+  coefficients and selects features. Scale the features first.
+- In `LogisticRegression` and SVMs the knob is `C`, the inverse of the penalty.
+- Tuning prompts against a fixed eval set overfits in exactly the same way, and needs the same
+  held-out discipline.
