@@ -11,6 +11,7 @@ const grouped = await lessonsByModule();
 const allSlugs = lessons.map((l) => l.id);
 
 const plannedCount = MODULES.reduce((sum, m) => sum + (m.plannedLessons?.length ?? 0), 0);
+const totalHours = Math.round(lessons.reduce((sum, l) => sum + (l.data.minutes ?? 0), 0) / 60);
 
 const LEVEL_ORDER: Level[] = ["beginner", "intermediate", "advanced", "expert"];
 ---
@@ -28,7 +29,8 @@ const LEVEL_ORDER: Level[] = ["beginner", "intermediate", "advanced", "expert"];
     <div class="mt-6 flex flex-wrap items-center gap-6">
       <ProgressRing client:load total={allSlugs.length} slugs={allSlugs} />
       <p class="text-sm" style="color: var(--text-faint)">
-        {lessons.length} lessons published · {plannedCount} on the roadmap
+        {lessons.length} lessons · about {totalHours} hours of reading and running
+        {plannedCount > 0 && ` · ${plannedCount} more on the roadmap`}
       </p>
     </div>
   </header>
@@ -133,8 +135,12 @@ const LEVEL_ORDER: Level[] = ["beginner", "intermediate", "advanced", "expert"];
     }
   </div>
 
-  <p class="mt-10 flex items-center justify-center gap-2 text-sm" style="color: var(--text-faint)">
-    <Lock width={13} height={13} />
-    Planned modules are written in order. Watch the repository to be notified when each lands.
-  </p>
+  {
+    plannedCount > 0 && (
+      <p class="mt-10 flex items-center justify-center gap-2 text-sm" style="color: var(--text-faint)">
+        <Lock width={13} height={13} />
+        Planned modules are written in order. Watch the repository to be notified when each lands.
+      </p>
+    )
+  }
 </BaseLayout>
