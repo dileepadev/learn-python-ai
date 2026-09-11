@@ -1,0 +1,477 @@
+---
+title: "Hybrid search: dense plus keyword"
+description: Embeddings miss the exact error code, the product name and the rare identifier. BM25 finds them and misses the paraphrase. Run both and fuse the rankings.
+module: rag-and-retrieval
+order: 4
+level: expert
+minutes: 20
+objectives:
+  - Name the queries dense retrieval systematically fails
+  - Implement BM25 and explain each of its terms
+  - Fuse two rankings with reciprocal rank fusion
+  - Fuse scores directly, and know why that is harder
+  - Decide when hybrid search is worth its complexity
+---
+
+Dense retrieval is good at meaning and bad at literals. Keyword search is the reverse. Production
+retrieval runs both, because real queries contain both.
+
+## What dense retrieval misses
+
+<Run id="rag-hybrid-1" code={`FAILURES = [
+    ("Exact identifiers",
+     "'error E4021' — the code is one rare token; its embedding is dominated by 'error'."),
+    ("Product and person names",
+     "A name the embedding model never saw in training has no useful position in the space."),
+    ("Negation and small edits",
+     "'chunking without overlap' embeds almost identically to 'chunking with overlap'."),
+    ("Rare technical terms",
+     "Jargon specific to your company is not in the training distribution."),
+    ("Numbers and versions",
+     "'in v2.3' and 'in v3.2' are near-identical vectors and completely different answers."),
+]
+
+for name, why in FAILURES:
+    print(f"{name}\\n  {why}\\n")`} />
+
+Keyword search handles every one of those, because a rare token is exactly what an inverted index
+is good at — and fails at the thing dense retrieval does best: finding the passage that answers
+the question in different words.
+
+## BM25
+
+BM25 scores a document by how often the query's terms appear in it, weighted by how rare each term
+is across the corpus, and adjusted so long documents do not win by length alone.
+
+<Run id="rag-hybrid-2" code={`import math
+from collections import Counter
+
+CORPUS = [
+    "Retrieval augmented generation grounds answers in your own documents.",
+    "Use 10 to 20 percent chunk overlap so sentences are not cut in half.",
+    "Error E4021 means the embedding model returned a dimension mismatch.",
+    "Store embeddings as float32 to halve the memory they need.",
+    "The chunking guide explains overlap, separators and heading paths.",
+]
+
+def tokenise(text):
+    return [word.strip(".,:;!?()").lower() for word in text.split() if word.strip(".,:;!?()")]
+
+class BM25:
+    def __init__(self, documents, k1=1.5, b=0.75):
+        self.k1, self.b = k1, b
+        self.documents = [tokenise(d) for d in documents]
+        self.lengths = [len(d) for d in self.documents]
+        self.average_length = sum(self.lengths) / len(self.lengths)
+        self.frequencies = [Counter(d) for d in self.documents]
+
+        self.document_frequency = Counter()
+        for document in self.documents:
+            for term in set(document):
+                self.document_frequency[term] += 1
+        self.count = len(self.documents)
+
+    def idf(self, term):
+        seen_in = self.document_frequency.get(term, 0)
+        return math.log(1 + (self.count - seen_in + 0.5) / (seen_in + 0.5))
+
+    def score(self, query, position):
+        total = 0.0
+        frequencies, length = self.frequencies[position], self.lengths[position]
+        for term in tokenise(query):
+            if term not in frequencies:
+                continue
+            occurrences = frequencies[term]
+            numerator = occurrences * (self.k1 + 1)
+            denominator = occurrences + self.k1 * (1 - self.b + self.b * length / self.average_length)
+            total += self.idf(term) * numerator / denominator
+        return total
+
+    def search(self, query, k=3):
+        scored = [(i, self.score(query, i)) for i in range(self.count)]
+        scored.sort(key=lambda pair: pair[1], reverse=True)
+        return [(i, round(s, 4)) for i, s in scored[:k] if s > 0]
+
+bm25 = BM25(CORPUS)
+for query in ["error E4021", "how much overlap between chunks"]:
+    print(f"query: {query}")
+    for position, score in bm25.search(query):
+        print(f"  {score:7.4f}  {CORPUS[position][:62]}")
+    print()`} />
+
+The three parts are worth naming:
+
+- **IDF** — a term appearing in one document out of a million is worth far more than "the".
+- **`k1`** saturates term frequency: the tenth occurrence of a word adds much less than the second.
+- **`b`** normalises by length, so a long document does not score highly merely for being long.
+
+## Where each one wins
+
+<Run id="rag-hybrid-3" code={`import math
+import numpy as np
+from collections import Counter
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+CORPUS = [
+    "Retrieval augmented generation grounds answers in your own documents.",
+    "Use 10 to 20 percent chunk overlap so sentences are not cut in half.",
+    "Error E4021 means the embedding model returned a dimension mismatch.",
+    "Store embeddings as float32 to halve the memory they need.",
+    "The chunking guide explains overlap, separators and heading paths.",
+    "Splitting text into pieces that share a few words at each boundary.",
+]
+
+def tokenise(text):
+    return [w.strip(".,:;!?()").lower() for w in text.split() if w.strip(".,:;!?()")]
+
+# Dense side: TF-IDF vectors standing in for an embedding model.
+vectoriser = TfidfVectorizer().fit(CORPUS)
+def embed(texts):
+    vectors = vectoriser.transform(texts).toarray().astype(np.float32)
+    return vectors / np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-12)
+index = embed(CORPUS)
+
+def dense_search(query, k=3):
+    scores = index @ embed([query])[0]
+    order = np.argsort(scores)[::-1][:k]
+    return [(int(i), round(float(scores[i]), 4)) for i in order]
+
+# Keyword side.
+class BM25:
+    def __init__(self, documents, k1=1.5, b=0.75):
+        self.k1, self.b = k1, b
+        self.documents = [tokenise(d) for d in documents]
+        self.lengths = [len(d) for d in self.documents]
+        self.average_length = sum(self.lengths) / len(self.lengths)
+        self.frequencies = [Counter(d) for d in self.documents]
+        self.document_frequency = Counter()
+        for document in self.documents:
+            for term in set(document):
+                self.document_frequency[term] += 1
+        self.count = len(self.documents)
+
+    def score(self, query, position):
+        total = 0.0
+        frequencies, length = self.frequencies[position], self.lengths[position]
+        for term in tokenise(query):
+            if term not in frequencies:
+                continue
+            seen_in = self.document_frequency[term]
+            idf = math.log(1 + (self.count - seen_in + 0.5) / (seen_in + 0.5))
+            occurrences = frequencies[term]
+            total += idf * occurrences * (self.k1 + 1) / (
+                occurrences + self.k1 * (1 - self.b + self.b * length / self.average_length))
+        return total
+
+    def search(self, query, k=3):
+        scored = sorted(((i, self.score(query, i)) for i in range(self.count)),
+                        key=lambda p: p[1], reverse=True)
+        return [(i, round(s, 4)) for i, s in scored[:k]]
+
+bm25 = BM25(CORPUS)
+
+for query in ["E4021", "how do I break a document into pieces"]:
+    print(f"query: {query!r}")
+    print("  dense: ", [(i, s) for i, s in dense_search(query)])
+    print("  bm25:  ", [(i, s) for i, s in bm25.search(query)])
+    print(f"  dense top: {CORPUS[dense_search(query)[0][0]][:60]}")
+    print(f"  bm25 top:  {CORPUS[bm25.search(query)[0][0]][:60]}")
+    print()`} />
+
+The first query is a bare identifier: BM25 finds it because `E4021` is rare, and the dense side has
+almost nothing to work with. The second is a paraphrase sharing barely a word with its answer —
+where dense retrieval is supposed to shine, and where a lexical method struggles.
+
+<Callout type="warning">
+Our dense stand-in is TF-IDF, which is itself lexical, so it cannot really demonstrate the
+paraphrase win. With a trained embedding model, "how do I break a document into pieces" retrieves
+the chunking passage comfortably. Take the *shape* of the argument from this lesson and measure
+the magnitude on your own corpus.
+</Callout>
+
+## Reciprocal rank fusion
+
+The problem with combining two retrievers is that their scores are not comparable — a cosine
+similarity of 0.82 and a BM25 score of 7.3 mean nothing to each other. RRF sidesteps that
+entirely by using only the **ranks**:
+
+<Run id="rag-hybrid-4" code={`def reciprocal_rank_fusion(rankings, k=60):
+    """rankings: a list of ranked id lists, best first. Higher output is better."""
+    scores = {}
+    for ranking in rankings:
+        for rank, identifier in enumerate(ranking, start=1):
+            scores[identifier] = scores.get(identifier, 0.0) + 1.0 / (k + rank)
+    return sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
+
+dense_ranking = ["c3", "c1", "c7", "c2"]
+keyword_ranking = ["c7", "c9", "c1", "c4"]
+
+print(f"{'id':>5} {'fused':>10}  appears in")
+for identifier, score in reciprocal_rank_fusion([dense_ranking, keyword_ranking]):
+    where = []
+    if identifier in dense_ranking:
+        where.append(f"dense#{dense_ranking.index(identifier) + 1}")
+    if identifier in keyword_ranking:
+        where.append(f"keyword#{keyword_ranking.index(identifier) + 1}")
+    print(f"{identifier:>5} {score:>10.5f}  {', '.join(where)}")`} />
+
+`c7` wins: third for the dense retriever, first for the keyword one, and the only document both
+rate highly. That is exactly the behaviour you want — agreement between two different methods is
+strong evidence.
+
+The constant `k` controls how much a top rank dominates:
+
+<Run id="rag-hybrid-5" code={`def rrf_scores(rankings, k):
+    scores = {}
+    for ranking in rankings:
+        for rank, identifier in enumerate(ranking, start=1):
+            scores[identifier] = scores.get(identifier, 0.0) + 1.0 / (k + rank)
+    return sorted(scores.items(), key=lambda p: p[1], reverse=True)
+
+dense = ["a", "b", "c"]
+keyword = ["c", "b", "a"]
+
+for k in [1, 10, 60, 200]:
+    order = [identifier for identifier, _ in rrf_scores([dense, keyword], k)]
+    print(f"k={k:>3}  {order}")
+
+print()
+print("Small k lets a single first place dominate; large k flattens towards consensus.")
+print("60 is the conventional default and rarely needs tuning.")`} />
+
+## Weighted score fusion
+
+If you do want to combine scores, normalise each retriever's scores into a comparable range first:
+
+<Run id="rag-hybrid-6" code={`import numpy as np
+
+def min_max(scores):
+    values = np.asarray(list(scores.values()), dtype=float)
+    low, high = values.min(), values.max()
+    if high - low < 1e-12:
+        return {key: 0.0 for key in scores}
+    return {key: (value - low) / (high - low) for key, value in scores.items()}
+
+dense_scores = {"c1": 0.81, "c3": 0.88, "c7": 0.79, "c2": 0.52}
+keyword_scores = {"c7": 7.3, "c9": 5.1, "c1": 4.4, "c4": 1.2}
+
+dense_normalised = min_max(dense_scores)
+keyword_normalised = min_max(keyword_scores)
+
+alpha = 0.6      # weight on the dense side
+everything = set(dense_normalised) | set(keyword_normalised)
+
+fused = {
+    identifier: alpha * dense_normalised.get(identifier, 0.0)
+                + (1 - alpha) * keyword_normalised.get(identifier, 0.0)
+    for identifier in everything
+}
+
+for identifier, score in sorted(fused.items(), key=lambda p: p[1], reverse=True):
+    print(f"{identifier:>5} {score:.4f}   dense {dense_normalised.get(identifier, 0):.2f}  "
+          f"keyword {keyword_normalised.get(identifier, 0):.2f}")`} />
+
+<Callout type="warning">
+Min-max normalisation is computed **per query**, over that query's candidate set, so the same
+document scores differently depending on what it was ranked against. It also has no floor: the
+worst candidate is always 0.0, even when it is excellent. RRF has neither problem, which is why it
+is the default recommendation.
+</Callout>
+
+<Callout type="ai" title="Why this matters for AI">
+Almost every RAG system that works in production is hybrid, and the reason is the query
+distribution rather than any theoretical argument. Users paste error codes, order numbers, config
+keys and exact product names — the literals dense retrieval is worst at — and then ask
+conversational follow-ups that only a semantic method can answer. Running both and fusing with RRF
+costs one extra index and about ten lines, and it removes an entire class of "why can't it find
+the thing I literally pasted" complaints.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="rag-hybrid-ex1"
+  title="Exercise 1"
+  brief="Write <code>rrf(rankings, k=60)</code>: score each id by the sum of <code>1/(k + rank)</code> across every ranking it appears in, and return <code>(id, score)</code> pairs best first."
+  code={`def rrf(rankings, k=60):
+    # rankings is a list of ranked id lists, best first (rank 1 is the front).
+    # An id missing from a ranking simply contributes nothing from it.
+    ...
+
+
+dense = ["c3", "c1", "c7"]
+keyword = ["c7", "c9", "c1"]
+
+for identifier, score in rrf([dense, keyword]):
+    print(identifier, round(score, 5))`}
+  hint="Accumulate into a dict with enumerate(ranking, start=1), then sort the items by score descending."
+  solution={`def rrf(rankings, k=60):
+    scores = {}
+    for ranking in rankings:
+        for rank, identifier in enumerate(ranking, start=1):
+            scores[identifier] = scores.get(identifier, 0.0) + 1.0 / (k + rank)
+    return sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
+
+
+dense = ["c3", "c1", "c7"]
+keyword = ["c7", "c9", "c1"]
+
+for identifier, score in rrf([dense, keyword]):
+    print(identifier, round(score, 5))`}
+  tests={`dense = ["c3", "c1", "c7"]
+keyword = ["c7", "c9", "c1"]
+
+results = rrf([dense, keyword])
+assert isinstance(results, list) and all(len(p) == 2 for p in results), (
+    "Return a list of (id, score) pairs."
+)
+assert {i for i, _ in results} == {"c1", "c3", "c7", "c9"}, (
+    f"Every id from either ranking should appear. Got {sorted(i for i, _ in results)}."
+)
+
+scores = dict(results)
+assert abs(scores["c7"] - (1 / 63 + 1 / 61)) < 1e-12, (
+    f"c7 is rank 3 and rank 1, so 1/63 + 1/61. Got {scores['c7']}."
+)
+assert abs(scores["c9"] - 1 / 62) < 1e-12, f"c9 appears once, at rank 2. Got {scores['c9']}."
+
+assert results[0][0] == "c7", (
+    f"c7 appears in both lists and should win. Got {results[0][0]}."
+)
+ordered = [s for _, s in results]
+assert ordered == sorted(ordered, reverse=True), f"Best first, got {ordered}."
+
+# k must actually be used.
+tight = dict(rrf([dense, keyword], k=1))
+assert abs(tight["c9"] - 1 / 3) < 1e-12, f"With k=1, rank 2 gives 1/3. Got {tight['c9']}."
+
+# A single ranking is just that ranking.
+solo = rrf([["a", "b", "c"]])
+assert [i for i, _ in solo] == ["a", "b", "c"], f"One ranking should pass through, got {solo!r}."
+
+assert rrf([]) == [], "No rankings means no results."
+assert rrf([[], []]) == [], "Empty rankings mean no results."`}
+/>
+
+<Exercise
+  id="rag-hybrid-ex2"
+  title="Exercise 2"
+  brief="Write <code>idf(term, documents)</code> using the BM25 formula, then <code>rarest(query, documents)</code> returning the query term with the highest IDF."
+  code={`import math
+
+def idf(term, documents):
+    # documents is a list of token lists.
+    # BM25 idf: ln(1 + (N - n + 0.5) / (n + 0.5)), where n is how many
+    # documents contain the term and N is how many there are.
+    ...
+
+
+def rarest(query_terms, documents):
+    # The query term with the highest idf.
+    ...
+
+
+DOCUMENTS = [
+    ["the", "cat", "sat"],
+    ["the", "dog", "sat"],
+    ["the", "error", "e4021", "appeared"],
+    ["the", "cat", "and", "the", "dog"],
+]
+
+for term in ["the", "cat", "e4021", "missing"]:
+    print(f"{term:10} {idf(term, DOCUMENTS):.4f}")
+
+print("rarest:", rarest(["the", "cat", "e4021"], DOCUMENTS))`}
+  hint="Count documents containing the term with sum(1 for d in documents if term in d), then apply the formula. rarest is max(query_terms, key=...)."
+  solution={`import math
+
+def idf(term, documents):
+    n = sum(1 for document in documents if term in document)
+    N = len(documents)
+    return math.log(1 + (N - n + 0.5) / (n + 0.5))
+
+
+def rarest(query_terms, documents):
+    return max(query_terms, key=lambda term: idf(term, documents))
+
+
+DOCUMENTS = [
+    ["the", "cat", "sat"],
+    ["the", "dog", "sat"],
+    ["the", "error", "e4021", "appeared"],
+    ["the", "cat", "and", "the", "dog"],
+]
+
+for term in ["the", "cat", "e4021", "missing"]:
+    print(f"{term:10} {idf(term, DOCUMENTS):.4f}")
+
+print("rarest:", rarest(["the", "cat", "e4021"], DOCUMENTS))`}
+  tests={`import math
+
+DOCUMENTS = [
+    ["the", "cat", "sat"],
+    ["the", "dog", "sat"],
+    ["the", "error", "e4021", "appeared"],
+    ["the", "cat", "and", "the", "dog"],
+]
+
+assert abs(idf("the", DOCUMENTS) - math.log(1 + (4 - 4 + 0.5) / (4 + 0.5))) < 1e-12, (
+    f"'the' is in all four documents. Got {idf('the', DOCUMENTS)}."
+)
+assert abs(idf("e4021", DOCUMENTS) - math.log(1 + (4 - 1 + 0.5) / (1 + 0.5))) < 1e-12, (
+    f"'e4021' is in one document. Got {idf('e4021', DOCUMENTS)}."
+)
+
+assert idf("e4021", DOCUMENTS) > idf("cat", DOCUMENTS) > idf("the", DOCUMENTS), (
+    "Rarer terms must score higher — that is the whole point of IDF."
+)
+
+# A term in no document at all gets the highest score of all.
+assert idf("missing", DOCUMENTS) > idf("e4021", DOCUMENTS), (
+    "An unseen term has n=0 and the largest possible idf."
+)
+assert idf("the", DOCUMENTS) > 0, "BM25's idf stays positive even for a term in every document."
+
+# A term counts once per document, however many times it occurs.
+repeated = [["x", "x", "x"], ["y"]]
+assert abs(idf("x", repeated) - math.log(1 + (2 - 1 + 0.5) / (1 + 0.5))) < 1e-12, (
+    "Document frequency counts documents, not occurrences."
+)
+
+assert rarest(["the", "cat", "e4021"], DOCUMENTS) == "e4021", (
+    f"e4021 is by far the rarest. Got {rarest(['the', 'cat', 'e4021'], DOCUMENTS)!r}."
+)
+assert rarest(["the"], DOCUMENTS) == "the", "A single term is trivially the rarest."`}
+/>
+
+<Quiz
+  question="A user pastes 'error E4021' and dense retrieval returns passages about errors in general. Why?"
+  choices={[
+    { text: "The rare identifier contributes little to the embedding, which is dominated by the common word 'error'", correct: true, why: "An embedding is a summary of meaning, and a token the model barely saw in training has almost no pull on it — exactly the case BM25 handles by weighting rarity." },
+    { text: "The identifier was not in the index", why: "It is in the index; the problem is that dense similarity does not favour it." },
+    { text: "The embedding model needs a higher temperature", why: "Embedding models have no temperature." },
+    { text: "k is set too low", why: "Raising k returns more general-error passages, not the specific one." },
+  ]}
+/>
+
+<Quiz
+  question="Why is reciprocal rank fusion usually preferred over combining two retrievers' scores directly?"
+  choices={[
+    { text: "It uses only ranks, so it needs no comparable scales and no per-query normalisation", correct: true, why: "A cosine of 0.82 and a BM25 of 7.3 are not commensurable, and min-max normalising them is query-dependent and has no meaningful floor." },
+    { text: "It is more accurate in every case", why: "Weighted fusion can beat it with tuning; RRF wins on robustness and on needing no tuning at all." },
+    { text: "It only needs one retriever", why: "It combines as many as you give it — one is just a pass-through." },
+    { text: "It removes duplicate documents", why: "Ids appearing in both lists are merged by addition, which is scoring rather than deduplication." },
+  ]}
+/>
+
+## Recap
+
+- Dense retrieval fails systematically on identifiers, rare names, versions, numbers and negation.
+  Keyword search fails on paraphrase. Real queries contain both.
+- BM25 weights terms by rarity (IDF), saturates repeated terms (`k1`) and normalises for document
+  length (`b`).
+- Fuse with **reciprocal rank fusion**: sum `1/(k + rank)` across rankings, `k = 60`. It needs no
+  comparable scales and no tuning.
+- Weighted score fusion works but needs per-query normalisation, which is query-dependent and has
+  no sensible floor.
+- Hybrid costs one extra index and about ten lines, and removes a whole class of failure.

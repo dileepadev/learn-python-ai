@@ -1,0 +1,458 @@
+---
+title: Measuring groundedness and retrieval quality
+description: Recall@k, MRR and nDCG for the retriever; groundedness and citation accuracy for the answer — and the ablation that tells you which stage is actually at fault.
+module: rag-and-retrieval
+order: 7
+level: expert
+minutes: 22
+objectives:
+  - Build a small evaluation set that catches real regressions
+  - Compute recall@k, precision@k, MRR and nDCG
+  - Measure groundedness and citation accuracy end to end
+  - Ablate the pipeline to find which stage is failing
+  - Recognise what an LLM judge can and cannot tell you
+---
+
+"It seems better" is not a result. This lesson turns a RAG system into numbers you can compare
+between two Tuesdays — and, more usefully, numbers that say *which stage* to fix.
+
+## The evaluation set
+
+<Run id="rag-eval-1" code={`EXAMPLES = [
+    # Answerable, with the chunks that genuinely contain the answer.
+    {"question": "How much overlap between chunks?", "relevant": ["c1"], "answerable": True},
+    {"question": "What dtype should embeddings use?", "relevant": ["c2"], "answerable": True},
+    {"question": "What does error E4021 mean?", "relevant": ["c3"], "answerable": True},
+    {"question": "How many documents per request?", "relevant": ["c4"], "answerable": True},
+    {"question": "How do I split a document?", "relevant": ["c1", "c5"], "answerable": True},
+    # Deliberately unanswerable: the refusal path needs testing too.
+    {"question": "What is the weather in Colombo?", "relevant": [], "answerable": False},
+    {"question": "Who is the CEO?", "relevant": [], "answerable": False},
+]
+
+print(f"{len(EXAMPLES)} examples")
+print(f"  answerable:   {sum(1 for e in EXAMPLES if e['answerable'])}")
+print(f"  unanswerable: {sum(1 for e in EXAMPLES if not e['answerable'])}")
+print()
+print("The unanswerable ones are not padding. A system that never refuses")
+print("scores perfectly on answerable questions and is dangerous in production.")`} />
+
+<Callout type="tip">
+Twenty examples you chose deliberately beat two hundred sampled at random. Include the questions
+that broke last month, one per known failure mode, and at least a quarter that should be refused.
+Labelling which chunks are relevant is tedious and is the work — without it you can only measure
+end-to-end, and never learn which stage failed.
+</Callout>
+
+## Retrieval metrics
+
+<Run id="rag-eval-2" code={`def recall_at_k(retrieved, relevant, k):
+    """Of the chunks that should have been found, how many were in the top k?"""
+    if not relevant:
+        return None                      # undefined when nothing is relevant
+    found = set(retrieved[:k]) & set(relevant)
+    return len(found) / len(relevant)
+
+def precision_at_k(retrieved, relevant, k):
+    """Of the top k, how many were actually relevant?"""
+    if k == 0:
+        return 0.0
+    return len(set(retrieved[:k]) & set(relevant)) / k
+
+def reciprocal_rank(retrieved, relevant):
+    """1/rank of the first relevant result, or 0 if none was found."""
+    for rank, identifier in enumerate(retrieved, start=1):
+        if identifier in relevant:
+            return 1.0 / rank
+    return 0.0
+
+retrieved = ["c7", "c1", "c9", "c5", "c2"]
+relevant = ["c1", "c5"]
+
+print("retrieved:", retrieved)
+print("relevant: ", relevant)
+print()
+for k in [1, 3, 5]:
+    print(f"recall@{k}    {recall_at_k(retrieved, relevant, k):.3f}"
+          f"    precision@{k} {precision_at_k(retrieved, relevant, k):.3f}")
+print()
+print(f"reciprocal rank {reciprocal_rank(retrieved, relevant):.3f}  "
+      f"(first relevant is at position 2)")`} />
+
+The three answer different questions, and confusing them is common:
+
+- **Recall@k** — did retrieval find the answer at all? This is the ceiling on everything after it.
+- **Precision@k** — how much of what you retrieved was worth sending? This is your context budget.
+- **MRR** — how near the top was the first good one? This is what re-ranking improves.
+
+<Run id="rag-eval-3" code={`def reciprocal_rank(retrieved, relevant):
+    for rank, identifier in enumerate(retrieved, start=1):
+        if identifier in relevant:
+            return 1.0 / rank
+    return 0.0
+
+runs = {
+    "baseline":  [["c7", "c1", "c9"], ["c2", "c8", "c4"], ["c9", "c7", "c3"]],
+    "reranked":  [["c1", "c7", "c9"], ["c2", "c8", "c4"], ["c3", "c9", "c7"]],
+}
+truth = [["c1"], ["c2"], ["c3"]]
+
+for name, retrievals in runs.items():
+    ranks = [reciprocal_rank(r, t) for r, t in zip(retrievals, truth)]
+    recall3 = [len(set(r[:3]) & set(t)) / len(t) for r, t in zip(retrievals, truth)]
+    print(f"{name:10} MRR {sum(ranks) / len(ranks):.3f}   recall@3 {sum(recall3) / len(recall3):.3f}")
+
+print()
+print("Recall@3 is identical — the same documents were found either way.")
+print("MRR moved, because re-ranking put them first. That is exactly what it is for.")`} />
+
+## nDCG
+
+When some results are more relevant than others, a binary label is too coarse. nDCG weights by
+graded relevance and discounts by position:
+
+<Run id="rag-eval-4" code={`import math
+
+def dcg(relevances):
+    return sum(relevance / math.log2(rank + 1) for rank, relevance in enumerate(relevances, start=1))
+
+def ndcg_at_k(retrieved, graded, k=5):
+    """graded: {chunk_id: relevance}, where 0 means irrelevant."""
+    actual = [graded.get(identifier, 0) for identifier in retrieved[:k]]
+    ideal = sorted(graded.values(), reverse=True)[:k]
+    best = dcg(ideal)
+    return dcg(actual) / best if best else 0.0
+
+graded = {"c1": 3, "c5": 2, "c2": 1}          # 3 = perfect, 1 = tangential
+
+for name, ranking in [
+    ("perfect order", ["c1", "c5", "c2", "c9", "c7"]),
+    ("good but shuffled", ["c5", "c1", "c9", "c2", "c7"]),
+    ("best result last", ["c9", "c7", "c2", "c5", "c1"]),
+    ("nothing relevant", ["c9", "c7", "c8", "c6", "c4"]),
+]:
+    print(f"{name:20} nDCG@5 {ndcg_at_k(ranking, graded):.4f}")`} />
+
+The discount is logarithmic, so moving a result from position 1 to 2 costs far more than moving it
+from 9 to 10 — which matches how people read a list.
+
+## End-to-end metrics
+
+Retrieval quality is a means. What you ship is the answer:
+
+<Run id="rag-eval-5" code={`import re
+
+REFUSAL = "I don't know based on the provided documentation."
+
+def evaluate_answer(answer, supplied_ids, example):
+    cited = set(re.findall(r"\\[([a-zA-Z0-9_]+)\\]", answer))
+    refused = answer.strip() == REFUSAL
+    unsupported = cited - set(supplied_ids)
+
+    return {
+        "refused": refused,
+        "refused_correctly": refused and not example["answerable"],
+        "refused_wrongly": refused and example["answerable"],
+        "answered_unanswerable": not refused and not example["answerable"],
+        "cited_something": bool(cited),
+        "citations_supported": not unsupported,
+        "cited_relevant": bool(cited & set(example["relevant"])),
+    }
+
+cases = [
+    ("Use 10 to 20 percent [c1].", ["c1", "c2"],
+     {"answerable": True, "relevant": ["c1"]}, "grounded and correct"),
+    ("Use 10 to 20 percent.", ["c1"],
+     {"answerable": True, "relevant": ["c1"]}, "right, but uncited"),
+    ("Store as float16 [c9].", ["c1", "c2"],
+     {"answerable": True, "relevant": ["c2"]}, "fabricated citation"),
+    (REFUSAL, [], {"answerable": False, "relevant": []}, "correctly refused"),
+    ("The weather is sunny [c1].", ["c1"],
+     {"answerable": False, "relevant": []}, "answered the unanswerable"),
+]
+
+for answer, supplied, example, label in cases:
+    result = evaluate_answer(answer, supplied, example)
+    flags = [name for name, value in result.items() if value]
+    print(f"{label:26} {flags}")`} />
+
+Four numbers are worth reporting from that, and they are not interchangeable:
+
+<Run id="rag-eval-6" code={`METRICS = [
+    ("Answer rate", "answered / all", "How often the system produces an answer at all."),
+    ("Refusal precision", "correct refusals / all refusals",
+     "When it refuses, is it right to? Low means it is refusing answerable questions."),
+    ("Refusal recall", "correct refusals / unanswerable questions",
+     "Of the questions it should refuse, how many does it? Low means it invents answers."),
+    ("Citation support", "answers with only supplied ids / cited answers",
+     "Mechanically checkable. Should be 1.0, and anything less is fabrication."),
+    ("Groundedness", "claims supported by the cited chunk / claims",
+     "Needs a judge or a human. The expensive one, and the one that matters most."),
+]
+
+for name, formula, why in METRICS:
+    print(f"{name}\\n  {formula}\\n  {why}\\n")`} />
+
+<Callout type="warning">
+Answer rate and refusal recall trade against each other, and a single "accuracy" number hides the
+trade completely. A system that answers everything scores well on answerable questions and
+terribly on the rest; one that refuses everything does the reverse. Report both, always.
+</Callout>
+
+## Ablation
+
+When end-to-end quality drops, the useful question is *where*. Ablate:
+
+<Run id="rag-eval-7" code={`def diagnose(example, retrieved, answer, supplied_ids):
+    """Walk the stages in order and stop at the first that failed."""
+    relevant = set(example["relevant"])
+
+    if example["answerable"] and relevant and not (set(retrieved) & relevant):
+        return "retrieval", "the answer was never retrieved — chunking or embedding"
+
+    if example["answerable"] and relevant and not (set(supplied_ids) & relevant):
+        return "selection", "retrieved but not selected — score floor or budget too tight"
+
+    if answer.strip() == REFUSAL and example["answerable"]:
+        return "generation", "the context contained the answer and the model refused"
+
+    cited = set(re.findall(r"\\[([a-zA-Z0-9_]+)\\]", answer))
+    if cited - set(supplied_ids):
+        return "generation", "cited a chunk that was never supplied"
+
+    if not example["answerable"] and answer.strip() != REFUSAL:
+        return "generation", "answered a question the corpus cannot answer"
+
+    return "ok", "answered from the supplied context"
+
+import re
+REFUSAL = "I don't know based on the provided documentation."
+
+cases = [
+    ({"answerable": True, "relevant": ["c1"]}, ["c7", "c9"], "Something [c7].", ["c7"]),
+    ({"answerable": True, "relevant": ["c1"]}, ["c1", "c9"], REFUSAL, ["c9"]),
+    ({"answerable": True, "relevant": ["c1"]}, ["c1"], REFUSAL, ["c1"]),
+    ({"answerable": True, "relevant": ["c1"]}, ["c1"], "Use 10-20% [c1].", ["c1"]),
+    ({"answerable": False, "relevant": []}, ["c9"], "It is sunny [c9].", ["c9"]),
+]
+
+for example, retrieved, answer, supplied in cases:
+    stage, why = diagnose(example, retrieved, answer, supplied)
+    print(f"{stage:11} {why}")`} />
+
+<Callout type="ai" title="Why this matters for AI">
+That function is the most useful thing in the module. Without it, every bad answer looks like a
+model problem, and teams spend weeks on prompts when the answer was never retrieved. With it, a
+failing evaluation run produces a histogram over stages — and the histogram tells you whether to
+work on chunking, on the floor, or on the prompt. Measure the stage, not just the outcome.
+</Callout>
+
+## LLM as judge
+
+Groundedness — "is this claim actually supported by the cited passage?" — needs a reader. A model
+can be that reader, with caveats:
+
+<Run id="rag-eval-8" code={`JUDGE_PROMPT = """You are checking whether an answer is supported by its source.
+
+<passage>
+{passage}
+</passage>
+
+<claim>{claim}</claim>
+
+Reply with exactly one word:
+  supported   - the passage states this, or directly implies it
+  contradicted - the passage states the opposite
+  unsupported - the passage neither states nor implies it
+"""
+
+CAVEATS = [
+    "A judge agrees with itself far more than with a human. Measure that agreement "
+    "on a sample you labelled by hand, before trusting any number it produces.",
+    "Judges prefer longer, more confident answers, and prefer answers from the same "
+    "model family. Both biases move scores without moving quality.",
+    "Ask for a label from a fixed set, not a score from 1 to 10. Labels are far more "
+    "stable between runs.",
+    "Judge one claim against one passage. A whole-answer verdict hides which sentence "
+    "was the problem.",
+]
+
+print(JUDGE_PROMPT.format(passage="Use 10 to 20 percent overlap.", claim="Use 15 percent overlap."))
+print("Caveats:")
+for caveat in CAVEATS:
+    print(f"  - {caveat}")`} />
+
+Module 8 takes this further, including how to calibrate a judge against human labels. For now the
+important part is the ordering: **the mechanical checks come first.** Citation support costs
+nothing and catches the worst failures; reach for a judge only for what mechanics cannot see.
+
+## Try it yourself
+
+<Exercise
+  id="rag-eval-ex1"
+  title="Exercise 1"
+  brief="Write <code>recall_at_k</code> and <code>mrr</code>. Recall returns <code>None</code> when nothing is relevant; MRR averages the reciprocal rank across a list of (retrieved, relevant) pairs."
+  code={`def recall_at_k(retrieved, relevant, k):
+    # Fraction of the relevant ids that appear in the first k retrieved.
+    # Return None when relevant is empty — the metric is undefined.
+    ...
+
+
+def mrr(pairs):
+    # pairs: list of (retrieved_ids, relevant_ids).
+    # For each, 1/rank of the first relevant hit, or 0.0 if none.
+    # Return the mean across the pairs, or 0.0 for an empty list.
+    ...
+
+
+print(recall_at_k(["c7", "c1", "c9", "c5"], ["c1", "c5"], 3))
+print(mrr([(["c7", "c1"], ["c1"]), (["c2"], ["c2"]), (["c9"], ["c3"])]))`}
+  hint="Use set intersection for recall. For MRR, enumerate(retrieved, start=1) and return 1/rank at the first hit."
+  solution={`def recall_at_k(retrieved, relevant, k):
+    if not relevant:
+        return None
+    return len(set(retrieved[:k]) & set(relevant)) / len(set(relevant))
+
+
+def mrr(pairs):
+    if not pairs:
+        return 0.0
+    total = 0.0
+    for retrieved, relevant in pairs:
+        for rank, identifier in enumerate(retrieved, start=1):
+            if identifier in relevant:
+                total += 1.0 / rank
+                break
+    return total / len(pairs)
+
+
+print(recall_at_k(["c7", "c1", "c9", "c5"], ["c1", "c5"], 3))
+print(mrr([(["c7", "c1"], ["c1"]), (["c2"], ["c2"]), (["c9"], ["c3"])]))`}
+  tests={`assert recall_at_k(["c7", "c1", "c9", "c5"], ["c1", "c5"], 3) == 0.5, (
+    "Only c1 is in the top 3, out of two relevant ids."
+)
+assert recall_at_k(["c7", "c1", "c9", "c5"], ["c1", "c5"], 4) == 1.0, "Both appear by k=4."
+assert recall_at_k(["c7"], ["c1"], 1) == 0.0, "Nothing relevant was retrieved."
+assert recall_at_k(["c1"], [], 3) is None, (
+    "Recall is undefined when nothing is relevant — return None, not 0."
+)
+assert recall_at_k(["c1", "c1"], ["c1"], 2) == 1.0, "A duplicate must not inflate recall above 1."
+
+assert abs(mrr([(["c7", "c1"], ["c1"])]) - 0.5) < 1e-12, "First hit at rank 2 gives 0.5."
+assert abs(mrr([(["c1"], ["c1"])]) - 1.0) < 1e-12, "First hit at rank 1 gives 1.0."
+assert mrr([(["c9"], ["c3"])]) == 0.0, "No hit gives 0.0."
+
+expected = (0.5 + 1.0 + 0.0) / 3
+assert abs(mrr([(["c7", "c1"], ["c1"]), (["c2"], ["c2"]), (["c9"], ["c3"])]) - expected) < 1e-12, (
+    f"MRR is the mean across the pairs, expected {expected:.4f}."
+)
+assert mrr([]) == 0.0, "An empty list should give 0.0, not divide by zero."
+
+# Only the FIRST hit counts.
+assert abs(mrr([(["c9", "c1", "c5"], ["c1", "c5"])]) - 0.5) < 1e-12, (
+    "Two relevant results still give the reciprocal rank of the first one."
+)`}
+/>
+
+<Exercise
+  id="rag-eval-ex2"
+  title="Exercise 2"
+  brief="Write <code>ndcg_at_k(retrieved, graded, k)</code>: discounted cumulative gain over the top k, divided by the gain of the ideal ordering. Return 0.0 when nothing is relevant."
+  code={`import math
+
+def ndcg_at_k(retrieved, graded, k=5):
+    # graded: {chunk_id: relevance}. An id not present has relevance 0.
+    # DCG = sum(relevance / log2(rank + 1)) over the top k, rank starting at 1.
+    # Ideal DCG uses the k highest relevances, best first.
+    ...
+
+
+graded = {"c1": 3, "c5": 2, "c2": 1}
+print(round(ndcg_at_k(["c1", "c5", "c2"], graded), 4))
+print(round(ndcg_at_k(["c2", "c5", "c1"], graded), 4))
+print(round(ndcg_at_k(["c9", "c8"], graded), 4))`}
+  hint="Write a dcg(relevances) helper first, then apply it to both the actual and the ideal ordering."
+  solution={`import math
+
+def dcg(relevances):
+    return sum(relevance / math.log2(rank + 1)
+               for rank, relevance in enumerate(relevances, start=1))
+
+
+def ndcg_at_k(retrieved, graded, k=5):
+    actual = [graded.get(identifier, 0) for identifier in retrieved[:k]]
+    ideal = sorted(graded.values(), reverse=True)[:k]
+    best = dcg(ideal)
+    return dcg(actual) / best if best else 0.0
+
+
+graded = {"c1": 3, "c5": 2, "c2": 1}
+print(round(ndcg_at_k(["c1", "c5", "c2"], graded), 4))
+print(round(ndcg_at_k(["c2", "c5", "c1"], graded), 4))
+print(round(ndcg_at_k(["c9", "c8"], graded), 4))`}
+  tests={`import math
+
+graded = {"c1": 3, "c5": 2, "c2": 1}
+
+perfect = ndcg_at_k(["c1", "c5", "c2"], graded, k=3)
+assert abs(perfect - 1.0) < 1e-9, f"The ideal ordering must score exactly 1.0, got {perfect}."
+
+worse = ndcg_at_k(["c2", "c5", "c1"], graded, k=3)
+assert worse < perfect, f"A worse ordering must score lower: {worse} against {perfect}."
+assert 0.0 < worse < 1.0, f"It should still be positive — the results are relevant. Got {worse}."
+
+assert ndcg_at_k(["c9", "c8"], graded, k=3) == 0.0, (
+    "No relevant results retrieved means a gain of zero."
+)
+assert ndcg_at_k(["c1"], {}, k=3) == 0.0, (
+    "With nothing graded the ideal gain is zero — return 0.0 rather than dividing by it."
+)
+
+# The discount must be logarithmic, not linear.
+single_first = ndcg_at_k(["c1", "c9", "c9"], {"c1": 1}, k=3)
+single_second = ndcg_at_k(["c9", "c1", "c9"], {"c1": 1}, k=3)
+assert abs(single_first - 1.0) < 1e-9, "One relevant result at rank 1 is a perfect ordering."
+assert abs(single_second - 1 / math.log2(3)) < 1e-9, (
+    f"At rank 2 the gain is 1/log2(3) = {1 / math.log2(3):.4f}, got {single_second}."
+)
+
+# k must truncate.
+assert abs(ndcg_at_k(["c1", "c5", "c2"], graded, k=1) - 1.0) < 1e-9, (
+    "At k=1 the best possible is c1 alone, which is what was retrieved."
+)
+truncated = ndcg_at_k(["c5", "c1", "c2"], graded, k=1)
+assert truncated < 1.0, f"At k=1 with c5 first, the ordering is not ideal. Got {truncated}."`}
+/>
+
+<Quiz
+  question="Recall@10 is 0.95 but answers are frequently wrong. Which stage should you look at?"
+  choices={[
+    { text: "Selection or generation — the answer is being retrieved but not used", correct: true, why: "High recall means retrieval found it. The failure is downstream: the score floor or budget dropped it, or the model did not use what it was given." },
+    { text: "Chunking, since recall is never the whole story", why: "Recall at 0.95 says the chunks contain the answer and retrieval surfaced it — chunking is doing its job." },
+    { text: "The embedding model", why: "The embedding model is what produced that recall; replacing it addresses a stage that is already working." },
+    { text: "The size of the corpus", why: "Corpus size does not explain a gap between finding the answer and using it." },
+  ]}
+/>
+
+<Quiz
+  question="Why include deliberately unanswerable questions in a retrieval evaluation set?"
+  choices={[
+    { text: "Without them a system that never refuses looks perfect, while inventing answers in production", correct: true, why: "Refusal recall is only measurable against questions that should be refused, and the refusal path is the one that keeps a grounded system honest." },
+    { text: "To increase the size of the evaluation set", why: "Size is not the point; they measure a behaviour nothing else can." },
+    { text: "To test the embedding model's coverage", why: "Coverage is measured by recall on answerable questions." },
+    { text: "Because they are easier to label", why: "They are easier to label, but that is a convenience, not the reason." },
+  ]}
+/>
+
+## Recap
+
+- Build a small, deliberate evaluation set, labelled with the relevant chunk ids, and include
+  questions that should be refused.
+- **Recall@k** is the ceiling, **precision@k** is your context budget, **MRR** is what re-ranking
+  moves, and **nDCG** handles graded relevance with a positional discount.
+- End to end, report answer rate, refusal precision and recall, citation support and groundedness
+  — never one blended "accuracy".
+- Ablate by stage: never retrieved, retrieved but not selected, selected but refused, or cited
+  something that was not supplied.
+- Do the mechanical checks first; a judge is for what mechanics cannot see, and needs calibrating
+  against human labels before you trust it.
