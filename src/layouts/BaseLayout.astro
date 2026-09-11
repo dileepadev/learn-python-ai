@@ -48,6 +48,19 @@ const ogImage = new URL(withBase(image), Astro.site);
     <!-- Preconnect to the Pyodide CDN: the runtime download starts early. -->
     <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
 
+    {
+      /* Cache the Python runtime so a second visit boots without the download.
+         Production only: a worker in front of the dev server breaks HMR. */
+      import.meta.env.PROD && (
+        <script is:inline define:vars={{ swUrl: withBase("/sw.js"), swScope: withBase("/") }}>
+          {`if ("serviceWorker" in navigator) {
+            addEventListener("load", () => {
+              navigator.serviceWorker.register(swUrl, { scope: swScope }).catch(() => {});
+            });
+          }`}
+        </script>
+      )
+    }
 
     <!-- Resolve the theme before first paint so there is no light-mode flash. -->
     <script is:inline>
