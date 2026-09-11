@@ -37,7 +37,7 @@ print("This one is not — it always runs.")`} />
 
 Get it wrong and Python tells you immediately:
 
-<Run id="f-cond-3" code={`x = 5
+<Run id="f-cond-3" raises="IndentationError" code={`x = 5
 
 if x > 0:
 print("positive")`} />
@@ -222,6 +222,7 @@ else:
 <Exercise
   id="f-cond-ex2"
   title="Exercise 2"
+  refactor
   brief="Rewrite the function using guard clauses so it never nests more than one level deep. It must behave identically."
   code={`def status(score):
     if score is not None:

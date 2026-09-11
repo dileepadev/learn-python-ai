@@ -107,7 +107,7 @@ should run on every dataset you split.
 
 A tuple is an ordered sequence like a list, but it cannot be changed after it is created.
 
-<Run id="f-tuple-1" code={`point = (1, 2, 3, 4, 5)
+<Run id="f-tuple-1" raises="TypeError" code={`point = (1, 2, 3, 4, 5)
 
 print(point, type(point))
 print(point[0], point[-1])
@@ -166,7 +166,7 @@ print(f"train: {n_train}, test: {n_test}")`} />
 **Dictionary keys.** Because a tuple cannot change, it can be hashed — so it can be a key.
 A list cannot.
 
-<Run id="f-tuple-6" code={`grid = {(0, 0): "origin", (1, 2): "somewhere"}
+<Run id="f-tuple-6" raises="TypeError" code={`grid = {(0, 0): "origin", (1, 2): "somewhere"}
 print(grid[(1, 2)])
 
 broken = {[0, 0]: "nope"}   # lists are unhashable`} />
