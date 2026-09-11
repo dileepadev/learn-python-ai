@@ -1,0 +1,387 @@
+---
+title: LLM-as-judge, and its failure modes
+description: A model can grade what no assertion can reach — and it has biases towards length, towards itself, and towards agreeing with whatever it just read. Calibrate it against humans before you trust a number it produced.
+module: production-ai
+order: 5
+level: expert
+minutes: 22
+objectives:
+  - Decide when a judge is warranted and when a mechanical check is enough
+  - Write a judge prompt that returns a stable label
+  - Measure agreement between a judge and human labels
+  - Name the known biases and design around them
+  - Use pairwise comparison when absolute scores will not hold still
+---
+
+Some questions have no assertion: is this answer actually supported by the passage, is it helpful,
+is it better than the previous version. A model can answer those. It can also be confidently
+wrong in patterned ways, and the patterns are known.
+
+## Only when mechanics cannot
+
+<Run id="prod-judge-1" code={`CHECKS = [
+    ("Is it valid JSON?", "mechanical", "json.loads. Free, exact, instant."),
+    ("Does it cite only supplied chunks?", "mechanical", "A set difference. Free and exact."),
+    ("Is it under 60 words?", "mechanical", "len(answer.split())."),
+    ("Does it contain the required figure?", "mechanical", "A substring check."),
+    ("Did it refuse when it should?", "mechanical", "Compare with the fixed refusal string."),
+    ("Is this claim supported by that passage?", "judge", "Needs reading comprehension."),
+    ("Is this summary faithful to the source?", "judge", "Needs reading comprehension."),
+    ("Is answer A more helpful than answer B?", "judge", "Needs a judgement."),
+]
+
+for question, kind, note in CHECKS:
+    print(f"{kind:>10}  {question:<42} {note}")
+
+print()
+print("Everything mechanical first. A judge costs money, adds latency, and")
+print("introduces a second model whose behaviour you now also have to manage.")`} />
+
+## A judge prompt
+
+Ask for a label from a fixed set, not a score out of ten:
+
+<Run id="prod-judge-2" code={`import textwrap
+
+GROUNDEDNESS = textwrap.dedent("""
+    You are checking whether a claim is supported by a passage.
+
+    <passage>
+    {passage}
+    </passage>
+
+    <claim>
+    {claim}
+    </claim>
+
+    Reply with exactly one word, and nothing else:
+      supported    - the passage states this, or directly and unambiguously implies it
+      contradicted - the passage states the opposite
+      unsupported  - the passage neither states nor implies it
+
+    Judge only against the passage. Do not use outside knowledge, even if the
+    claim is true in general.
+""").strip()
+
+print(GROUNDEDNESS.format(
+    passage="Use 10 to 20 percent chunk overlap so sentences are not cut in half.",
+    claim="An overlap of about 15 percent is reasonable.",
+))`} />
+
+Three properties make that prompt work: a **fixed label set**, one claim against one passage, and
+an explicit instruction to ignore outside knowledge — without which a judge marks a true statement
+"supported" even when the passage never mentions it.
+
+<Callout type="warning">
+A 1-to-10 score is far less stable than a label. The same judge gives the same answer a 7 and an 8
+on different runs, clusters everything into 6-8, and shifts with the wording of the scale. Labels
+from a small fixed set reproduce far better, and you can always count them into a rate.
+</Callout>
+
+## Decomposing the answer
+
+Judge one claim at a time. A verdict on a whole answer hides which sentence was the problem:
+
+<Run id="prod-judge-3" code={`import re
+
+def split_claims(answer):
+    """Rough sentence split — each sentence carries the citations inside it."""
+    sentences = re.split(r"(?<=[.!?])\\s+", answer.strip())
+    return [s for s in sentences if s]
+
+answer = ("Use an overlap of 10 to 20 percent [c1]. "
+          "Store the vectors as float16 to save memory [c2]. "
+          "Normalise them at index time [c2].")
+
+passages = {
+    "c1": "Use 10 to 20 percent chunk overlap so sentences are not cut in half.",
+    "c2": "Store embedding vectors as float32 and normalise them at index time.",
+}
+
+# Recorded judge verdicts, one per claim.
+VERDICTS = {
+    "Use an overlap of 10 to 20 percent [c1].": "supported",
+    "Store the vectors as float16 to save memory [c2].": "contradicted",
+    "Normalise them at index time [c2].": "supported",
+}
+
+claims = split_claims(answer)
+print(f"{len(claims)} claims")
+for claim in claims:
+    cited = re.findall(r"\\[([a-zA-Z0-9_]+)\\]", claim)
+    verdict = VERDICTS[claim]
+    mark = {"supported": "ok  ", "contradicted": "BAD ", "unsupported": "??? "}[verdict]
+    print(f"  {mark} {verdict:13} {claim}")
+    if verdict != "supported":
+        print(f"         passage {cited}: {passages[cited[0]]}")
+
+grounded = sum(1 for c in claims if VERDICTS[c] == "supported") / len(claims)
+print()
+print(f"groundedness: {grounded:.2f}")`} />
+
+Two of three claims are supported and one contradicts its own citation — a specific, fixable
+finding. "This answer scored 0.67" would not have been.
+
+## Calibrate against humans
+
+A judge's number means nothing until you know how often it agrees with a person:
+
+<Run id="prod-judge-4" code={`LABELLED = [
+    ("supported", "supported"), ("supported", "supported"), ("supported", "supported"),
+    ("supported", "unsupported"), ("unsupported", "unsupported"), ("unsupported", "unsupported"),
+    ("unsupported", "supported"), ("contradicted", "contradicted"), ("supported", "supported"),
+    ("unsupported", "unsupported"), ("supported", "supported"), ("contradicted", "unsupported"),
+]
+
+agree = sum(1 for human, judge in LABELLED if human == judge)
+print(f"raw agreement: {agree}/{len(LABELLED)} = {agree / len(LABELLED):.2f}")
+print()
+
+# Raw agreement flatters a judge when the labels are imbalanced. Cohen's kappa
+# subtracts the agreement you would expect by chance.
+labels = sorted({label for pair in LABELLED for label in pair})
+n = len(LABELLED)
+observed = agree / n
+expected = sum(
+    (sum(1 for h, _ in LABELLED if h == label) / n) *
+    (sum(1 for _, j in LABELLED if j == label) / n)
+    for label in labels
+)
+kappa = (observed - expected) / (1 - expected)
+
+print(f"expected by chance: {expected:.3f}")
+print(f"Cohen's kappa:      {kappa:.3f}")
+print()
+for low, high, verdict in [(0.8, 1.01, "strong"), (0.6, 0.8, "usable"),
+                           (0.4, 0.6, "weak — improve the prompt"),
+                           (-1.0, 0.4, "do not trust this judge")]:
+    if low <= kappa < high:
+        print(f"-> {verdict}")`} />
+
+<Callout type="ai" title="Why this matters for AI">
+The step everyone skips. A judge that agrees with humans 60% of the time on a three-label task is
+barely above chance, and a pipeline built on it will optimise towards the judge's quirks rather
+than towards quality. Label eighty examples by hand — an afternoon — measure agreement, and
+iterate on the *judge prompt* until it is acceptable. Only then use it to measure anything else.
+Re-check whenever you change the judge model.
+</Callout>
+
+## The biases
+
+<Run id="prod-judge-5" code={`BIASES = [
+    ("Length", "Longer answers score higher, other things equal.",
+     "Cap the length before judging, or compare answers of similar length."),
+    ("Self-preference", "A judge prefers text from its own model family.",
+     "Use a different model as judge from the one being judged, where you can."),
+    ("Position", "In a pairwise comparison the first option wins more often.",
+     "Run both orders and keep only the consistent verdicts."),
+    ("Sycophancy", "Stating your expected answer in the prompt makes it agree.",
+     "Never tell the judge what you hope for."),
+    ("Authority", "Confident phrasing scores higher than hedged phrasing.",
+     "Judge the claim, not the tone. Say so in the prompt."),
+    ("Anchoring", "A previous verdict in the same conversation drags the next one.",
+     "One fresh request per judgement. Never batch several into one call."),
+]
+
+for name, effect, mitigation in BIASES:
+    print(f"{name}\\n  {effect}\\n  -> {mitigation}\\n")`} />
+
+<Run id="prod-judge-6" code={`# Position bias, and the cure: ask both ways round.
+RECORDED = {
+    ("A", "B"): "first",     # shown A then B, picked the first
+    ("B", "A"): "first",     # shown B then A, picked the first — contradiction
+    ("C", "D"): "first",
+    ("D", "C"): "second",    # consistent: C wins both ways
+}
+
+def compare(a, b):
+    forward = RECORDED[(a, b)]
+    backward = RECORDED[(b, a)]
+    winner_forward = a if forward == "first" else b
+    winner_backward = b if backward == "first" else a
+    if winner_forward == winner_backward:
+        return winner_forward, "consistent"
+    return None, "inconsistent — position bias, count it as a tie"
+
+for a, b in [("A", "B"), ("C", "D")]:
+    winner, note = compare(a, b)
+    print(f"{a} vs {b}: {winner or 'tie':>4}  ({note})")`} />
+
+Running both orders doubles the cost and converts a confident wrong answer into an honest tie.
+That is a good trade.
+
+## Pairwise beats absolute
+
+When absolute scores drift between runs, ask which of two is better instead:
+
+<Run id="prod-judge-7" code={`RESULTS = [
+    ("e1", "A"), ("e2", "A"), ("e3", "B"), ("e4", "tie"),
+    ("e5", "A"), ("e6", "A"), ("e7", "B"), ("e8", "A"),
+]
+
+wins_a = sum(1 for _, winner in RESULTS if winner == "A")
+wins_b = sum(1 for _, winner in RESULTS if winner == "B")
+ties = sum(1 for _, winner in RESULTS if winner == "tie")
+decided = wins_a + wins_b
+
+print(f"A wins {wins_a}, B wins {wins_b}, {ties} ties")
+print(f"win rate for A over decided pairs: {wins_a / decided:.2f}")
+print()
+
+# With eight comparisons, is a 5-2 split meaningful? Barely.
+from math import comb
+tail = sum(comb(decided, k) for k in range(wins_a, decided + 1)) / 2 ** decided
+print(f"probability of {wins_a}+ wins from {decided} coin flips: {tail:.3f}")
+print("-> suggestive, not conclusive. More comparisons, or a larger difference.")`} />
+
+<Callout type="tip">
+Pairwise comparison is more reliable than absolute scoring and answers a different question. "Is
+version B better than version A?" is usually the question you actually have — and it is the one a
+judge is best at, because it never has to hold a scale steady between runs.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="prod-judge-ex1"
+  title="Exercise 1"
+  brief="Write <code>agreement(pairs)</code> returning raw agreement and Cohen's kappa for a list of (human, judge) label pairs."
+  code={`def agreement(pairs):
+    # pairs: list of (human_label, judge_label).
+    # observed: the fraction where they match.
+    # expected: sum over labels of P(human says it) * P(judge says it).
+    # kappa: (observed - expected) / (1 - expected), or 1.0 when expected is 1.
+    # Return {"observed": ..., "expected": ..., "kappa": ...}.
+    ...
+
+
+print(agreement([("a", "a"), ("a", "b"), ("b", "b"), ("b", "b")]))`}
+  hint="Collect the label set from both sides, count each side's marginals, then apply the formula."
+  solution={`def agreement(pairs):
+    if not pairs:
+        return {"observed": 0.0, "expected": 0.0, "kappa": 0.0}
+
+    n = len(pairs)
+    labels = {label for pair in pairs for label in pair}
+    observed = sum(1 for human, judge in pairs if human == judge) / n
+    expected = sum(
+        (sum(1 for h, _ in pairs if h == label) / n)
+        * (sum(1 for _, j in pairs if j == label) / n)
+        for label in labels
+    )
+    kappa = 1.0 if expected >= 1.0 else (observed - expected) / (1 - expected)
+    return {"observed": observed, "expected": expected, "kappa": kappa}
+
+
+print(agreement([("a", "a"), ("a", "b"), ("b", "b"), ("b", "b")]))`}
+  tests={`perfect = agreement([("a", "a"), ("b", "b"), ("a", "a"), ("b", "b")])
+assert abs(perfect["observed"] - 1.0) < 1e-9, "Every pair matches."
+assert abs(perfect["kappa"] - 1.0) < 1e-9, f"Perfect agreement is kappa 1.0, got {perfect['kappa']}."
+
+result = agreement([("a", "a"), ("a", "b"), ("b", "b"), ("b", "b")])
+assert abs(result["observed"] - 0.75) < 1e-9, f"Three of four match, got {result['observed']}."
+# human: a,a,b,b -> 0.5/0.5 ; judge: a,b,b,b -> 0.25/0.75 ; expected = 0.125 + 0.375 = 0.5
+assert abs(result["expected"] - 0.5) < 1e-9, f"Expected agreement is 0.5, got {result['expected']}."
+assert abs(result["kappa"] - 0.5) < 1e-9, f"(0.75 - 0.5) / 0.5 = 0.5, got {result['kappa']}."
+
+# Chance-level agreement should give a kappa near zero, even when raw agreement looks decent.
+chance = agreement([("a", "a"), ("a", "a"), ("a", "a"), ("a", "b")])
+assert chance["observed"] > 0.7, "Raw agreement is high..."
+assert chance["kappa"] < 0.3, (
+    f"...but the human always said 'a', so the judge deserves little credit. "
+    f"Got kappa {chance['kappa']}."
+)
+
+# Total disagreement is negative.
+opposed = agreement([("a", "b"), ("b", "a"), ("a", "b"), ("b", "a")])
+assert opposed["kappa"] < 0, f"Systematic disagreement should be negative, got {opposed['kappa']}."
+
+# A degenerate case must not divide by zero.
+single = agreement([("a", "a"), ("a", "a")])
+assert single["kappa"] == 1.0, (
+    f"With one label everywhere, expected agreement is 1 — return 1.0 rather than dividing "
+    f"by zero. Got {single['kappa']}."
+)
+assert agreement([])["kappa"] == 0.0, "An empty list must not raise."`}
+/>
+
+<Exercise
+  id="prod-judge-ex2"
+  title="Exercise 2"
+  brief="Write <code>resolve(forward, backward, a, b)</code>: given the judge's pick shown in each order, return the winner when the two agree and <code>None</code> when position bias made them contradict."
+  code={`def resolve(forward, backward, a, b):
+    # forward:  "first" or "second", from showing (a, b)
+    # backward: "first" or "second", from showing (b, a)
+    # Return the winner when both orders agree, otherwise None.
+    ...
+
+
+print(resolve("first", "second", "A", "B"))   # A both ways
+print(resolve("first", "first", "A", "B"))    # contradiction
+print(resolve("second", "first", "A", "B"))   # B both ways`}
+  hint="In the forward order 'first' means a; in the backward order 'first' means b. Work out each winner, then compare."
+  solution={`def resolve(forward, backward, a, b):
+    winner_forward = a if forward == "first" else b
+    winner_backward = b if backward == "first" else a
+    return winner_forward if winner_forward == winner_backward else None
+
+
+print(resolve("first", "second", "A", "B"))
+print(resolve("first", "first", "A", "B"))
+print(resolve("second", "first", "A", "B"))`}
+  tests={`assert resolve("first", "second", "A", "B") == "A", (
+    "Shown (A, B) it picked the first (A); shown (B, A) it picked the second (A). A wins."
+)
+assert resolve("second", "first", "A", "B") == "B", (
+    "Shown (A, B) it picked the second (B); shown (B, A) it picked the first (B). B wins."
+)
+assert resolve("first", "first", "A", "B") is None, (
+    "Picking the first slot both times is position bias, not a verdict — return None."
+)
+assert resolve("second", "second", "A", "B") is None, (
+    "Picking the second slot both times is the same contradiction."
+)
+
+# It must work for any pair of names, not just A and B.
+assert resolve("first", "second", "gpt-prompt", "claude-prompt") == "gpt-prompt"
+assert resolve("second", "first", "v1", "v2") == "v2"
+assert resolve("first", "first", "v1", "v2") is None
+
+# Consistency: swapping the arguments swaps the roles, and a decided winner stays the winner.
+assert resolve("second", "first", "B", "A") == "A", (
+    "Calling it with the names swapped should still name the same winner."
+)`}
+/>
+
+<Quiz
+  question="Your judge agrees with human labels on 62% of a three-label task. What should you do?"
+  choices={[
+    { text: "Improve the judge prompt and re-measure — 62% on three labels is barely above chance", correct: true, why: "Chance is around 33%, so the judge is adding little. Optimising a pipeline against it would chase its quirks rather than quality." },
+    { text: "Use it — 62% is a majority", why: "The bar is agreement above chance by a useful margin, not above 50%." },
+    { text: "Switch to a 1-to-10 score for more resolution", why: "Scores are less stable than labels, so resolution would come at the cost of reproducibility." },
+    { text: "Average several judge calls to raise the agreement", why: "Averaging reduces variance but not a systematic disagreement with humans." },
+  ]}
+/>
+
+<Quiz
+  question="Why run a pairwise comparison in both orders?"
+  choices={[
+    { text: "Judges favour whichever option is shown first, so a single order can produce a confident, meaningless verdict", correct: true, why: "Running both and keeping only consistent verdicts turns position bias into an honest tie — worth double the cost." },
+    { text: "To average out the temperature", why: "Temperature affects variance between runs, not this systematic positional effect." },
+    { text: "Because the API requires both orders", why: "Nothing requires it; it is a methodological choice." },
+    { text: "To give each answer the same number of tokens", why: "Token counts are unchanged by ordering." },
+  ]}
+/>
+
+## Recap
+
+- Use mechanical checks for everything they can reach. A judge is for reading comprehension and
+  preference, and it costs money, latency and a second model to manage.
+- Ask for a label from a small fixed set, one claim against one passage, with an explicit
+  instruction to ignore outside knowledge.
+- Calibrate against human labels and report **kappa**, not raw agreement — raw agreement flatters
+  a judge on imbalanced data.
+- Design around the known biases: length, self-preference, position, sycophancy, authority,
+  anchoring.
+- Prefer pairwise comparison to absolute scores, run both orders, and count contradictions as
+  ties.

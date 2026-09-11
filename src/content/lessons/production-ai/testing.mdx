@@ -1,0 +1,546 @@
+---
+title: Testing non-deterministic systems with pytest
+description: The model is not the unit under test. Test everything around it deterministically with fakes and fixtures, assert properties rather than exact strings, and keep the statistical question separate.
+module: production-ai
+order: 3
+level: expert
+minutes: 22
+objectives:
+  - Separate what to unit-test from what to evaluate statistically
+  - Write pytest tests, fixtures and parametrised cases
+  - Inject a fake client so the model never appears in a unit test
+  - Assert properties of an output instead of its exact text
+  - Mark the tests that cost money, and keep them out of the default run
+---
+
+pytest runs in this page, so the test suites below really execute. What cannot run here is the
+model — and that turns out to be the whole lesson.
+
+## Two different questions
+
+<Run id="prod-test-1" code={`QUESTIONS = [
+    ("Is the code correct?",
+     "unit tests, deterministic, milliseconds, run on every commit",
+     "chunking, parsing, validation, retry classification, prompt rendering, "
+     "cost arithmetic, the agent loop's termination"),
+    ("Is the system good?",
+     "evaluation, statistical, minutes and money, run on a schedule",
+     "answer quality, groundedness, refusal behaviour, retrieval recall"),
+]
+
+for question, shape, what in QUESTIONS:
+    print(f"{question}\\n  {shape}\\n  {what}\\n")
+
+print("Confusing the two gives you a flaky test suite and an unmeasured system.")`} />
+
+The rule that follows: **never put a live model call in a unit test.** It is slow, costs money,
+and fails for reasons unrelated to your change.
+
+## pytest
+
+<Run id="prod-test-2" code={`from pathlib import Path
+import pytest
+
+Path("chunking.py").write_text('''
+def chunk_words(text, size=10, overlap=2):
+    if overlap >= size:
+        raise ValueError("overlap must be smaller than size")
+    words = text.split()
+    if not words:
+        return []
+    step = size - overlap
+    chunks = []
+    for start in range(0, len(words), step):
+        piece = words[start:start + size]
+        if not piece:
+            break
+        chunks.append(" ".join(piece))
+        if start + size >= len(words):
+            break
+    return chunks
+''')
+
+Path("test_chunking.py").write_text('''
+import pytest
+from chunking import chunk_words
+
+def test_short_text_is_one_chunk():
+    assert chunk_words("one two three", size=10) == ["one two three"]
+
+def test_empty_text_gives_no_chunks():
+    assert chunk_words("") == []
+
+def test_chunks_overlap():
+    chunks = chunk_words(" ".join(f"w{n}" for n in range(1, 21)), size=10, overlap=2)
+    assert chunks[0].split()[-2:] == chunks[1].split()[:2]
+
+def test_no_word_is_lost():
+    text = " ".join(f"w{n}" for n in range(1, 26))
+    seen = {word for chunk in chunk_words(text, 10, 2) for word in chunk.split()}
+    assert seen == set(text.split())
+
+def test_overlap_must_be_smaller_than_size():
+    with pytest.raises(ValueError, match="smaller than size"):
+        chunk_words("a b c", size=4, overlap=4)
+''')
+
+import sys
+sys.path.insert(0, ".")
+pytest.main(["-q", "test_chunking.py", "-p", "no:cacheprovider"])`} />
+
+Five tests, no model, no network, a few milliseconds. `pytest.raises` asserts that a failure
+happens *and* that it is the right one — a test that merely expects "an exception" passes when the
+code raises `NameError` from a typo.
+
+## Fixtures and parametrisation
+
+A fixture builds what a test needs; `parametrize` runs one test over many cases:
+
+<Run id="prod-test-3" code={`from pathlib import Path
+import pytest, sys
+
+Path("retrying.py").write_text('''
+def should_retry(status):
+    if status == 429:
+        return True
+    if 500 <= status < 600:
+        return True
+    if status in (408, 409):
+        return True
+    return False
+''')
+
+Path("test_retrying.py").write_text('''
+import pytest
+from retrying import should_retry
+
+@pytest.fixture
+def permanent_statuses():
+    return [400, 401, 403, 404, 413, 422]
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 529, 408, 409])
+def test_transient_statuses_are_retried(status):
+    assert should_retry(status) is True
+
+def test_permanent_statuses_are_not(permanent_statuses):
+    for status in permanent_statuses:
+        assert should_retry(status) is False, f"{status} should not be retried"
+
+@pytest.mark.parametrize(("status", "expected"), [(429, True), (400, False), (503, True)])
+def test_table(status, expected):
+    assert should_retry(status) is expected
+''')
+
+sys.path.insert(0, ".")
+pytest.main(["-q", "test_retrying.py", "-p", "no:cacheprovider"])`} />
+
+Ten test cases from three functions. When one fails, pytest names the parameter that broke, so you
+learn *which* status is mishandled rather than that "the test failed".
+
+## Make the model injectable
+
+Code that constructs its own client cannot be tested. Pass it in:
+
+<Run id="prod-test-4" code={`from pathlib import Path
+import pytest, sys
+
+Path("summarise.py").write_text('''
+REFUSAL = "I don\\'t know based on the provided documentation."
+
+def summarise(client, text, *, model="claude-opus-5", max_words=20):
+    """Note the client parameter: that is the seam a test needs."""
+    if not text.strip():
+        return ""
+    response = client.create(
+        model=model,
+        max_tokens=256,
+        system=f"Summarise in at most {max_words} words. Reply with the summary alone.",
+        messages=[{"role": "user", "content": text}],
+    )
+    if response.stop_reason == "refusal":
+        return REFUSAL
+    return "".join(b.text for b in response.content if b.type == "text").strip()
+''')
+
+Path("test_summarise.py").write_text('''
+import pytest
+from types import SimpleNamespace
+from summarise import summarise, REFUSAL
+
+class FakeClient:
+    """Records what it was asked; replies from a script."""
+    def __init__(self, replies, stop_reason="end_turn"):
+        self.replies = list(replies)
+        self.stop_reason = stop_reason
+        self.requests = []
+
+    def create(self, **request):
+        self.requests.append(request)
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=self.replies.pop(0))],
+            stop_reason=self.stop_reason,
+        )
+
+@pytest.fixture
+def client():
+    return FakeClient(["A short summary."])
+
+def test_returns_the_text(client):
+    assert summarise(client, "a long document") == "A short summary."
+
+def test_sends_the_document_as_a_user_message(client):
+    summarise(client, "a long document")
+    request = client.requests[0]
+    assert request["messages"][-1]["role"] == "user"
+    assert request["messages"][-1]["content"] == "a long document"
+
+def test_max_words_reaches_the_system_prompt(client):
+    summarise(client, "text", max_words=7)
+    assert "7 words" in client.requests[0]["system"]
+
+def test_empty_input_never_calls_the_model(client):
+    assert summarise(client, "   ") == ""
+    assert client.requests == []
+
+def test_refusal_is_passed_through():
+    refusing = FakeClient(["irrelevant"], stop_reason="refusal")
+    assert summarise(refusing, "text") == REFUSAL
+''')
+
+sys.path.insert(0, ".")
+pytest.main(["-q", "test_summarise.py", "-p", "no:cacheprovider"])`} />
+
+Look at what those tests actually check: that the document reaches the user message, that a
+parameter reaches the system prompt, that empty input short-circuits, that a refusal is handled.
+Every one is a real bug you can ship, and none of them needs a model.
+
+<Callout type="ai" title="Why this matters for AI">
+Nearly all the bugs in an LLM application are in the code around the model: the chunk that was
+never indexed, the tool result appended to the wrong message, the retry that retried a 400, the
+prompt where a placeholder rendered as a literal brace. All of those are deterministic, cheap to
+test, and invisible to any evaluation of answer quality. Keep the seam — pass the client in — and
+your suite stays fast enough to run on every save.
+</Callout>
+
+## Assert properties, not strings
+
+For the output that genuinely is non-deterministic, assert what must always hold:
+
+<Run id="prod-test-5" code={`from pathlib import Path
+import pytest, sys
+
+Path("answers.py").write_text('''
+import re
+
+REFUSAL = "I don\\'t know based on the provided documentation."
+
+def check(answer, supplied_ids, *, max_words=60):
+    cited = set(re.findall(r"\\\\[([a-zA-Z0-9_]+)\\\\]", answer))
+    refused = answer.strip() == REFUSAL
+    return {
+        "refused": refused,
+        "cited": cited,
+        "unsupported": cited - set(supplied_ids),
+        "words": len(answer.split()),
+        "within_length": len(answer.split()) <= max_words,
+    }
+''')
+
+Path("test_answers.py").write_text('''
+import pytest
+from answers import check, REFUSAL
+
+# Recorded model outputs: what a real run produced, captured once.
+SAMPLES = [
+    ("Use an overlap of 10 to 20 percent [c1].", ["c1", "c2"]),
+    ("Store vectors as float32 [c2], and normalise them [c2].", ["c1", "c2"]),
+    (REFUSAL, ["c1"]),
+]
+
+@pytest.mark.parametrize(("answer", "supplied"), SAMPLES)
+def test_never_cites_an_unsupplied_chunk(answer, supplied):
+    assert check(answer, supplied)["unsupported"] == set()
+
+@pytest.mark.parametrize(("answer", "supplied"), SAMPLES)
+def test_answers_are_cited_or_refusals(answer, supplied):
+    result = check(answer, supplied)
+    assert result["refused"] or result["cited"], "an answer must cite something"
+
+@pytest.mark.parametrize(("answer", "supplied"), SAMPLES)
+def test_answers_stay_brief(answer, supplied):
+    assert check(answer, supplied)["within_length"]
+
+def test_a_fabricated_citation_is_caught():
+    result = check("Store as float16 [c9].", ["c1", "c2"])
+    assert result["unsupported"] == {"c9"}
+''')
+
+sys.path.insert(0, ".")
+pytest.main(["-q", "test_answers.py", "-p", "no:cacheprovider"])`} />
+
+"Cites only supplied chunks", "is a citation or a refusal", "is under sixty words" — those hold
+for every correct answer, so they are testable. "Equals this exact sentence" is not.
+
+<Callout type="warning">
+Recorded samples go stale. They test your *checking* code, which is the point, but they say
+nothing about whether today's model still behaves. That question belongs to the evaluation
+harness in the next lesson, which runs against live calls on a schedule.
+</Callout>
+
+## Floats and markers
+
+<Run id="prod-test-6" code={`from pathlib import Path
+import pytest, sys
+
+Path("test_misc.py").write_text('''
+import pytest
+
+def cosine(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    left = sum(x * x for x in a) ** 0.5
+    right = sum(y * y for y in b) ** 0.5
+    return dot / (left * right)
+
+def test_floats_need_a_tolerance():
+    assert cosine([1.0, 0.0], [1.0, 0.0]) == pytest.approx(1.0)
+    assert cosine([1.0, 1.0], [1.0, 0.0]) == pytest.approx(0.7071, abs=1e-4)
+
+@pytest.mark.slow
+def test_something_expensive():
+    assert sum(range(1_000_00)) > 0
+
+@pytest.mark.live
+def test_calls_the_real_api():
+    pytest.skip("needs ANTHROPIC_API_KEY and real money")
+''')
+
+Path("pytest.ini").write_text('''[pytest]
+markers =
+    slow: takes more than a second
+    live: makes a real API call and costs money
+''')
+
+sys.path.insert(0, ".")
+print("default run:")
+pytest.main(["-q", "test_misc.py", "-p", "no:cacheprovider"])
+
+print()
+print("skipping the expensive ones:")
+pytest.main(["-q", "test_misc.py", "-m", "not slow and not live", "-p", "no:cacheprovider"])`} />
+
+Markers let one suite serve two purposes. In CI the default job runs
+`pytest -m "not live"` on every pull request, and a nightly job runs the rest with a key.
+
+<Callout type="tip">
+Use `0.0 == pytest.approx(x)` for anything floating point. `0.1 + 0.2 == 0.3` is `False`, and a
+cosine similarity computed two different ways will differ in the last few bits — a test that
+demands exact equality fails for reasons that are not bugs.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="prod-test-ex1"
+  title="Exercise 1"
+  brief="Write a <code>FakeClient</code> that replies from a script, records every request, and raises a clear error when the script runs out."
+  code={`from types import SimpleNamespace
+
+class FakeClient:
+    def __init__(self, replies, stop_reason="end_turn"):
+        # Keep a copy of replies, remember stop_reason, and start an
+        # empty list of recorded requests.
+        ...
+
+    def create(self, **request):
+        # Record the request, pop the next reply, and return an object
+        # with .content (one text block) and .stop_reason.
+        # Raise AssertionError when there are no replies left.
+        ...
+
+
+client = FakeClient(["first", "second"])
+print(client.create(model="claude-opus-5", messages=[]).content[0].text)
+print(client.create(model="claude-opus-5", messages=[]).content[0].text)
+print(len(client.requests))`}
+  hint="Store list(replies). In create, append the request, check the list is not empty, then build SimpleNamespace(content=[SimpleNamespace(type='text', text=...)], stop_reason=...)."
+  solution={`from types import SimpleNamespace
+
+class FakeClient:
+    def __init__(self, replies, stop_reason="end_turn"):
+        self.replies = list(replies)
+        self.stop_reason = stop_reason
+        self.requests = []
+
+    def create(self, **request):
+        self.requests.append(request)
+        if not self.replies:
+            raise AssertionError("FakeClient ran out of scripted replies")
+        text = self.replies.pop(0)
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=text)],
+            stop_reason=self.stop_reason,
+        )
+
+
+client = FakeClient(["first", "second"])
+print(client.create(model="claude-opus-5", messages=[]).content[0].text)
+print(client.create(model="claude-opus-5", messages=[]).content[0].text)
+print(len(client.requests))`}
+  tests={`client = FakeClient(["one", "two"])
+
+first = client.create(model="claude-opus-5", messages=[{"role": "user", "content": "hi"}])
+assert first.content[0].text == "one", f"The first reply should be 'one', got {first.content[0].text!r}."
+assert first.content[0].type == "text", "The block needs a type of 'text'."
+assert first.stop_reason == "end_turn", f"Default stop_reason should be 'end_turn', got {first.stop_reason!r}."
+
+assert len(client.requests) == 1, "Every call must be recorded."
+assert client.requests[0]["model"] == "claude-opus-5", (
+    f"Record the whole request. Got {client.requests[0]!r}."
+)
+assert client.requests[0]["messages"][0]["content"] == "hi", "The messages must be recorded too."
+
+assert client.create(messages=[]).content[0].text == "two", "Replies come out in order."
+assert len(client.requests) == 2, "Two calls, two recorded requests."
+
+try:
+    client.create(messages=[])
+except AssertionError:
+    pass
+else:
+    raise AssertionError(
+        "Running out of scripted replies must raise AssertionError — a silent None here "
+        "produces a confusing failure far from its cause."
+    )
+
+# The caller's list must not be mutated.
+replies = ["a"]
+other = FakeClient(replies)
+other.create(messages=[])
+assert replies == ["a"], "Copy the replies list; do not consume the caller's."
+
+refusing = FakeClient(["ignored"], stop_reason="refusal")
+assert refusing.create(messages=[]).stop_reason == "refusal", (
+    "stop_reason must be configurable, so the refusal path can be tested."
+)`}
+/>
+
+<Exercise
+  id="prod-test-ex2"
+  title="Exercise 2"
+  brief="Write <code>classify(client, ticket)</code>: take the client as a parameter, send the ticket as a user message, return the lower-cased stripped reply — and return <code>'unknown'</code> for empty input or a refusal, without calling the model for the empty case."
+  code={`from types import SimpleNamespace
+
+def classify(client, ticket, *, model="claude-opus-5"):
+    # Empty or whitespace-only ticket: return "unknown" WITHOUT calling the client.
+    # Otherwise call client.create(model=..., max_tokens=16, messages=[...])
+    # with the ticket as a user message.
+    # stop_reason "refusal" -> "unknown". Otherwise the text, stripped and lowered.
+    ...
+
+
+class FakeClient:
+    def __init__(self, replies, stop_reason="end_turn"):
+        self.replies, self.stop_reason, self.requests = list(replies), stop_reason, []
+    def create(self, **request):
+        self.requests.append(request)
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=self.replies.pop(0))],
+            stop_reason=self.stop_reason,
+        )
+
+
+print(classify(FakeClient(["  Billing \\n"]), "charged twice"))
+print(classify(FakeClient(["ignored"]), "   "))`}
+  hint="Guard the empty case first and return before touching the client. Then check stop_reason before extracting the text."
+  solution={`from types import SimpleNamespace
+
+def classify(client, ticket, *, model="claude-opus-5"):
+    if not ticket.strip():
+        return "unknown"
+    response = client.create(
+        model=model,
+        max_tokens=16,
+        messages=[{"role": "user", "content": ticket}],
+    )
+    if response.stop_reason == "refusal":
+        return "unknown"
+    text = "".join(b.text for b in response.content if b.type == "text")
+    return text.strip().lower()
+
+
+class FakeClient:
+    def __init__(self, replies, stop_reason="end_turn"):
+        self.replies, self.stop_reason, self.requests = list(replies), stop_reason, []
+    def create(self, **request):
+        self.requests.append(request)
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=self.replies.pop(0))],
+            stop_reason=self.stop_reason,
+        )
+
+
+print(classify(FakeClient(["  Billing \\n"]), "charged twice"))
+print(classify(FakeClient(["ignored"]), "   "))`}
+  tests={`client = FakeClient(["  Billing \\n"])
+assert classify(client, "charged twice") == "billing", (
+    "The reply should be stripped and lower-cased."
+)
+assert len(client.requests) == 1, "One call for one ticket."
+
+request = client.requests[0]
+assert request["messages"][-1]["role"] == "user", "The ticket goes in a user message."
+assert request["messages"][-1]["content"] == "charged twice", (
+    f"Send the ticket unchanged. Got {request['messages'][-1]['content']!r}."
+)
+assert request["model"] == "claude-opus-5", "Pass the model through."
+
+# Empty input must short-circuit — the assertion that catches a wasted API call.
+idle = FakeClient(["should not be used"])
+assert classify(idle, "   ") == "unknown", "Whitespace-only input classifies as unknown."
+assert idle.requests == [], (
+    "An empty ticket must not reach the model at all — check before calling, not after."
+)
+
+refusing = FakeClient(["irrelevant"], stop_reason="refusal")
+assert classify(refusing, "something") == "unknown", "A refusal maps to 'unknown'."
+
+# The model must be overridable, because a test needs to assert on it.
+custom = FakeClient(["bug"])
+classify(custom, "crash", model="claude-haiku-4-5")
+assert custom.requests[0]["model"] == "claude-haiku-4-5", (
+    f"The model argument should reach the request. Got {custom.requests[0]['model']!r}."
+)`}
+/>
+
+<Quiz
+  question="Why should a unit test never make a real model call?"
+  choices={[
+    { text: "It is slow, costs money, and fails for reasons unrelated to the change under test", correct: true, why: "A suite you cannot run on every save stops being run, and a test that fails because of a rate limit teaches you nothing about your code." },
+    { text: "Model calls cannot be made from a test process", why: "They can — which is exactly why the discipline has to be deliberate." },
+    { text: "pytest does not support network access", why: "It supports it fine; the problem is what that does to the suite." },
+    { text: "Because the model's output is copyrighted", why: "Not the issue — speed, cost and determinism are." },
+  ]}
+/>
+
+<Quiz
+  question="What kind of assertion works on genuinely non-deterministic model output?"
+  choices={[
+    { text: "Properties that must hold for any correct answer — cites only supplied ids, under N words, valid JSON", correct: true, why: "These are true of every acceptable output, so they fail only when something is genuinely wrong." },
+    { text: "Exact string equality against a recorded answer", why: "It fails on any rewording, so it is either constantly broken or constantly re-recorded without being read." },
+    { text: "Nothing — non-deterministic output cannot be tested", why: "The output varies but its constraints do not, and the constraints are where the bugs are." },
+    { text: "A second model call to check the first", why: "Useful for evaluation, far too slow and expensive for a unit test — and it is not deterministic either." },
+  ]}
+/>
+
+## Recap
+
+- Unit tests answer "is the code correct?"; evaluation answers "is the system good?". Keep them
+  apart.
+- Never call a live model in a unit test. Pass the client in as a parameter — that seam is what
+  makes the code testable at all.
+- `pytest.raises(Error, match=...)` checks the failure is the right one; `parametrize` turns one
+  test into a table.
+- For non-deterministic output, assert invariants: only supplied citations, length bounds, schema
+  validity.
+- `pytest.approx` for floats, and markers plus `-m "not live"` to keep the expensive tests out of
+  the default run.
