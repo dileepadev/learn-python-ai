@@ -13,7 +13,9 @@
     "check": "astro check",
     "lint:lessons": "node scripts/lint-lessons.mjs",
     "verify": "node scripts/verify-exercises.mjs",
-    "postbuild": "pagefind --site dist"
+    "og": "node scripts/generate-og-images.mjs",
+    "postbuild": "pagefind --site dist",
+    "prebuild": "node scripts/generate-og-images.mjs"
   },
   "dependencies": {
     "@astrojs/mdx": "^8.0.1",
@@ -44,6 +46,7 @@
     "@types/react-dom": "^19.2.7",
     "pagefind": "^1.5.2",
     "pyodide": "^314.0.6",
+    "sharp": "^0.35.4",
     "typescript": "^6.0.3"
   }
 }
