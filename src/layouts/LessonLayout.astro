@@ -1,6 +1,7 @@
 ---
 import BaseLayout from "./BaseLayout.astro";
 import Sidebar from "../components/Sidebar.astro";
+import LessonDrawer from "../components/LessonDrawer.astro";
 import Objectives from "../components/mdx/Objectives.astro";
 import LessonComplete from "../components/LessonComplete.tsx";
 import { MODULE_BY_SLUG } from "../lib/curriculum";
@@ -32,6 +33,10 @@ const toc = headings.filter((h) => h.depth === 2 || h.depth === 3);
 
     <!-- Lesson -->
     <article class="min-w-0">
+      <div class="mb-4 lg:hidden" data-pagefind-ignore>
+        <LessonDrawer currentId={lesson.id} />
+      </div>
+
       <p class="mb-2 flex flex-wrap items-center gap-2 text-[12px]" style="color: var(--text-faint)">
         <span style="color: var(--accent)">{module?.title}</span>
         <span>·</span>
