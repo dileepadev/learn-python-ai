@@ -1,0 +1,488 @@
+---
+title: Embeddings and vector similarity
+description: Turn text into vectors whose geometry means something, measure similarity properly, and handle the practical parts — batching, caching and the fact that you can never mix two models' vectors.
+module: rag-and-retrieval
+order: 1
+level: expert
+minutes: 20
+objectives:
+  - Explain what an embedding is and what its geometry encodes
+  - Compute cosine similarity over a batch, without loops
+  - Rank documents against a query and take the top k
+  - Batch and cache embedding calls
+  - Explain why two models' embeddings can never be compared
+---
+
+<Callout type="warning" title="What runs here">
+A real embedding model is an API call, and this sandbox has no network. The lessons in this module
+use a **TF-IDF vectoriser** from scikit-learn as a stand-in: it produces genuine, deterministic
+vectors with the same shape and the same geometry, so every mechanic you learn — normalising,
+cosine similarity, top-k, indexing, hybrid search, re-ranking — is exactly what you will write
+against a real model. The one difference is what the vectors *mean*: TF-IDF captures shared words,
+where a trained embedding model captures shared meaning. Where that difference matters, the text
+says so.
+</Callout>
+
+## What an embedding is
+
+A function from text to a fixed-length vector of floats, trained so that texts with similar
+meaning land close together.
+
+<Run id="rag-emb-1" code={`import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+CORPUS = [
+    "Retrieval augmented generation grounds answers in your own documents.",
+    "RAG systems fetch relevant passages before generating an answer.",
+    "Use 10 to 20 percent chunk overlap so sentences are not cut in half.",
+    "Store embeddings as float32 to halve the memory they need.",
+    "The cat sat on the mat in the afternoon sunshine.",
+]
+
+vectoriser = TfidfVectorizer().fit(CORPUS)
+vectors = vectoriser.transform(CORPUS).toarray().astype(np.float32)
+
+print("documents:", vectors.shape[0])
+print("dimensions:", vectors.shape[1])
+print("dtype:     ", vectors.dtype)
+print()
+print("first vector, first 12 dimensions:")
+print(vectors[0][:12].round(3))
+print("non-zero dimensions:", int((vectors[0] != 0).sum()), "of", vectors.shape[1])`} />
+
+Every document becomes a point in the same space. Nothing about a single vector is interpretable —
+dimension 7 means nothing on its own. What means something is **distance between vectors**.
+
+## Cosine similarity
+
+Module 3 built this: normalise, then take the dot product.
+
+<Run id="rag-emb-2" code={`import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+CORPUS = [
+    "Retrieval augmented generation grounds answers in your own documents.",
+    "RAG systems fetch relevant passages before generating an answer.",
+    "Use 10 to 20 percent chunk overlap so sentences are not cut in half.",
+    "Store embeddings as float32 to halve the memory they need.",
+    "The cat sat on the mat in the afternoon sunshine.",
+]
+
+vectoriser = TfidfVectorizer().fit(CORPUS)
+
+def embed(texts):
+    """Stand-in for an embedding model: text in, unit vectors out."""
+    vectors = vectoriser.transform(texts).toarray().astype(np.float32)
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    return vectors / np.maximum(norms, 1e-12)
+
+vectors = embed(CORPUS)
+print("every row has length:", np.linalg.norm(vectors, axis=1).round(6))
+print()
+
+similarity = vectors @ vectors.T          # unit vectors, so the dot product is the cosine
+print("pairwise similarity:")
+print(similarity.round(3))`} />
+
+Read the diagonal — every document is identical to itself at 1.0 — and then look at the
+off-diagonal entries. The two RAG sentences share vocabulary and score highest; the cat is
+orthogonal to everything.
+
+<Callout type="tip">
+Normalise once, at index time, and every later query is a plain dot product. That is not an
+optimisation detail — it is why production vector databases store unit vectors and advertise
+"inner product" as their metric.
+</Callout>
+
+## Ranking against a query
+
+<Run id="rag-emb-3" code={`import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+CORPUS = [
+    "Retrieval augmented generation grounds answers in your own documents.",
+    "RAG systems fetch relevant passages before generating an answer.",
+    "Use 10 to 20 percent chunk overlap so sentences are not cut in half.",
+    "Store embeddings as float32 to halve the memory they need.",
+    "The cat sat on the mat in the afternoon sunshine.",
+]
+
+vectoriser = TfidfVectorizer().fit(CORPUS)
+
+def embed(texts):
+    vectors = vectoriser.transform(texts).toarray().astype(np.float32)
+    return vectors / np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-12)
+
+index = embed(CORPUS)
+
+def search(query, k=3):
+    scores = index @ embed([query])[0]
+    best = np.argpartition(scores, -k)[-k:]
+    best = best[np.argsort(scores[best])[::-1]]
+    return [(int(i), float(scores[i]), CORPUS[i]) for i in best]
+
+for query in ["how much overlap when chunking?", "how should I store vectors?"]:
+    print(f"query: {query}")
+    for rank, (index_, score, text) in enumerate(search(query), start=1):
+        print(f"  {rank}. {score:.3f}  {text[:64]}")
+    print()`} />
+
+That is a search engine: one matrix-vector product and an `argpartition`, exactly the top-k
+pattern from module 3.
+
+<Callout type="warning">
+Notice the second result of each query scoring well below the first, and the third barely scoring
+at all. Retrieval always returns *k* things, however irrelevant — a similarity floor is what stops
+a nonsense passage being handed to the model as context. That threshold is a real tuning decision,
+not a detail.
+</Callout>
+
+## The real call
+
+With a hosted embedding model the shape is the same; only `embed` changes:
+
+```python
+# An embedding model is a separate service from the chat model. Anthropic
+# recommends a dedicated provider such as Voyage AI; the shape below is
+# typical of all of them.
+def embed(texts: list[str]) -> np.ndarray:
+    response = embeddings_client.embed(
+        model="voyage-3",
+        input=texts,             # a batch, not one string at a time
+        input_type="document",   # or "query" — many models distinguish the two
+    )
+    vectors = np.array([item.embedding for item in response.data], dtype=np.float32)
+    return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+```
+
+Two details worth carrying over:
+
+- **Batch.** One request with 128 texts is far cheaper and faster than 128 requests. Reach for
+  `itertools.batched` from module 2.
+- **Ask for the right `input_type`.** Several models embed a question and a passage differently,
+  because a question is not a shorter version of its answer.
+
+<Run id="rag-emb-4" code={`from itertools import batched
+
+documents = [f"document number {n}" for n in range(1, 1001)]
+
+requests = 0
+for group in batched(documents, 128):
+    requests += 1          # one API call per batch
+
+print(f"{len(documents)} documents")
+print(f"{requests} requests batched, against {len(documents)} unbatched")
+print(f"{len(documents) / requests:.0f}x fewer round trips")`} />
+
+## Caching
+
+Embedding the same text twice is money spent on an answer you already had. Key a cache by a hash
+of the content, exactly as in module 2:
+
+<Run id="rag-emb-5" code={`import hashlib
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+CORPUS = ["alpha beta gamma", "beta gamma delta", "gamma delta epsilon"]
+vectoriser = TfidfVectorizer().fit(CORPUS)
+
+class EmbeddingCache:
+    def __init__(self, model):
+        self.model = model
+        self.store = {}
+        self.computed = 0
+        self.reused = 0
+
+    def key(self, text):
+        return hashlib.sha256(f"{self.model}\\u0000{text}".encode("utf-8")).hexdigest()[:16]
+
+    def embed(self, texts):
+        missing = [t for t in texts if self.key(t) not in self.store]
+        if missing:
+            fresh = vectoriser.transform(missing).toarray().astype(np.float32)
+            fresh /= np.maximum(np.linalg.norm(fresh, axis=1, keepdims=True), 1e-12)
+            for text, vector in zip(missing, fresh):
+                self.store[self.key(text)] = vector
+            self.computed += len(missing)
+        self.reused += len(texts) - len(missing)
+        return np.stack([self.store[self.key(t)] for t in texts])
+
+cache = EmbeddingCache("tfidf-demo")
+
+cache.embed(CORPUS)
+cache.embed(CORPUS)                       # the same corpus again
+cache.embed(CORPUS + ["delta epsilon zeta"])
+
+print("computed:", cache.computed)
+print("reused:  ", cache.reused)
+print("stored:  ", len(cache.store))`} />
+
+Note the model name in the cache key. That is not decoration.
+
+## You cannot mix models
+
+Two models' vectors live in unrelated spaces. Comparing them produces a number, and the number is
+meaningless:
+
+<Run id="rag-emb-6" code={`import numpy as np
+
+rng = np.random.default_rng(0)
+
+def fake_model(seed, text, dimensions=256):
+    """Two 'models': same text, same dimension, different learned space."""
+    local = np.random.default_rng(abs(hash(text)) % (2**31) + seed)
+    vector = local.normal(size=dimensions)
+    return vector / np.linalg.norm(vector)
+
+text = "retrieval augmented generation"
+a = fake_model(0, text)
+b = fake_model(1, text)
+
+print("same text, model A vs model B:", round(float(a @ b), 4))
+print("same text, model A vs model A:", round(float(a @ fake_model(0, text)), 4))
+print()
+print("A similarity near zero for identical text means the comparison is nonsense.")`} />
+
+<Callout type="ai" title="Why this matters for AI">
+This is the migration trap that catches real systems. Changing embedding model — or even a minor
+version of one — invalidates **every vector in your index**, and nothing errors: queries keep
+returning k results, they are simply the wrong ones, and quality degrades in a way that looks like
+a prompt problem. Store the model id and dimension alongside every vector, refuse to query when
+they disagree, and treat a model change as a full re-index.
+</Callout>
+
+<Run id="rag-emb-7" code={`import numpy as np
+
+class Index:
+    """An index that refuses to answer a query it cannot answer honestly."""
+
+    def __init__(self, model, dimensions):
+        self.model = model
+        self.dimensions = dimensions
+        self.vectors = np.zeros((0, dimensions), dtype=np.float32)
+
+    def add(self, vectors, model, dimensions):
+        if model != self.model:
+            raise ValueError(f"index was built with {self.model!r}, not {model!r}")
+        if dimensions != self.dimensions:
+            raise ValueError(f"index is {self.dimensions}-dimensional, not {dimensions}")
+        self.vectors = np.vstack([self.vectors, vectors])
+
+    def search(self, vector, model):
+        if model != self.model:
+            raise ValueError(f"query embedded with {model!r}, index built with {self.model!r}")
+        return self.vectors @ vector
+
+index = Index("voyage-3", 8)
+index.add(np.ones((3, 8), dtype=np.float32) / np.sqrt(8), "voyage-3", 8)
+print("added; index holds", index.vectors.shape)
+
+for model, dimensions in [("voyage-3", 16), ("some-other-model", 8)]:
+    try:
+        index.add(np.ones((1, dimensions), dtype=np.float32), model, dimensions)
+    except ValueError as error:
+        print("refused:", error)`} />
+
+## Dimensions and memory
+
+<Run id="rag-emb-8" code={`import numpy as np
+
+for count in [100_000, 1_000_000, 10_000_000]:
+    print(f"{count:>12,} vectors")
+    for dimensions in [384, 768, 1536]:
+        for dtype in [np.float32, np.float16]:
+            size = count * dimensions * np.dtype(dtype).itemsize
+            print(f"    {dimensions:>5}d {np.dtype(dtype).name:>8}  {size / 1e9:8.2f} GB")
+    print()`} />
+
+Smaller embeddings are cheaper to store and faster to search, and lose some accuracy. Many models
+now support shortening a vector deliberately rather than training a smaller one — measure the
+retrieval quality you actually lose before assuming it matters.
+
+## Try it yourself
+
+<Exercise
+  id="rag-emb-ex1"
+  title="Exercise 1"
+  brief="Write <code>top_k(index, query_vector, k)</code>: return a list of <code>(position, score)</code> pairs for the k closest rows, best first. The index rows are already unit vectors."
+  code={`import numpy as np
+
+def top_k(index, query_vector, k=3):
+    # index is (n, d) unit vectors; query_vector is (d,) and already normalised.
+    # Score every row, take the k best, and return them best first.
+    ...
+
+
+rng = np.random.default_rng(0)
+index = rng.normal(size=(6, 4))
+index /= np.linalg.norm(index, axis=1, keepdims=True)
+query = index[2]          # identical to row 2, so row 2 must win
+
+print(top_k(index, query, k=3))`}
+  hint="scores = index @ query_vector, then np.argsort(scores)[::-1][:k] — or argpartition for the O(n) version."
+  solution={`import numpy as np
+
+def top_k(index, query_vector, k=3):
+    scores = index @ query_vector
+    order = np.argsort(scores)[::-1][:k]
+    return [(int(i), float(scores[i])) for i in order]
+
+
+rng = np.random.default_rng(0)
+index = rng.normal(size=(6, 4))
+index /= np.linalg.norm(index, axis=1, keepdims=True)
+query = index[2]
+
+print(top_k(index, query, k=3))`}
+  tests={`import numpy as np
+
+rng = np.random.default_rng(0)
+index = rng.normal(size=(6, 4))
+index /= np.linalg.norm(index, axis=1, keepdims=True)
+query = index[2]
+
+results = top_k(index, query, k=3)
+assert isinstance(results, list) and len(results) == 3, (
+    f"Return exactly k pairs, got {results!r}."
+)
+assert all(isinstance(r, tuple) and len(r) == 2 for r in results), (
+    "Each entry should be a (position, score) pair."
+)
+
+assert results[0][0] == 2, (
+    f"The query is row 2 itself, so row 2 must rank first. Got position {results[0][0]}."
+)
+assert abs(results[0][1] - 1.0) < 1e-5, (
+    f"A unit vector against itself scores 1.0, got {results[0][1]}."
+)
+
+scores = [score for _, score in results]
+assert scores == sorted(scores, reverse=True), f"Results must be best first, got {scores}."
+
+expected = index @ query
+for position, score in results:
+    assert abs(score - float(expected[position])) < 1e-5, (
+        f"Score for position {position} should be {expected[position]:.5f}, got {score}."
+    )
+
+# k larger than the index should not crash.
+everything = top_k(index, query, k=10)
+assert len(everything) == 6, f"With k above the index size, return everything — got {len(everything)}."
+
+assert top_k(index, query, k=1)[0][0] == 2, "k=1 should still give the best match."`}
+/>
+
+<Exercise
+  id="rag-emb-ex2"
+  title="Exercise 2"
+  brief="Give <code>VectorStore</code> an <code>add</code> and a <code>search</code> that both refuse a mismatched model or dimension, raising <code>ValueError</code>."
+  code={`import numpy as np
+
+class VectorStore:
+    def __init__(self, model, dimensions):
+        self.model = model
+        self.dimensions = dimensions
+        self.vectors = np.zeros((0, dimensions), dtype=np.float32)
+
+    def add(self, vectors, model):
+        # Raise ValueError when model differs, or when vectors.shape[1]
+        # differs from self.dimensions. Otherwise stack them on.
+        ...
+
+    def search(self, query_vector, model):
+        # Raise ValueError on a model mismatch or a wrong-length query.
+        # Otherwise return the scores: self.vectors @ query_vector.
+        ...
+
+
+store = VectorStore("voyage-3", 4)
+store.add(np.eye(4, dtype=np.float32), "voyage-3")
+print(store.vectors.shape)
+print(store.search(np.array([1.0, 0, 0, 0], dtype=np.float32), "voyage-3"))`}
+  hint="Two checks in each method, then np.vstack for add and a matrix-vector product for search."
+  solution={`import numpy as np
+
+class VectorStore:
+    def __init__(self, model, dimensions):
+        self.model = model
+        self.dimensions = dimensions
+        self.vectors = np.zeros((0, dimensions), dtype=np.float32)
+
+    def add(self, vectors, model):
+        if model != self.model:
+            raise ValueError(f"index was built with {self.model!r}, not {model!r}")
+        if vectors.shape[1] != self.dimensions:
+            raise ValueError(f"index is {self.dimensions}-dimensional, not {vectors.shape[1]}")
+        self.vectors = np.vstack([self.vectors, vectors])
+
+    def search(self, query_vector, model):
+        if model != self.model:
+            raise ValueError(f"query embedded with {model!r}, index built with {self.model!r}")
+        if query_vector.shape[0] != self.dimensions:
+            raise ValueError(f"query is {query_vector.shape[0]}-dimensional, not {self.dimensions}")
+        return self.vectors @ query_vector
+
+
+store = VectorStore("voyage-3", 4)
+store.add(np.eye(4, dtype=np.float32), "voyage-3")
+print(store.vectors.shape)
+print(store.search(np.array([1.0, 0, 0, 0], dtype=np.float32), "voyage-3"))`}
+  tests={`import numpy as np
+
+store = VectorStore("voyage-3", 4)
+store.add(np.eye(4, dtype=np.float32), "voyage-3")
+assert store.vectors.shape == (4, 4), f"Four rows should have been added, got {store.vectors.shape}."
+
+store.add(np.eye(4, dtype=np.float32), "voyage-3")
+assert store.vectors.shape == (8, 4), "A second add should append, not replace."
+
+scores = store.search(np.array([1.0, 0, 0, 0], dtype=np.float32), "voyage-3")
+assert np.asarray(scores).shape == (8,), f"One score per row, got {np.asarray(scores).shape}."
+assert abs(float(np.asarray(scores)[0]) - 1.0) < 1e-6, "The matching row should score 1.0."
+
+for call, why in [
+    (lambda: store.add(np.eye(4, dtype=np.float32), "other-model"), "a different model must be refused"),
+    (lambda: store.add(np.eye(8, dtype=np.float32), "voyage-3"), "a wrong dimension must be refused"),
+    (lambda: store.search(np.ones(4, dtype=np.float32), "other-model"), "a query from another model must be refused"),
+    (lambda: store.search(np.ones(8, dtype=np.float32), "voyage-3"), "a wrong-length query must be refused"),
+]:
+    try:
+        call()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(why)
+
+assert store.vectors.shape == (8, 4), "A refused add must not change the index."`}
+/>
+
+<Quiz
+  question="You upgrade to a newer embedding model but keep the existing index. What happens?"
+  choices={[
+    { text: "Queries still return k results, but they are effectively random — and nothing errors", correct: true, why: "The two models' spaces are unrelated, so the arithmetic succeeds and the geometry is meaningless. Store the model id with the vectors and refuse a mismatch." },
+    { text: "The API rejects the query with a dimension error", why: "Only if the dimensions happen to differ — and many models share a dimension, which makes the failure silent." },
+    { text: "Quality improves, since the query embedding is better", why: "A better query vector in the wrong space is no better than a worse one." },
+    { text: "The index converts the old vectors automatically", why: "There is no conversion between two learned spaces; re-embedding is the only route." },
+  ]}
+/>
+
+<Quiz
+  question="Why normalise embeddings when you store them rather than at query time?"
+  choices={[
+    { text: "Every later search becomes a plain dot product, with no per-query rescaling", correct: true, why: "Normalising n index vectors once beats normalising them on every query — which is why vector databases store unit vectors and use inner product." },
+    { text: "Unnormalised vectors take more space", why: "The byte count is identical; the saving is in computation per query." },
+    { text: "Cosine similarity only works on normalised vectors", why: "It works either way — normalising early just moves the division out of the hot path." },
+    { text: "It prevents the model drift problem", why: "Drift is about which model produced the vectors, and normalising does nothing about it." },
+  ]}
+/>
+
+## Recap
+
+- An embedding maps text to a fixed-length vector; only distances between vectors mean anything.
+- Normalise at index time, then similarity is a dot product and top-k is `argpartition`.
+- Batch embedding calls and cache them by a hash of the content **plus the model id**.
+- Ask for the right `input_type` when a model distinguishes queries from documents.
+- Two models' vectors are incomparable. Store the model and dimension with the index and refuse a
+  mismatch, because nothing else will tell you.
+- Retrieval always returns k results; a similarity floor is what stops irrelevant context reaching
+  the model.

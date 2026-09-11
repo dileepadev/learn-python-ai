@@ -1,0 +1,548 @@
+---
+title: Building a vector index
+description: Exact search is one matrix product and works further than you think. Build an index with metadata filtering and persistence, then learn what approximate search buys and what it costs.
+module: rag-and-retrieval
+order: 3
+level: expert
+minutes: 20
+objectives:
+  - Build an exact index with add, search and persistence
+  - Filter by metadata, and know why pre-filtering beats post-filtering
+  - Estimate when brute force stops being enough
+  - Explain what approximate search trades away
+  - Handle updates and deletes without corrupting the index
+---
+
+A vector index is an array of unit vectors, a parallel list of metadata, and a dot product. Start
+there — a great many production systems never need more.
+
+## Exact search
+
+<Run id="rag-index-1" code={`import numpy as np, time
+
+rng = np.random.default_rng(0)
+
+for count in [1_000, 10_000, 100_000]:
+    index = rng.normal(size=(count, 768)).astype(np.float32)
+    index /= np.linalg.norm(index, axis=1, keepdims=True)
+    query = index[0]
+
+    started = time.perf_counter()
+    scores = index @ query
+    best = np.argpartition(scores, -10)[-10:]
+    elapsed = (time.perf_counter() - started) * 1000
+
+    print(f"{count:>8,} vectors  {index.nbytes / 1e6:7.1f} MB  {elapsed:7.1f} ms")`} />
+
+A hundred thousand 768-dimension vectors is about 300 MB and searches in a few tens of
+milliseconds. That is a perfectly good production system for most internal corpora, and it has no
+recall loss, no index build step and no extra service to operate.
+
+## The index
+
+<Run id="rag-index-2" code={`import numpy as np
+from dataclasses import dataclass, field
+
+@dataclass
+class Record:
+    chunk_id: str
+    doc_id: str
+    text: str
+    metadata: dict = field(default_factory=dict)
+
+class VectorIndex:
+    """Exact search over unit vectors, with parallel metadata."""
+
+    def __init__(self, model, dimensions):
+        self.model = model
+        self.dimensions = dimensions
+        self.vectors = np.zeros((0, dimensions), dtype=np.float32)
+        self.records: list[Record] = []
+        self.positions: dict[str, int] = {}
+
+    def __len__(self):
+        return len(self.records)
+
+    def add(self, vectors, records):
+        vectors = np.asarray(vectors, dtype=np.float32)
+        if vectors.shape[1] != self.dimensions:
+            raise ValueError(f"expected {self.dimensions} dimensions, got {vectors.shape[1]}")
+        if len(vectors) != len(records):
+            raise ValueError("one vector per record, please")
+
+        vectors = vectors / np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-12)
+        for offset, record in enumerate(records):
+            self.positions[record.chunk_id] = len(self.records) + offset
+        self.vectors = np.vstack([self.vectors, vectors])
+        self.records.extend(records)
+
+    def search(self, query_vector, k=5, minimum=0.0):
+        if len(self) == 0:
+            return []
+        query_vector = np.asarray(query_vector, dtype=np.float32)
+        query_vector = query_vector / max(float(np.linalg.norm(query_vector)), 1e-12)
+
+        scores = self.vectors @ query_vector
+        k = min(k, len(scores))
+        best = np.argpartition(scores, -k)[-k:]
+        best = best[np.argsort(scores[best])[::-1]]
+        return [(self.records[i], float(scores[i])) for i in best if scores[i] >= minimum]
+
+rng = np.random.default_rng(0)
+index = VectorIndex("demo", 8)
+index.add(
+    rng.normal(size=(5, 8)),
+    [Record(f"c{i}", "guide", f"chunk number {i}", {"lang": "en"}) for i in range(5)],
+)
+
+print("records:", len(index))
+for record, score in index.search(index.vectors[2], k=3):
+    print(f"  {record.chunk_id} {score:.3f}  {record.text}")`} />
+
+The `minimum` argument is the similarity floor from the last lesson, and it is the difference
+between "here are five passages" and "here are the passages that are actually about this".
+
+## Filtering by metadata
+
+Real queries are rarely "search everything". They are "search this customer's documents, in
+English, published this year".
+
+<Run id="rag-index-3" code={`import numpy as np
+
+rng = np.random.default_rng(0)
+n = 2000
+vectors = rng.normal(size=(n, 32)).astype(np.float32)
+vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+metadata = [{"lang": "en" if i % 3 else "si", "year": 2024 + (i % 3)} for i in range(n)]
+query = vectors[7]
+
+def post_filter(k=5):
+    """Search everything, then throw away what does not match."""
+    scores = vectors @ query
+    order = np.argsort(scores)[::-1]
+    kept = [i for i in order if metadata[i]["lang"] == "si"][:k]
+    return [(int(i), float(scores[i])) for i in kept]
+
+def pre_filter(k=5):
+    """Narrow first, then search only the candidates."""
+    allowed = np.array([i for i, m in enumerate(metadata) if m["lang"] == "si"])
+    scores = vectors[allowed] @ query
+    k = min(k, len(scores))
+    best = np.argpartition(scores, -k)[-k:]
+    best = best[np.argsort(scores[best])[::-1]]
+    return [(int(allowed[i]), float(scores[i])) for i in best]
+
+print("post-filter:", [i for i, _ in post_filter()])
+print("pre-filter: ", [i for i, _ in pre_filter()])
+print()
+print("candidates searched:")
+print(f"  post-filter {n}")
+print(f"  pre-filter  {sum(1 for m in metadata if m['lang'] == 'si')}")`} />
+
+Both return the same answers here, because exact search ranks everything anyway. The difference
+matters the moment you move to approximate search:
+
+<Callout type="warning">
+Post-filtering an **approximate** index is a trap. You ask for the 10 nearest neighbours, then
+keep the ones matching your filter — and if none of the 10 match, you get nothing back, even
+though excellent matches exist just outside the retrieved set. With a selective filter this fails
+almost always. Filter first, or use an index that supports filtered search natively.
+</Callout>
+
+## Persisting it
+
+Vectors go in a binary file; metadata goes in JSONL. Both are boring, which is the point:
+
+<Run id="rag-index-4" code={`import json
+import numpy as np
+from pathlib import Path
+
+rng = np.random.default_rng(0)
+vectors = rng.normal(size=(4, 8)).astype(np.float32)
+vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+records = [{"chunk_id": f"c{i}", "doc_id": "guide", "text": f"chunk {i}"} for i in range(4)]
+
+def save(directory, model, vectors, records):
+    path = Path(directory)
+    path.mkdir(parents=True, exist_ok=True)
+    np.save(path / "vectors.npy", vectors)
+    with open(path / "records.jsonl", "w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\\n")
+    (path / "manifest.json").write_text(json.dumps({
+        "model": model, "dimensions": int(vectors.shape[1]), "count": int(vectors.shape[0]),
+    }, indent=2))
+
+def load(directory):
+    path = Path(directory)
+    manifest = json.loads((path / "manifest.json").read_text())
+    loaded = np.load(path / "vectors.npy")
+    with open(path / "records.jsonl", encoding="utf-8") as handle:
+        records = [json.loads(line) for line in handle if line.strip()]
+    if loaded.shape[0] != len(records):
+        raise ValueError("vectors and records are out of step")
+    if loaded.shape[1] != manifest["dimensions"]:
+        raise ValueError("vector width does not match the manifest")
+    return manifest, loaded, records
+
+save("index", "voyage-3", vectors, records)
+print(Path("index/manifest.json").read_text())
+
+manifest, loaded, restored = load("index")
+print("round trip identical:", np.array_equal(vectors, loaded))
+print("records:", len(restored), restored[0])`} />
+
+The manifest is what makes the model check from the last lesson enforceable across a restart.
+
+## Updates and deletes
+
+The naive delete — removing a row from the array — invalidates every position after it. A
+tombstone keeps positions stable:
+
+<Run id="rag-index-5" code={`import numpy as np
+
+class TombstoneIndex:
+    def __init__(self, dimensions):
+        self.vectors = np.zeros((0, dimensions), dtype=np.float32)
+        self.ids = []
+        self.alive = np.zeros(0, dtype=bool)
+
+    def add(self, vectors, ids):
+        self.vectors = np.vstack([self.vectors, np.asarray(vectors, dtype=np.float32)])
+        self.ids.extend(ids)
+        self.alive = np.concatenate([self.alive, np.ones(len(ids), dtype=bool)])
+
+    def delete(self, chunk_id):
+        for position, existing in enumerate(self.ids):
+            if existing == chunk_id and self.alive[position]:
+                self.alive[position] = False
+                return True
+        return False
+
+    def search(self, query, k=3):
+        scores = np.where(self.alive, self.vectors @ query, -np.inf)
+        k = min(k, int(self.alive.sum()))
+        if k == 0:
+            return []
+        best = np.argpartition(scores, -k)[-k:]
+        best = best[np.argsort(scores[best])[::-1]]
+        return [(self.ids[i], round(float(scores[i]), 3)) for i in best]
+
+    def compact(self):
+        """Rebuild without the dead rows. Do this offline, not per request."""
+        self.vectors = self.vectors[self.alive]
+        self.ids = [i for i, keep in zip(self.ids, self.alive) if keep]
+        self.alive = np.ones(len(self.ids), dtype=bool)
+
+rng = np.random.default_rng(0)
+index = TombstoneIndex(4)
+vectors = rng.normal(size=(5, 4)).astype(np.float32)
+vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+index.add(vectors, [f"c{i}" for i in range(5)])
+
+query = vectors[1]
+print("before delete:", index.search(query))
+index.delete("c1")
+print("after delete: ", index.search(query))
+print("rows stored:", len(index.ids), "alive:", int(index.alive.sum()))
+index.compact()
+print("after compact:", len(index.ids))`} />
+
+Masking with `-inf` rather than filtering keeps the index a single contiguous array, which is what
+makes the search fast.
+
+## When brute force is not enough
+
+<Run id="rag-index-6" code={`import numpy as np
+
+def brute_force_estimate(count, dimensions=768, gflops=20.0):
+    """One query is count x dimensions multiply-adds."""
+    operations = 2 * count * dimensions
+    return operations / (gflops * 1e9) * 1000     # milliseconds
+
+print(f"{'vectors':>13} {'memory':>10} {'per query':>12}")
+for count in [10_000, 100_000, 1_000_000, 10_000_000, 100_000_000]:
+    memory = count * 768 * 4 / 1e9
+    print(f"{count:>13,} {memory:>9.1f} GB {brute_force_estimate(count):>10.1f} ms")
+
+print()
+print("Rules of thumb:")
+for rule in [
+    "Under ~100k vectors: NumPy in process. No index, no service, exact results.",
+    "100k to a few million: still viable, but consider sharding or a library index.",
+    "Beyond that: approximate search, and a dedicated store.",
+    "Any scale, if you need durability, concurrency and filtering: a real database.",
+]:
+    print("  -", rule)`} />
+
+<Callout type="ai" title="Why this matters for AI">
+The instinct to reach for a vector database on day one costs weeks and usually buys nothing. Most
+internal corpora — a documentation site, a support archive, a code base — are tens of thousands of
+chunks, which is a 100 MB array and a millisecond query. Start with NumPy and a JSONL file, get
+the chunking and the evaluation right, and move to a real store when *scale* forces it rather than
+when the architecture diagram suggests it. The retrieval quality work transfers; the infrastructure
+work does not.
+</Callout>
+
+## What approximate search trades
+
+<Run id="rag-index-7" code={`import numpy as np
+
+rng = np.random.default_rng(0)
+n, dimensions = 20_000, 64
+vectors = rng.normal(size=(n, dimensions)).astype(np.float32)
+vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+
+# A crude IVF: cluster into buckets, search only the nearest few buckets.
+buckets = 64
+centroid_ids = rng.integers(0, buckets, n)
+centroids = np.stack([
+    vectors[centroid_ids == b].mean(axis=0) if (centroid_ids == b).any() else np.zeros(dimensions)
+    for b in range(buckets)
+])
+centroids /= np.maximum(np.linalg.norm(centroids, axis=1, keepdims=True), 1e-12)
+
+def exact(query, k=10):
+    scores = vectors @ query
+    return set(np.argsort(scores)[::-1][:k].tolist())
+
+def approximate(query, k=10, probe=4):
+    nearest = np.argsort(centroids @ query)[::-1][:probe]
+    candidates = np.flatnonzero(np.isin(centroid_ids, nearest))
+    if len(candidates) < k:
+        return set(candidates.tolist())
+    scores = vectors[candidates] @ query
+    chosen = candidates[np.argsort(scores)[::-1][:k]]
+    return set(chosen.tolist())
+
+queries = vectors[rng.integers(0, n, 40)]
+print(f"{'probe':>6} {'searched':>10} {'recall@10':>11}")
+for probe in [1, 2, 4, 8, 16, 64]:
+    recalls, searched = [], []
+    for query in queries:
+        truth = exact(query)
+        found = approximate(query, probe=probe)
+        recalls.append(len(truth & found) / len(truth))
+        nearest = np.argsort(centroids @ query)[::-1][:probe]
+        searched.append(int(np.isin(centroid_ids, nearest).sum()))
+    print(f"{probe:>6} {np.mean(searched):>10,.0f} {np.mean(recalls):>11.3f}")`} />
+
+That is the entire bargain: search fewer candidates, miss some true neighbours. Probing every
+bucket recovers exact results and exact cost. Real indexes — HNSW, IVF-PQ — are far better at the
+trade than this toy, but the shape is identical, and **recall is a number you must measure**, not
+a property you can assume.
+
+## Try it yourself
+
+<Exercise
+  id="rag-index-ex1"
+  title="Exercise 1"
+  brief="Write <code>filtered_search(vectors, metadata, query, predicate, k)</code>: narrow to the rows the predicate accepts, then rank only those. Return <code>(original_position, score)</code> pairs, best first."
+  code={`import numpy as np
+
+def filtered_search(vectors, metadata, query, predicate, k=3):
+    # predicate takes a metadata dict and returns True to keep the row.
+    # Narrow FIRST, then score. Return positions in the ORIGINAL array.
+    # Return [] when nothing matches.
+    ...
+
+
+rng = np.random.default_rng(0)
+vectors = rng.normal(size=(10, 4)).astype(np.float32)
+vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+metadata = [{"lang": "en" if i % 2 else "si"} for i in range(10)]
+
+print(filtered_search(vectors, metadata, vectors[3], lambda m: m["lang"] == "si", k=3))`}
+  hint="Build an array of allowed indices, score vectors[allowed] @ query, sort, then map back through allowed."
+  solution={`import numpy as np
+
+def filtered_search(vectors, metadata, query, predicate, k=3):
+    allowed = np.array([i for i, m in enumerate(metadata) if predicate(m)], dtype=int)
+    if len(allowed) == 0:
+        return []
+    scores = vectors[allowed] @ query
+    order = np.argsort(scores)[::-1][:k]
+    return [(int(allowed[i]), float(scores[i])) for i in order]
+
+
+rng = np.random.default_rng(0)
+vectors = rng.normal(size=(10, 4)).astype(np.float32)
+vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+metadata = [{"lang": "en" if i % 2 else "si"} for i in range(10)]
+
+print(filtered_search(vectors, metadata, vectors[3], lambda m: m["lang"] == "si", k=3))`}
+  tests={`import numpy as np
+
+rng = np.random.default_rng(0)
+vectors = rng.normal(size=(10, 4)).astype(np.float32)
+vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+metadata = [{"lang": "en" if i % 2 else "si"} for i in range(10)]
+
+results = filtered_search(vectors, metadata, vectors[3], lambda m: m["lang"] == "si", k=3)
+assert len(results) == 3, f"Expected 3 results, got {len(results)}."
+assert all(metadata[i]["lang"] == "si" for i, _ in results), (
+    f"Every result must satisfy the predicate. Got langs "
+    f"{[metadata[i]['lang'] for i, _ in results]}."
+)
+assert all(i % 2 == 0 for i, _ in results), "Only even positions are Sinhala here."
+
+scores = [s for _, s in results]
+assert scores == sorted(scores, reverse=True), f"Results must be best first, got {scores}."
+
+expected = vectors @ vectors[3]
+for position, score in results:
+    assert abs(score - float(expected[position])) < 1e-5, (
+        f"Position {position} should score {expected[position]:.5f}, got {score}."
+    )
+
+# Positions must index the ORIGINAL array, not the filtered subset.
+top = filtered_search(vectors, metadata, vectors[4], lambda m: m["lang"] == "si", k=1)
+assert top[0][0] == 4, (
+    f"Row 4 is Sinhala and identical to the query, so it must win with its original index. "
+    f"Got {top[0][0]}."
+)
+
+assert filtered_search(vectors, metadata, vectors[0], lambda m: m["lang"] == "fr", k=3) == [], (
+    "When nothing matches the predicate, return an empty list."
+)
+
+# k larger than the matching set should not crash.
+everything = filtered_search(vectors, metadata, vectors[0], lambda m: True, k=99)
+assert len(everything) == 10, f"With k above the size, return everything — got {len(everything)}."`}
+/>
+
+<Exercise
+  id="rag-index-ex2"
+  title="Exercise 2"
+  brief="Write <code>save_index</code> and <code>load_index</code>: persist vectors, records and a manifest, and on load refuse a directory whose counts or dimensions disagree."
+  code={`import json
+import numpy as np
+from pathlib import Path
+
+def save_index(directory, model, vectors, records):
+    # Write vectors.npy, records.jsonl (one JSON object per line) and
+    # manifest.json holding model, dimensions and count.
+    ...
+
+
+def load_index(directory):
+    # Return (manifest, vectors, records).
+    # Raise ValueError if the record count or the dimension disagrees
+    # with the manifest.
+    ...
+
+
+rng = np.random.default_rng(0)
+vectors = rng.normal(size=(3, 5)).astype(np.float32)
+records = [{"chunk_id": f"c{i}", "text": f"chunk {i}"} for i in range(3)]
+
+save_index("store", "voyage-3", vectors, records)
+manifest, loaded, restored = load_index("store")
+print(manifest)
+print(np.array_equal(vectors, loaded), len(restored))`}
+  hint="np.save / np.load for the array, one json.dumps per line for the records, and two comparisons against the manifest on load."
+  solution={`import json
+import numpy as np
+from pathlib import Path
+
+def save_index(directory, model, vectors, records):
+    path = Path(directory)
+    path.mkdir(parents=True, exist_ok=True)
+    np.save(path / "vectors.npy", vectors)
+    with open(path / "records.jsonl", "w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\\n")
+    (path / "manifest.json").write_text(json.dumps({
+        "model": model,
+        "dimensions": int(vectors.shape[1]),
+        "count": int(vectors.shape[0]),
+    }))
+
+
+def load_index(directory):
+    path = Path(directory)
+    manifest = json.loads((path / "manifest.json").read_text())
+    vectors = np.load(path / "vectors.npy")
+    with open(path / "records.jsonl", encoding="utf-8") as handle:
+        records = [json.loads(line) for line in handle if line.strip()]
+    if len(records) != manifest["count"] or vectors.shape[0] != manifest["count"]:
+        raise ValueError("vectors and records are out of step with the manifest")
+    if vectors.shape[1] != manifest["dimensions"]:
+        raise ValueError("vector width does not match the manifest")
+    return manifest, vectors, records
+
+
+rng = np.random.default_rng(0)
+vectors = rng.normal(size=(3, 5)).astype(np.float32)
+records = [{"chunk_id": f"c{i}", "text": f"chunk {i}"} for i in range(3)]
+
+save_index("store", "voyage-3", vectors, records)
+manifest, loaded, restored = load_index("store")
+print(manifest)
+print(np.array_equal(vectors, loaded), len(restored))`}
+  tests={`import json
+import numpy as np
+from pathlib import Path
+
+rng = np.random.default_rng(1)
+vectors = rng.normal(size=(4, 6)).astype(np.float32)
+records = [{"chunk_id": f"x{i}", "text": f"body {i}"} for i in range(4)]
+
+save_index("roundtrip", "test-model", vectors, records)
+
+for name in ["vectors.npy", "records.jsonl", "manifest.json"]:
+    assert Path("roundtrip", name).exists(), f"{name} was not written."
+
+manifest, loaded, restored = load_index("roundtrip")
+assert manifest["model"] == "test-model", f"The model must be recorded, got {manifest!r}."
+assert manifest["dimensions"] == 6 and manifest["count"] == 4, f"Got {manifest!r}."
+assert np.array_equal(loaded, vectors), "The vectors must round-trip exactly."
+assert restored == records, f"The records must round-trip exactly, got {restored!r}."
+
+# One record per line.
+lines = [l for l in Path("roundtrip/records.jsonl").read_text().splitlines() if l.strip()]
+assert len(lines) == 4, f"records.jsonl should hold one object per line, found {len(lines)}."
+assert json.loads(lines[0])["chunk_id"] == "x0", "Each line must parse on its own."
+
+# A corrupted pairing must be refused rather than silently mis-aligned.
+Path("roundtrip/records.jsonl").write_text(json.dumps(records[0]) + "\\n")
+try:
+    load_index("roundtrip")
+except ValueError:
+    pass
+else:
+    raise AssertionError("A record count that disagrees with the manifest must raise ValueError.")`}
+/>
+
+<Quiz
+  question="Why is post-filtering an approximate index dangerous?"
+  choices={[
+    { text: "The approximate search returns k neighbours before the filter runs, so a selective filter can leave nothing", correct: true, why: "The good matches that satisfy your filter may sit just outside the retrieved set, and you get an empty result rather than a worse one — which looks like missing data." },
+    { text: "Filtering after search is slower", why: "It is usually faster; the problem is that it returns the wrong answers." },
+    { text: "Approximate indexes cannot store metadata", why: "They can; the issue is the order of the two operations." },
+    { text: "It corrupts the index", why: "Nothing is written — only the results are wrong." },
+  ]}
+/>
+
+<Quiz
+  question="You have 60,000 chunks. What should you reach for?"
+  choices={[
+    { text: "A NumPy array and a JSONL file — exact search, a few milliseconds, nothing to operate", correct: true, why: "At that scale the index is under 200 MB and brute force is exact and fast; the effort belongs in chunking and evaluation instead." },
+    { text: "A distributed vector database with HNSW indexing", why: "You would trade exact results and zero operations for recall loss and a service to run, buying nothing at this size." },
+    { text: "Approximate search, to keep latency predictable", why: "Exact latency here is already a few milliseconds and perfectly predictable." },
+    { text: "Re-chunking to reduce the count below 10,000", why: "Larger chunks would hurt retrieval precision to solve a problem you do not have." },
+  ]}
+/>
+
+## Recap
+
+- An index is unit vectors, parallel metadata and a dot product. Exact search handles ~100k
+  vectors comfortably.
+- Apply a similarity floor, or you always return k results however irrelevant.
+- **Pre-filter**, then search. Post-filtering an approximate index returns nothing when the filter
+  is selective.
+- Persist vectors as `.npy`, records as JSONL, and a manifest carrying the model and dimensions so
+  the compatibility check survives a restart.
+- Delete with a tombstone mask and compact offline; rebuilding the array per delete invalidates
+  every position.
+- Approximate search trades recall for speed. Measure the recall — never assume it.

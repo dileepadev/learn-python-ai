@@ -97,17 +97,8 @@ export const MODULES: Module[] = [
     description:
       "Give a model access to knowledge it was never trained on. Chunking strategies, embeddings, vector indexes, hybrid and re-ranked retrieval, and how to evaluate whether the answer was actually grounded.",
     level: "expert",
-    status: "planned",
+    status: "published",
     icon: "search",
-    plannedLessons: [
-      "Embeddings and vector similarity",
-      "Chunking strategies that survive contact with real documents",
-      "Building a vector index",
-      "Hybrid search: dense plus keyword",
-      "Re-ranking and context assembly",
-      "A complete RAG pipeline",
-      "Measuring groundedness and retrieval quality",
-    ],
   },
   {
     slug: "production-ai",
