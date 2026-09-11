@@ -57,7 +57,7 @@ wrong, add a `print` and find out how far execution actually got.
 Python is strict about syntax. Leave off a closing parenthesis and it refuses to run *any* of
 the file — not even the lines before the mistake.
 
-<Run id="f-hello-4" code={`print("this line is fine")
+<Run id="f-hello-4" raises="SyntaxError" code={`print("this line is fine")
 print("this one is missing something"`} />
 
 Read the error from the bottom up. The last line names the problem —
