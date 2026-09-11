@@ -1,0 +1,662 @@
+---
+title: Tool use and the function-calling loop
+description: Give the model hands — define tools, run the request/execute/return loop, handle parallel calls and failures, and write descriptions the model can actually act on.
+module: llm-engineering
+order: 5
+level: advanced
+minutes: 22
+objectives:
+  - Define a tool with a name, description and input schema
+  - Run the loop until the model stops asking for tools
+  - Return every tool result in one user message, with matching ids
+  - Report a failed tool as a result rather than dropping it
+  - Write tool descriptions that change the model's behaviour
+---
+
+A model cannot look anything up or change anything. Tool use is the protocol that fixes that: you
+describe what is available, the model asks for a call, **your code** runs it, and you send the
+result back. The model never executes anything.
+
+## A tool definition
+
+<Run id="llm-tool-1" code={`import json
+
+TOOLS = [
+    {
+        "name": "search_documents",
+        "description": (
+            "Search the internal documentation index and return the most relevant "
+            "passages. Use this whenever the user asks about product behaviour, "
+            "configuration or API details. Do not use it for general knowledge."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search terms. Use the user's own words where possible.",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "How many passages to return. Default 3, maximum 10.",
+                    "minimum": 1,
+                    "maximum": 10,
+                },
+            },
+            "required": ["query"],
+        },
+    },
+]
+
+print(json.dumps(TOOLS[0], indent=2)[:400] + " ...")
+print()
+print("tools sent with the request:", [t["name"] for t in TOOLS])`} />
+
+Three fields matter, and the second matters most:
+
+- **`name`** — how the model refers to it, and how you dispatch.
+- **`description`** — when to use it, when not to, and what it returns. This is prompt
+  engineering, and it is where most tool bugs actually live.
+- **`input_schema`** — JSON Schema. Every property's `description` is read by the model too.
+
+<Callout type="tip">
+Write the description for a new colleague who has never seen your system. "Searches documents" is
+useless; "Search the internal documentation index… Do not use it for general knowledge" tells the
+model both when to reach for it and when to leave it alone. Most "the model called the wrong tool"
+problems are description problems.
+</Callout>
+
+## The loop
+
+The model replies with `stop_reason: "tool_use"` and one or more `tool_use` blocks. You run them,
+append the results, and call again — until it stops asking.
+
+<Run id="llm-tool-2" code={`from types import SimpleNamespace
+
+DOCUMENTS = {
+    "chunking": "Use 10-20% overlap so sentences are not cut in half.",
+    "embeddings": "Store embeddings as float32; it halves memory and loses nothing.",
+}
+
+def search_documents(query, top_k=3):
+    hits = [text for key, text in DOCUMENTS.items() if key in query.lower()]
+    return "\\n".join(hits[:top_k]) or "No matching passages."
+
+REGISTRY = {"search_documents": search_documents}
+
+TOOLS = [{
+    "name": "search_documents",
+    "description": "Search the internal documentation index.",
+    "input_schema": {"type": "object",
+                     "properties": {"query": {"type": "string"},
+                                    "top_k": {"type": "integer"}},
+                     "required": ["query"]},
+}]
+
+class RecordedClient:
+    """Replays a recorded conversation: first a tool call, then a final answer."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.requests = []
+
+    def create(self, **request):
+        self.requests.append(request)
+        return self.script.pop(0)
+
+script = [
+    SimpleNamespace(
+        stop_reason="tool_use",
+        content=[
+            SimpleNamespace(type="text", text="Let me look that up."),
+            SimpleNamespace(type="tool_use", id="toolu_01A", name="search_documents",
+                            input={"query": "chunking overlap", "top_k": 2}),
+        ],
+    ),
+    SimpleNamespace(
+        stop_reason="end_turn",
+        content=[SimpleNamespace(type="text", text="Use an overlap of 10-20%.")],
+    ),
+]
+
+client = RecordedClient(script)
+messages = [{"role": "user", "content": "What overlap should I use when chunking?"}]
+
+while True:
+    response = client.create(model="claude-opus-5", max_tokens=16000,
+                             tools=TOOLS, messages=messages)
+
+    messages.append({"role": "assistant", "content": response.content})
+
+    if response.stop_reason != "tool_use":
+        break
+
+    results = []
+    for block in response.content:
+        if block.type != "tool_use":
+            continue
+        print(f"calling {block.name}({block.input})")
+        output = REGISTRY[block.name](**block.input)
+        results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+
+    messages.append({"role": "user", "content": results})
+
+print()
+print("answer:", "".join(b.text for b in response.content if b.type == "text"))
+print("round trips:", len(client.requests))`} />
+
+Two rules in that loop are not optional:
+
+- The **assistant turn is appended whole**, `tool_use` blocks included. Drop them and the next
+  request has results referring to a call the conversation no longer contains.
+- Each `tool_result` carries the **`tool_use_id` of the call it answers**. The model matches on
+  that id, not on order.
+
+## Parallel calls
+
+One assistant message can contain several `tool_use` blocks. Run them, and return **all** the
+results in **one** user message:
+
+<Run id="llm-tool-3" code={`from types import SimpleNamespace
+
+def get_weather(city):
+    return f"18C and cloudy in {city}"
+
+def get_time(city):
+    return f"14:30 in {city}"
+
+REGISTRY = {"get_weather": get_weather, "get_time": get_time}
+
+response = SimpleNamespace(
+    stop_reason="tool_use",
+    content=[
+        SimpleNamespace(type="tool_use", id="toolu_01", name="get_weather", input={"city": "Colombo"}),
+        SimpleNamespace(type="tool_use", id="toolu_02", name="get_time", input={"city": "Colombo"}),
+        SimpleNamespace(type="tool_use", id="toolu_03", name="get_weather", input={"city": "London"}),
+    ],
+)
+
+results = []
+for block in response.content:
+    if block.type == "tool_use":
+        results.append({
+            "type": "tool_result",
+            "tool_use_id": block.id,
+            "content": REGISTRY[block.name](**block.input),
+        })
+
+# Correct: one user message carrying every result.
+one_message = {"role": "user", "content": results}
+print("results in one message:", len(one_message["content"]))
+for result in one_message["content"]:
+    print(f"  {result['tool_use_id']}: {result['content']}")
+
+print()
+print("wrong shape:", [{"role": "user", "content": [r]} for r in results][:1], "... (one message each)")`} />
+
+<Callout type="warning">
+Splitting the results across several user messages is accepted by the API and quietly teaches the
+model to stop making parallel calls — every later turn becomes sequential and slower. One message,
+every result.
+</Callout>
+
+## When a tool fails
+
+Return the failure as a result with `is_error: true`. Do not drop it, and do not let the exception
+escape the loop:
+
+<Run id="llm-tool-4" code={`from types import SimpleNamespace
+
+def lookup_order(order_id):
+    if not order_id.startswith("ord_"):
+        raise ValueError(f"{order_id!r} is not an order id")
+    return f"Order {order_id}: shipped"
+
+REGISTRY = {"lookup_order": lookup_order}
+
+def run_tool(block):
+    try:
+        return {
+            "type": "tool_result",
+            "tool_use_id": block.id,
+            "content": REGISTRY[block.name](**block.input),
+        }
+    except KeyError:
+        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                "content": f"No tool named {block.name!r}."}
+    except Exception as error:
+        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                "content": f"{type(error).__name__}: {error}"}
+
+blocks = [
+    SimpleNamespace(type="tool_use", id="t1", name="lookup_order", input={"order_id": "ord_42"}),
+    SimpleNamespace(type="tool_use", id="t2", name="lookup_order", input={"order_id": "42"}),
+    SimpleNamespace(type="tool_use", id="t3", name="delete_everything", input={}),
+]
+
+for block in blocks:
+    result = run_tool(block)
+    marker = "error" if result.get("is_error") else "ok   "
+    print(f"{marker} {result['tool_use_id']}: {result['content']}")`} />
+
+An error result is information: the model can correct the argument and try again. A dropped
+result is a conversation the model cannot continue, and a raised exception is an outage.
+
+<Callout type="ai" title="Why this matters for AI">
+Everything that makes an LLM useful beyond text generation goes through this loop. Retrieval is a
+tool. Running code is a tool. Reading a file, filing a ticket, querying a database — all tools.
+The agent loop in the next lesson is this loop with a termination policy, and MCP is a standard
+way of discovering tools you did not write. Get the id matching, the single results message and
+the error handling right once, and every later system inherits it.
+</Callout>
+
+## A complete runner
+
+<Run id="llm-tool-5" code={`from types import SimpleNamespace
+
+TOOLS = [
+    {"name": "search", "description": "Search the docs index.",
+     "input_schema": {"type": "object",
+                      "properties": {"query": {"type": "string"}},
+                      "required": ["query"]}},
+    {"name": "word_count", "description": "Count words in a passage.",
+     "input_schema": {"type": "object",
+                      "properties": {"text": {"type": "string"}},
+                      "required": ["text"]}},
+]
+
+DOCUMENTS = {"chunking": "Use 10-20% overlap so sentences are not cut in half."}
+
+REGISTRY = {
+    "search": lambda query: DOCUMENTS.get(query.strip().lower(), "No match."),
+    "word_count": lambda text: str(len(text.split())),
+}
+
+class RecordedClient:
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = 0
+
+    def create(self, **request):
+        self.calls += 1
+        return self.script.pop(0)
+
+def run_conversation(client, tools, question, max_rounds=8):
+    messages = [{"role": "user", "content": question}]
+
+    for _ in range(max_rounds):
+        response = client.create(model="claude-opus-5", max_tokens=16000,
+                                 tools=tools, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason != "tool_use":
+            return "".join(b.text for b in response.content if b.type == "text"), messages
+
+        results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            try:
+                content = REGISTRY[block.name](**block.input)
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": content})
+            except Exception as error:
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "is_error": True, "content": f"{type(error).__name__}: {error}"})
+        messages.append({"role": "user", "content": results})
+
+    raise RuntimeError(f"still calling tools after {max_rounds} rounds")
+
+script = [
+    SimpleNamespace(stop_reason="tool_use", content=[
+        SimpleNamespace(type="tool_use", id="t1", name="search", input={"query": "chunking"}),
+    ]),
+    SimpleNamespace(stop_reason="tool_use", content=[
+        SimpleNamespace(type="tool_use", id="t2", name="word_count",
+                        input={"text": "Use 10-20% overlap so sentences are not cut in half."}),
+    ]),
+    SimpleNamespace(stop_reason="end_turn", content=[
+        SimpleNamespace(type="text", text="The guidance is 10-20% overlap (11 words)."),
+    ]),
+]
+
+answer, transcript = run_conversation(RecordedClient(script), TOOLS, "What does the doc say about chunking?")
+print(answer)
+print()
+print("turns in the transcript:", len(transcript))
+def kind_of(block):
+    # Assistant blocks are objects; the tool results we built are dicts.
+    return block["type"] if isinstance(block, dict) else block.type
+
+for turn in transcript:
+    content = turn["content"]
+    kinds = content if isinstance(content, str) else [kind_of(b) for b in content]
+    print(f"  {turn['role']:9} {kinds}")`} />
+
+Note `max_rounds`. A loop with no ceiling is an unbounded bill, and a model that misunderstands a
+tool can ask for it repeatedly.
+
+## Letting the SDK drive
+
+For an ordinary custom-tool agent the SDK will run the loop. Tools become decorated functions and
+the schema is derived from the signature and docstring:
+
+```python
+import anthropic
+from anthropic import beta_tool
+
+client = anthropic.Anthropic()
+
+@beta_tool
+def search_documents(query: str, top_k: int = 3) -> str:
+    """Search the internal documentation index.
+
+    Args:
+        query: The search terms, in the user's own words.
+        top_k: How many passages to return.
+    """
+    return "\n".join(find(query)[:top_k])
+
+runner = client.beta.messages.tool_runner(
+    model="claude-opus-5",
+    max_tokens=16000,
+    tools=[search_documents],
+    messages=[{"role": "user", "content": "What overlap should I use when chunking?"}],
+)
+
+for message in runner:
+    print(message.stop_reason)
+```
+
+The runner is a beta helper. Write the manual loop when you need control it does not expose — a
+custom transport, or a termination policy of your own — and the runner otherwise.
+
+<Callout type="warning">
+`block.input` arrives as a parsed dictionary. Never match on its serialised text: escaping of
+Unicode and forward slashes varies between models, so `'"path": "/tmp"' in raw` is a bug waiting
+for a model upgrade. Read the dictionary.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="llm-tool-ex1"
+  title="Exercise 1"
+  brief="Write <code>execute_tools(blocks, registry)</code>: one <code>tool_result</code> per <code>tool_use</code> block, with <code>is_error</code> set when the call fails or the tool is unknown."
+  code={`from types import SimpleNamespace
+
+def execute_tools(blocks, registry):
+    # For each block whose .type is "tool_use", call registry[block.name](**block.input)
+    # and build {"type": "tool_result", "tool_use_id": ..., "content": ...}.
+    # On an unknown tool or any exception, add "is_error": True and put the
+    # message in content. Ignore blocks that are not tool_use.
+    ...
+
+
+registry = {
+    "add": lambda a, b: str(a + b),
+    "explode": lambda: (_ for _ in ()).throw(ValueError("boom")),
+}
+
+blocks = [
+    SimpleNamespace(type="text", text="thinking out loud"),
+    SimpleNamespace(type="tool_use", id="t1", name="add", input={"a": 2, "b": 3}),
+    SimpleNamespace(type="tool_use", id="t2", name="explode", input={}),
+    SimpleNamespace(type="tool_use", id="t3", name="missing", input={}),
+]
+
+for result in execute_tools(blocks, registry):
+    print(result)`}
+  hint="Loop the blocks, skip anything that is not tool_use, and wrap the call in try/except — catching KeyError for the unknown name and Exception for a failure inside the tool."
+  solution={`from types import SimpleNamespace
+
+def execute_tools(blocks, registry):
+    results = []
+    for block in blocks:
+        if block.type != "tool_use":
+            continue
+        if block.name not in registry:
+            results.append({"type": "tool_result", "tool_use_id": block.id,
+                            "is_error": True, "content": f"No tool named {block.name!r}."})
+            continue
+        try:
+            content = registry[block.name](**block.input)
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": content})
+        except Exception as error:
+            results.append({"type": "tool_result", "tool_use_id": block.id,
+                            "is_error": True, "content": f"{type(error).__name__}: {error}"})
+    return results
+
+
+registry = {
+    "add": lambda a, b: str(a + b),
+    "explode": lambda: (_ for _ in ()).throw(ValueError("boom")),
+}
+
+blocks = [
+    SimpleNamespace(type="text", text="thinking out loud"),
+    SimpleNamespace(type="tool_use", id="t1", name="add", input={"a": 2, "b": 3}),
+    SimpleNamespace(type="tool_use", id="t2", name="explode", input={}),
+    SimpleNamespace(type="tool_use", id="t3", name="missing", input={}),
+]
+
+for result in execute_tools(blocks, registry):
+    print(result)`}
+  tests={`from types import SimpleNamespace
+
+registry = {
+    "add": lambda a, b: str(a + b),
+    "explode": lambda: (_ for _ in ()).throw(ValueError("boom")),
+}
+blocks = [
+    SimpleNamespace(type="text", text="thinking out loud"),
+    SimpleNamespace(type="tool_use", id="t1", name="add", input={"a": 2, "b": 3}),
+    SimpleNamespace(type="tool_use", id="t2", name="explode", input={}),
+    SimpleNamespace(type="tool_use", id="t3", name="missing", input={}),
+]
+
+results = execute_tools(blocks, registry)
+assert isinstance(results, list), f"Return a list, got {type(results).__name__}."
+assert len(results) == 3, (
+    f"One result per tool_use block, and the text block ignored — expected 3, got {len(results)}."
+)
+assert [r["tool_use_id"] for r in results] == ["t1", "t2", "t3"], (
+    f"Ids must match the calls they answer, in order. Got {[r['tool_use_id'] for r in results]}."
+)
+assert all(r["type"] == "tool_result" for r in results), "Every entry is a tool_result block."
+
+assert results[0]["content"] == "5", f"add(2, 3) should give '5', got {results[0]['content']!r}."
+assert not results[0].get("is_error"), "A successful call is not an error."
+
+assert results[1].get("is_error") is True, "A tool that raises must be reported with is_error."
+assert "boom" in results[1]["content"], (
+    f"Put the failure message in content so the model can react. Got {results[1]['content']!r}."
+)
+
+assert results[2].get("is_error") is True, "An unknown tool name must be reported, not dropped."
+
+# Nothing may escape: a raising tool must not take the loop down.
+only_bad = execute_tools([SimpleNamespace(type="tool_use", id="x", name="explode", input={})], registry)
+assert len(only_bad) == 1 and only_bad[0].get("is_error"), (
+    "Even when every call fails you must return a result for each one."
+)`}
+/>
+
+<Exercise
+  id="llm-tool-ex2"
+  title="Exercise 2"
+  brief="Write <code>run_loop(client, registry, question, max_rounds=5)</code>: call, append the whole assistant turn, execute tools into one user message, and stop when <code>stop_reason</code> is not <code>tool_use</code>. Return the final text."
+  code={`from types import SimpleNamespace
+
+def run_loop(client, registry, question, max_rounds=5):
+    # messages starts with the question as a user turn.
+    # Each round: client.create(...), append the assistant content whole,
+    # stop if stop_reason != "tool_use", otherwise execute every tool_use
+    # block and append ALL results as one user message.
+    # Raise RuntimeError if max_rounds is exhausted.
+    ...
+
+
+class ScriptedClient:
+    def __init__(self, script):
+        self.script = list(script)
+        self.requests = []
+
+    def create(self, **request):
+        self.requests.append(request)
+        return self.script.pop(0)
+
+
+registry = {"double": lambda n: str(n * 2)}
+client = ScriptedClient([
+    SimpleNamespace(stop_reason="tool_use", content=[
+        SimpleNamespace(type="tool_use", id="a", name="double", input={"n": 21}),
+    ]),
+    SimpleNamespace(stop_reason="end_turn", content=[
+        SimpleNamespace(type="text", text="It is 42."),
+    ]),
+])
+
+print(run_loop(client, registry, "What is 21 doubled?"))
+print("requests:", len(client.requests))`}
+  hint="A for loop over range(max_rounds). Build the results list inside it and append one {'role': 'user', 'content': results} message after the loop over blocks."
+  solution={`from types import SimpleNamespace
+
+def run_loop(client, registry, question, max_rounds=5):
+    messages = [{"role": "user", "content": question}]
+
+    for _ in range(max_rounds):
+        response = client.create(model="claude-opus-5", max_tokens=16000, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason != "tool_use":
+            return "".join(b.text for b in response.content if b.type == "text")
+
+        results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            try:
+                content = registry[block.name](**block.input)
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": content})
+            except Exception as error:
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "is_error": True, "content": str(error)})
+        messages.append({"role": "user", "content": results})
+
+    raise RuntimeError(f"still calling tools after {max_rounds} rounds")
+
+
+class ScriptedClient:
+    def __init__(self, script):
+        self.script = list(script)
+        self.requests = []
+
+    def create(self, **request):
+        self.requests.append(request)
+        return self.script.pop(0)
+
+
+registry = {"double": lambda n: str(n * 2)}
+client = ScriptedClient([
+    SimpleNamespace(stop_reason="tool_use", content=[
+        SimpleNamespace(type="tool_use", id="a", name="double", input={"n": 21}),
+    ]),
+    SimpleNamespace(stop_reason="end_turn", content=[
+        SimpleNamespace(type="text", text="It is 42."),
+    ]),
+])
+
+print(run_loop(client, registry, "What is 21 doubled?"))
+print("requests:", len(client.requests))`}
+  tests={`from types import SimpleNamespace
+
+class ScriptedClient:
+    def __init__(self, script):
+        self.script = list(script)
+        self.requests = []
+    def create(self, **request):
+        self.requests.append({"messages": [dict(m) for m in request["messages"]]})
+        return self.script.pop(0)
+
+registry = {"double": lambda n: str(n * 2), "shout": lambda s: s.upper()}
+
+# One tool call, then an answer.
+client = ScriptedClient([
+    SimpleNamespace(stop_reason="tool_use", content=[
+        SimpleNamespace(type="tool_use", id="a", name="double", input={"n": 21})]),
+    SimpleNamespace(stop_reason="end_turn", content=[
+        SimpleNamespace(type="text", text="It is 42.")]),
+])
+assert run_loop(client, registry, "21 doubled?") == "It is 42.", "Return the final text."
+assert len(client.requests) == 2, f"One round trip per model turn — expected 2, got {len(client.requests)}."
+
+sent = client.requests[1]["messages"]
+assert sent[1]["role"] == "assistant", "The assistant turn must be appended before the results."
+assert sent[2]["role"] == "user", "Tool results go back as a user message."
+assert isinstance(sent[2]["content"], list) and sent[2]["content"][0]["tool_use_id"] == "a", (
+    f"The result must carry the id of the call it answers. Got {sent[2]['content']!r}."
+)
+
+# Two parallel calls must come back in ONE user message.
+client = ScriptedClient([
+    SimpleNamespace(stop_reason="tool_use", content=[
+        SimpleNamespace(type="tool_use", id="a", name="double", input={"n": 1}),
+        SimpleNamespace(type="tool_use", id="b", name="shout", input={"s": "hi"})]),
+    SimpleNamespace(stop_reason="end_turn", content=[
+        SimpleNamespace(type="text", text="done")]),
+])
+run_loop(client, registry, "two things")
+results_message = client.requests[1]["messages"][2]
+assert len(results_message["content"]) == 2, (
+    f"Both results belong in one user message, got {len(results_message['content'])} in it."
+)
+assert [r["tool_use_id"] for r in results_message["content"]] == ["a", "b"], "Ids in call order."
+
+# An endless tool-caller must be stopped.
+endless = ScriptedClient([
+    SimpleNamespace(stop_reason="tool_use", content=[
+        SimpleNamespace(type="tool_use", id=str(i), name="double", input={"n": 1})])
+    for i in range(10)
+])
+try:
+    run_loop(endless, registry, "loop forever", max_rounds=3)
+except RuntimeError:
+    pass
+else:
+    raise AssertionError("Exhausting max_rounds should raise RuntimeError, not loop forever.")
+assert len(endless.requests) == 3, (
+    f"max_rounds=3 means at most 3 requests, got {len(endless.requests)}."
+)`}
+/>
+
+<Quiz
+  question="Why must every tool_result carry the tool_use_id of the call it answers?"
+  choices={[
+    { text: "The model pairs results to calls by id, not by position", correct: true, why: "With parallel calls the ordering carries no meaning; a mismatched or missing id makes the results unattributable." },
+    { text: "The id is only for your own logging", why: "It is part of the protocol — the API rejects results whose ids do not match outstanding calls." },
+    { text: "It tells the model which tool to call next", why: "It identifies a call already made, not one to come." },
+    { text: "It is optional when there is only one tool", why: "It is required on every tool_result, however many there are." },
+  ]}
+/>
+
+<Quiz
+  question="A tool raises an exception. What should the loop send back?"
+  choices={[
+    { text: "A tool_result with is_error true and the message as content, so the model can correct itself", correct: true, why: "The failure is information — often a bad argument the model can fix on the next turn. Dropping it leaves a call unanswered; raising it ends the conversation." },
+    { text: "Nothing — omit the result for the failed call", why: "The conversation then contains a call with no answer, which the API rejects and the model cannot continue from." },
+    { text: "Let the exception propagate and fail the request", why: "That turns a recoverable argument mistake into an outage." },
+    { text: "A tool_result containing an empty string", why: "The model then believes the tool succeeded and returned nothing, and reasons from that." },
+  ]}
+/>
+
+## Recap
+
+- A tool is a `name`, a `description` and an `input_schema` — and the description is where the
+  model's behaviour is actually decided.
+- The loop: call, append the **whole** assistant turn, execute every `tool_use` block, send the
+  results, repeat until `stop_reason` is no longer `"tool_use"`.
+- Every `tool_result` needs the matching `tool_use_id`, and **all** results go in **one** user
+  message.
+- Report failures with `is_error: true` rather than dropping them or raising.
+- Always bound the loop — an unbounded one is an unbounded bill.
+- Read `block.input` as a dictionary; never match on its serialised text.

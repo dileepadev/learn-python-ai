@@ -1,0 +1,533 @@
+---
+title: Structured output and schema validation with Pydantic
+description: Stop parsing prose. Declare the shape you need, have the API constrain the model to it, and validate what comes back — because a model's JSON is still untrusted input.
+module: llm-engineering
+order: 4
+level: advanced
+minutes: 20
+objectives:
+  - Define a schema with Pydantic and validate data against it
+  - Read a ValidationError and act on it
+  - Constrain fields, nest models and add custom validators
+  - Generate a JSON schema and use it to constrain the model's output
+  - Write a repair loop for the cases that still fail
+---
+
+Asking a model for JSON and hoping is not engineering. Pydantic lets you declare the shape you
+need, the API can constrain the model to produce it, and validation catches whatever slips
+through. This lesson is fully runnable — Pydantic is available here.
+
+## A schema
+
+<Run id="llm-struct-1" code={`from pydantic import BaseModel
+
+class Ticket(BaseModel):
+    category: str
+    urgency: int
+    summary: str
+
+ticket = Ticket(category="billing", urgency=3, summary="Charged twice in March")
+print(ticket)
+print(ticket.category, ticket.urgency)
+print()
+print("as a dict:", ticket.model_dump())
+print("as JSON:  ", ticket.model_dump_json())`} />
+
+Pydantic coerces where it is safe and refuses where it is not:
+
+<Run id="llm-struct-2" code={`from pydantic import BaseModel, ValidationError
+
+class Ticket(BaseModel):
+    category: str
+    urgency: int
+    summary: str
+
+# A numeric string becomes an int — the model often returns "3" rather than 3.
+print(Ticket(category="bug", urgency="3", summary="crash").urgency, "<- coerced from a string")
+
+try:
+    Ticket(category="bug", urgency="very high", summary="crash")
+except ValidationError as error:
+    print()
+    print("refused:")
+    for problem in error.errors():
+        print(f"  field {problem['loc']}: {problem['msg']}")`} />
+
+## Parsing what the model returned
+
+The realistic entry point is a JSON string of unknown quality:
+
+<Run id="llm-struct-3" code={`from pydantic import BaseModel, ValidationError
+
+class Ticket(BaseModel):
+    category: str
+    urgency: int
+    summary: str
+
+replies = [
+    '{"category": "billing", "urgency": 2, "summary": "Double charge"}',
+    '{"category": "bug", "urgency": "4", "summary": "Crash on start"}',
+    '{"category": "bug", "summary": "Missing urgency"}',
+    'Here is the JSON you asked for: {"category": "docs"}',
+]
+
+for reply in replies:
+    try:
+        print("ok:  ", Ticket.model_validate_json(reply))
+    except ValidationError as error:
+        first = error.errors()[0]
+        print("bad: ", first["type"], "-", first["msg"])`} />
+
+The last two are the failures that matter. One is missing a required field; the other wrapped the
+JSON in prose, which is exactly what a model does when you ask nicely instead of constraining it.
+
+## Constraining fields
+
+Types alone are a weak contract. `Literal` pins a value to a set, `Field` adds bounds and a
+description, and both end up in the schema the model sees:
+
+<Run id="llm-struct-4" code={`from typing import Literal
+from pydantic import BaseModel, Field, ValidationError
+
+class Ticket(BaseModel):
+    category: Literal["billing", "bug", "feature_request", "docs", "other"]
+    urgency: int = Field(ge=1, le=5, description="1 is trivial, 5 is production down")
+    summary: str = Field(min_length=1, max_length=120)
+    customer_id: str | None = None
+
+print(Ticket(category="bug", urgency=5, summary="Production down"))
+print()
+
+for bad in [
+    {"category": "billinggg", "urgency": 3, "summary": "typo in the category"},
+    {"category": "bug", "urgency": 9, "summary": "out of range"},
+    {"category": "bug", "urgency": 3, "summary": ""},
+]:
+    try:
+        Ticket(**bad)
+    except ValidationError as error:
+        problem = error.errors()[0]
+        print(f"{str(problem['loc'][0]):12} {problem['msg']}")`} />
+
+<Callout type="tip">
+Write a `description` on every field. It is not documentation for you — it is sent to the model as
+part of the schema, and it is the cheapest way to explain what "urgency 5" actually means.
+</Callout>
+
+## Nesting and lists
+
+<Run id="llm-struct-5" code={`from typing import Literal
+from pydantic import BaseModel, Field
+
+class Entity(BaseModel):
+    text: str
+    kind: Literal["person", "organisation", "product", "date"]
+
+class Extraction(BaseModel):
+    entities: list[Entity] = Field(default_factory=list)
+    language: str = "en"
+    confidence: float = Field(ge=0.0, le=1.0)
+
+payload = """
+{
+  "entities": [
+    {"text": "Dileepa", "kind": "person"},
+    {"text": "Anthropic", "kind": "organisation"},
+    {"text": "2026-03-01", "kind": "date"}
+  ],
+  "confidence": 0.86
+}
+"""
+
+extraction = Extraction.model_validate_json(payload)
+print(extraction.language, extraction.confidence)
+for entity in extraction.entities:
+    print(f"  {entity.kind:13} {entity.text}")
+
+print()
+print("people:", [e.text for e in extraction.entities if e.kind == "person"])`} />
+
+Note `default_factory=list` — the same mutable-default rule from module 2, enforced here by the
+library.
+
+## Custom validation
+
+Some rules are not expressible as a type. A validator runs after the field is parsed:
+
+<Run id="llm-struct-6" code={`from pydantic import BaseModel, Field, field_validator, model_validator, ValidationError
+
+class Answer(BaseModel):
+    text: str
+    citations: list[int] = Field(default_factory=list)
+    grounded: bool
+
+    @field_validator("citations")
+    @classmethod
+    def citations_must_be_positive(cls, value):
+        if any(number < 1 for number in value):
+            raise ValueError("chunk ids start at 1")
+        return value
+
+    @model_validator(mode="after")
+    def grounded_answers_cite_something(self):
+        if self.grounded and not self.citations:
+            raise ValueError("a grounded answer must cite at least one chunk")
+        return self
+
+print(Answer(text="Use 10-20% overlap.", citations=[2], grounded=True))
+print()
+
+for bad in [
+    {"text": "Use 10-20% overlap.", "citations": [0], "grounded": True},
+    {"text": "Probably fine.", "citations": [], "grounded": True},
+]:
+    try:
+        Answer(**bad)
+    except ValidationError as error:
+        print("refused:", error.errors()[0]["msg"])`} />
+
+<Callout type="ai" title="Why this matters for AI">
+That last validator is the one worth copying. A model that claims to be grounded but cites nothing
+is the single most common failure in a retrieval system, and it is invisible if you only check the
+JSON parses. Encode your *invariants* — not just the types — and you turn a plausible-looking
+hallucination into a caught exception at the boundary. Module 7 builds on exactly this.
+</Callout>
+
+## Constraining the model
+
+Pydantic can emit the JSON schema, and the API takes that schema and constrains generation to
+match it:
+
+<Run id="llm-struct-7" code={`import json
+from typing import Literal
+from pydantic import BaseModel, Field
+
+class Ticket(BaseModel):
+    category: Literal["billing", "bug", "feature_request", "docs", "other"]
+    urgency: int = Field(ge=1, le=5, description="1 is trivial, 5 is production down")
+    summary: str = Field(max_length=120)
+
+print(json.dumps(Ticket.model_json_schema(), indent=2))`} />
+
+On your own machine, the call that uses it:
+
+```python
+import anthropic
+from pydantic import BaseModel
+
+client = anthropic.Anthropic()
+
+class Ticket(BaseModel):
+    category: str
+    urgency: int
+    summary: str
+
+# messages.parse validates the response against the model for you.
+response = client.messages.parse(
+    model="claude-opus-5",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "I was charged twice in March"}],
+    output_config={"format": Ticket},
+)
+
+ticket = response.parsed_content      # already a Ticket instance
+print(ticket.category, ticket.urgency)
+```
+
+The lower-level form passes the schema directly on `messages.create`:
+
+```python
+response = client.messages.create(
+    model="claude-opus-5",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "I was charged twice in March"}],
+    output_config={
+        "format": {
+            "type": "json_schema",
+            "schema": Ticket.model_json_schema(),
+        }
+    },
+)
+```
+
+<Callout type="warning">
+It is `output_config={"format": ...}`. The older top-level `output_format` parameter is
+deprecated — if you have seen it in an example, that example predates the change. Structured
+output is also incompatible with citations on document blocks, which returns a 400.
+</Callout>
+
+The same constraint applies to tool arguments. `strict: true` on a tool definition guarantees the
+`input` validates against your schema:
+
+```python
+tools = [{
+    "name": "record_ticket",
+    "description": "Record a classified support ticket.",
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "category": {"type": "string", "enum": ["billing", "bug", "docs"]},
+            "urgency": {"type": "integer", "minimum": 1, "maximum": 5},
+        },
+        "required": ["category", "urgency"],
+        "additionalProperties": False,
+    },
+}]
+```
+
+`additionalProperties: false` and a complete `required` list are not optional with `strict` — the
+API rejects a schema without them.
+
+## Validate anyway
+
+Constrained generation makes malformed output rare, not impossible — and it says nothing about
+whether the *values* make sense. Validate at the boundary regardless:
+
+<Run id="llm-struct-8" code={`import json
+from pydantic import BaseModel, Field, ValidationError
+
+class Ticket(BaseModel):
+    category: str
+    urgency: int = Field(ge=1, le=5)
+    summary: str
+
+def parse_reply(raw):
+    """Return (ticket, None) or (None, a message telling the model what to fix)."""
+    try:
+        return Ticket.model_validate_json(raw), None
+    except ValidationError as error:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in item['loc'])}: {item['msg']}"
+            for item in error.errors()
+        )
+        return None, f"Your JSON did not validate. Fix these and reply with JSON only: {problems}"
+
+for raw in [
+    '{"category": "bug", "urgency": 2, "summary": "Crash"}',
+    '{"category": "bug", "urgency": 11, "summary": "Crash"}',
+    'not json at all',
+]:
+    ticket, repair = parse_reply(raw)
+    print("ok: " if ticket else "fix:", ticket or repair)`} />
+
+That second return value is the repair loop: send the validation error back as a user message and
+ask again. One retry fixes almost everything; a second is rarely worth it.
+
+<Run id="llm-struct-9" code={`from types import SimpleNamespace
+import json
+from pydantic import BaseModel, Field, ValidationError
+
+class Ticket(BaseModel):
+    category: str
+    urgency: int = Field(ge=1, le=5)
+    summary: str
+
+class RecordedClient:
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = 0
+
+    def create(self, **request):
+        self.calls += 1
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=self.replies.pop(0))],
+            stop_reason="end_turn",
+        )
+
+def extract(client, ticket_text, attempts=2):
+    messages = [{"role": "user", "content": ticket_text}]
+    for attempt in range(attempts):
+        response = client.create(model="claude-opus-5", max_tokens=512, messages=messages)
+        raw = "".join(b.text for b in response.content if b.type == "text")
+        try:
+            return Ticket.model_validate_json(raw)
+        except ValidationError as error:
+            if attempt == attempts - 1:
+                raise
+            problems = "; ".join(item["msg"] for item in error.errors())
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "user", "content": f"That failed validation: {problems}. Reply with JSON only."})
+    return None
+
+client = RecordedClient([
+    '{"category": "bug", "urgency": 11, "summary": "Crash on start"}',   # out of range
+    '{"category": "bug", "urgency": 5, "summary": "Crash on start"}',    # repaired
+])
+
+print(extract(client, "The app crashes every time I open it"))
+print("API calls used:", client.calls)`} />
+
+## Try it yourself
+
+<Exercise
+  id="llm-struct-ex1"
+  title="Exercise 1"
+  brief="Define <code>Review</code> with <code>sentiment</code> limited to positive/neutral/negative, <code>score</code> between 0 and 1, <code>topics</code> defaulting to an empty list, and an optional <code>reply</code>."
+  code={`from typing import Literal
+from pydantic import BaseModel, Field
+
+class Review(BaseModel):
+    # sentiment: one of "positive", "neutral", "negative"
+    # score:     a float from 0.0 to 1.0 inclusive
+    # topics:    a list of strings, empty by default
+    # reply:     a string or None, defaulting to None
+    ...
+
+
+print(Review(sentiment="positive", score=0.9))
+print(Review(sentiment="negative", score=0.1, topics=["latency"], reply="Sorry!"))`}
+  hint="Literal for sentiment, Field(ge=0.0, le=1.0) for score, Field(default_factory=list) for topics, and str | None = None for reply."
+  solution={`from typing import Literal
+from pydantic import BaseModel, Field
+
+class Review(BaseModel):
+    sentiment: Literal["positive", "neutral", "negative"]
+    score: float = Field(ge=0.0, le=1.0)
+    topics: list[str] = Field(default_factory=list)
+    reply: str | None = None
+
+
+print(Review(sentiment="positive", score=0.9))
+print(Review(sentiment="negative", score=0.1, topics=["latency"], reply="Sorry!"))`}
+  tests={`from pydantic import ValidationError
+
+good = Review(sentiment="positive", score=0.9)
+assert good.sentiment == "positive"
+assert good.topics == [], f"topics should default to an empty list, got {good.topics!r}."
+assert good.reply is None, f"reply should default to None, got {good.reply!r}."
+
+# Each instance needs its own list.
+a, b = Review(sentiment="neutral", score=0.5), Review(sentiment="neutral", score=0.5)
+a.topics.append("shared?")
+assert b.topics == [], "Use default_factory=list — a shared default list is the module 2 trap."
+
+for bad, why in [
+    ({"sentiment": "furious", "score": 0.5}, "sentiment must be one of the three literals"),
+    ({"sentiment": "positive", "score": 1.5}, "score above 1.0 must be refused"),
+    ({"sentiment": "positive", "score": -0.1}, "score below 0.0 must be refused"),
+    ({"score": 0.5}, "sentiment is required"),
+]:
+    try:
+        Review(**bad)
+    except ValidationError:
+        pass
+    else:
+        raise AssertionError(why)
+
+# Boundaries are inclusive.
+assert Review(sentiment="neutral", score=0.0).score == 0.0, "0.0 is a valid score."
+assert Review(sentiment="neutral", score=1.0).score == 1.0, "1.0 is a valid score."
+
+parsed = Review.model_validate_json('{"sentiment": "negative", "score": "0.25"}')
+assert parsed.score == 0.25, "A numeric string should coerce to a float."`}
+/>
+
+<Exercise
+  id="llm-struct-ex2"
+  title="Exercise 2"
+  brief="Write <code>parse_or_repair(raw)</code> returning <code>(review, None)</code> on success, or <code>(None, message)</code> where the message names every failing field."
+  code={`from typing import Literal
+from pydantic import BaseModel, Field, ValidationError
+
+class Review(BaseModel):
+    sentiment: Literal["positive", "neutral", "negative"]
+    score: float = Field(ge=0.0, le=1.0)
+
+
+def parse_or_repair(raw):
+    # On success return (review, None).
+    # On failure return (None, "..."), and the message must mention
+    # every field that failed.
+    ...
+
+
+for raw in ['{"sentiment": "positive", "score": 0.8}',
+            '{"sentiment": "furious", "score": 4}',
+            'not json']:
+    review, repair = parse_or_repair(raw)
+    print(review if review else repair)`}
+  hint="try Review.model_validate_json(raw) and return (review, None); on ValidationError build the message from error.errors(), joining each item's loc and msg."
+  solution={`from typing import Literal
+from pydantic import BaseModel, Field, ValidationError
+
+class Review(BaseModel):
+    sentiment: Literal["positive", "neutral", "negative"]
+    score: float = Field(ge=0.0, le=1.0)
+
+
+def parse_or_repair(raw):
+    try:
+        return Review.model_validate_json(raw), None
+    except ValidationError as error:
+        problems = "; ".join(
+            f"{'.'.join(str(part) for part in item['loc']) or 'payload'}: {item['msg']}"
+            for item in error.errors()
+        )
+        return None, f"Validation failed: {problems}"
+
+
+for raw in ['{"sentiment": "positive", "score": 0.8}',
+            '{"sentiment": "furious", "score": 4}',
+            'not json']:
+    review, repair = parse_or_repair(raw)
+    print(review if review else repair)`}
+  tests={`review, repair = parse_or_repair('{"sentiment": "positive", "score": 0.8}')
+assert repair is None, f"A valid payload should give no repair message, got {repair!r}."
+assert isinstance(review, Review), f"Expected a Review instance, got {type(review).__name__}."
+assert review.score == 0.8
+
+review, repair = parse_or_repair('{"sentiment": "furious", "score": 4}')
+assert review is None, "An invalid payload should not produce a Review."
+assert isinstance(repair, str) and repair, "Return a non-empty repair message."
+assert "sentiment" in repair, f"The message should name the sentiment field: {repair!r}"
+assert "score" in repair, (
+    f"Both fields failed, so both should be reported — a message naming only the first is "
+    f"half a repair instruction. Got: {repair!r}"
+)
+
+review, repair = parse_or_repair("not json")
+assert review is None and isinstance(repair, str) and repair, (
+    "Malformed JSON should come back as a repair message, not an exception."
+)
+
+# A missing field must be reported too.
+review, repair = parse_or_repair('{"sentiment": "neutral"}')
+assert review is None and "score" in repair, (
+    f"A missing required field should be named in the message. Got: {repair!r}"
+)`}
+/>
+
+<Quiz
+  question="The API constrained the output to your JSON schema. Why still validate with Pydantic?"
+  choices={[
+    { text: "A schema constrains the shape, not the meaning — and validators can encode invariants a schema cannot", correct: true, why: "\"grounded is true but citations is empty\" is schema-valid and wrong; validating at the boundary is what catches it." },
+    { text: "It does not — constrained output makes validation redundant", why: "It removes most parse failures, but not semantic nonsense, and treating model output as trusted is how bad data enters a pipeline." },
+    { text: "Pydantic is required to build the schema", why: "Useful, but you can write a schema by hand; the reason to validate is the return trip." },
+    { text: "Because the constraint only applies to the first response", why: "It applies to every constrained request; that is not the gap." },
+  ]}
+/>
+
+<Quiz
+  question="What does `strict: true` on a tool definition require, and what does it guarantee?"
+  choices={[
+    { text: "Requires additionalProperties: false and a complete required list; guarantees the tool input validates against the schema", correct: true, why: "Without those two the schema is rejected; with them you stop writing defensive parsing for every tool argument." },
+    { text: "Requires nothing, and guarantees the tool is always called", why: "Forcing a call is tool_choice, a different setting — and strict does have schema requirements." },
+    { text: "Requires a Pydantic model and guarantees type coercion", why: "The schema can come from anywhere, and nothing is coerced — it is constrained at generation time." },
+    { text: "Requires streaming to be enabled", why: "Streaming is unrelated to strict tool schemas." },
+  ]}
+/>
+
+## Recap
+
+- Declare the shape with Pydantic; `model_validate_json` turns an untrusted string into a typed
+  object or raises.
+- `Literal` pins a value set, `Field(ge=..., le=..., description=...)` bounds and documents, and
+  the descriptions reach the model.
+- Use `default_factory=list` for mutable defaults, and validators for the invariants a type
+  cannot express.
+- Constrain generation with `output_config={"format": ...}`, or let `client.messages.parse()`
+  validate for you. The old `output_format` parameter is deprecated.
+- `strict: true` on a tool needs `additionalProperties: false` and a full `required` list.
+- Validate anyway, and turn the validation error into a repair message. One retry is usually
+  enough.

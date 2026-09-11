@@ -1,0 +1,572 @@
+---
+title: Building an agent loop from first principles
+description: An agent is the tool loop plus a termination policy, a budget and an approval gate — and the hardest part is deciding not to build one.
+module: llm-engineering
+order: 6
+level: advanced
+minutes: 22
+objectives:
+  - State what makes a loop an agent, and when one is justified
+  - Add a termination policy, a budget and a round ceiling
+  - Gate destructive tools behind an approval step
+  - Log every step so a run can be explained afterwards
+  - Manage a history that grows on every turn
+---
+
+The last lesson's loop is already most of an agent. What is missing is everything that stops it:
+a budget, a ceiling, a way to finish, and a gate in front of anything irreversible.
+
+## Should you build one?
+
+<Run id="llm-agent-1" code={`CRITERIA = [
+    ("Complexity",
+     "Is the task multi-step and hard to specify fully in advance?",
+     "'Turn this design doc into a PR' — yes. 'Extract the title from this PDF' — no."),
+    ("Value",
+     "Does the outcome justify higher cost and latency?",
+     "An agent makes many model calls. A single call is cheaper and faster when it suffices."),
+    ("Viability",
+     "Is the model actually capable at this kind of task?",
+     "If a careful human with the same tools would struggle, an agent will too."),
+    ("Cost of error",
+     "Can mistakes be caught and undone?",
+     "Tests, review and rollback make errors survivable. Irreversible actions do not."),
+]
+
+for name, question, note in CRITERIA:
+    print(f"{name}\\n  {question}\\n  {note}\\n")
+
+print("A 'no' anywhere means stay at a simpler tier: one call, or a workflow you control.")`} />
+
+<Callout type="warning">
+Most tasks people reach for an agent to solve are workflows: a fixed sequence of steps where
+*your code* decides what happens next and the model does the language-shaped parts. A workflow is
+cheaper, faster, easier to test and far easier to debug. Reach for an agent only when the next
+step genuinely cannot be known in advance.
+</Callout>
+
+## The minimal agent
+
+A tool loop, plus a way to stop:
+
+<Run id="llm-agent-2" code={`from types import SimpleNamespace
+
+TOOLS = [
+    {"name": "search", "description": "Search the docs index.",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
+                      "required": ["query"]}},
+    {"name": "finish", "description": "Call this when you have the final answer.",
+     "input_schema": {"type": "object", "properties": {"answer": {"type": "string"}},
+                      "required": ["answer"]}},
+]
+
+INDEX = {
+    "chunking": "Use 10-20% overlap so sentences are not cut in half.",
+    "embeddings": "Store embeddings as float32.",
+}
+
+def search(query):
+    return INDEX.get(query.strip().lower(), "No match.")
+
+class ScriptedClient:
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = 0
+    def create(self, **request):
+        self.calls += 1
+        return self.script.pop(0)
+
+def agent(client, question, max_rounds=6):
+    messages = [{"role": "user", "content": question}]
+
+    for round_number in range(1, max_rounds + 1):
+        response = client.create(model="claude-opus-5", max_tokens=16000,
+                                 tools=TOOLS, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason != "tool_use":
+            return "".join(b.text for b in response.content if b.type == "text"), round_number
+
+        results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            if block.name == "finish":
+                return block.input["answer"], round_number
+            content = search(**block.input) if block.name == "search" else f"No tool {block.name!r}"
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": content})
+
+        messages.append({"role": "user", "content": results})
+
+    raise RuntimeError(f"no answer after {max_rounds} rounds")
+
+script = [
+    SimpleNamespace(stop_reason="tool_use", content=[
+        SimpleNamespace(type="tool_use", id="1", name="search", input={"query": "chunking"})]),
+    SimpleNamespace(stop_reason="tool_use", content=[
+        SimpleNamespace(type="tool_use", id="2", name="finish",
+                        input={"answer": "Use an overlap of 10-20%."})]),
+]
+
+answer, rounds = agent(ScriptedClient(script), "What overlap should I use?")
+print(answer)
+print("rounds:", rounds)`} />
+
+The `finish` tool is the termination policy. Without one, "done" is inferred from the model
+producing text instead of a tool call — which works, but gives you nothing structured to act on
+and no place to demand a citation or a confidence.
+
+## Budgets
+
+Rounds are one ceiling; tokens are the one that maps to money:
+
+<Run id="llm-agent-3" code={`from types import SimpleNamespace
+
+class Budget:
+    """Stops the loop on whichever limit is reached first."""
+
+    def __init__(self, max_rounds=8, max_tokens=50_000, max_usd=0.50):
+        self.max_rounds, self.max_tokens, self.max_usd = max_rounds, max_tokens, max_usd
+        self.rounds = self.input_tokens = self.output_tokens = 0
+
+    def record(self, usage):
+        self.rounds += 1
+        self.input_tokens += usage.input_tokens
+        self.output_tokens += usage.output_tokens
+
+    @property
+    def spent_usd(self):
+        return (self.input_tokens * 5.00 + self.output_tokens * 25.00) / 1_000_000
+
+    @property
+    def total_tokens(self):
+        return self.input_tokens + self.output_tokens
+
+    def exceeded(self):
+        if self.rounds >= self.max_rounds:
+            return f"round limit ({self.max_rounds})"
+        if self.total_tokens >= self.max_tokens:
+            return f"token limit ({self.max_tokens:,})"
+        if self.spent_usd >= self.max_usd:
+            return f"spend limit (\${self.max_usd:.2f})"
+        return None
+
+budget = Budget(max_rounds=4, max_tokens=30_000, max_usd=0.20)
+
+for round_number in range(1, 7):
+    # Each round resends a longer history, so input grows.
+    budget.record(SimpleNamespace(input_tokens=4000 * round_number, output_tokens=600))
+    stop = budget.exceeded()
+    print(f"round {round_number}: {budget.total_tokens:>7,} tokens  "
+          f"\${budget.spent_usd:.4f}  {stop or 'continue'}")
+    if stop:
+        break`} />
+
+<Callout type="ai" title="Why this matters for AI">
+The budget is not a nicety. An agent that misreads a tool result can call the same tool
+indefinitely, and because every round resends a longer history, the cost of round twenty is many
+times the cost of round one. A ceiling on rounds, tokens and spend — checked before each request,
+not after — is the difference between a bad afternoon and a bad invoice. Log the reason you
+stopped, too: "hit the round limit" and "the model finished" are completely different outcomes
+that look identical in a result table.
+</Callout>
+
+## Approval gates
+
+Anything irreversible goes behind a gate. The gate lives in **your** code, never in the prompt:
+
+<Run id="llm-agent-4" code={`from types import SimpleNamespace
+
+REQUIRES_APPROVAL = {"send_email", "delete_records", "issue_refund"}
+
+def approve(name, arguments, auto_approve):
+    """Stand-in for a human. Returns (allowed, reason)."""
+    if name not in REQUIRES_APPROVAL:
+        return True, "safe tool"
+    if name in auto_approve:
+        return True, "pre-approved for this run"
+    return False, "needs a human"
+
+def run_tool(block, auto_approve):
+    allowed, reason = approve(block.name, block.input, auto_approve)
+    if not allowed:
+        return {
+            "type": "tool_result",
+            "tool_use_id": block.id,
+            "is_error": True,
+            "content": (f"The operator declined to run {block.name}. "
+                        "Explain what you intended to do and stop."),
+        }
+    return {"type": "tool_result", "tool_use_id": block.id,
+            "content": f"ran {block.name} ({reason})"}
+
+blocks = [
+    SimpleNamespace(type="tool_use", id="a", name="search", input={"query": "refunds"}),
+    SimpleNamespace(type="tool_use", id="b", name="issue_refund", input={"order": "ord_9", "amount": 4000}),
+    SimpleNamespace(type="tool_use", id="c", name="send_email", input={"to": "user@example.com"}),
+]
+
+for block in blocks:
+    result = run_tool(block, auto_approve={"send_email"})
+    print(f"{block.name:14} {'DECLINED' if result.get('is_error') else 'ran'}: {result['content']}")`} />
+
+Note that a declined call still returns a `tool_result`. The model needs to know it was refused —
+otherwise it waits for an answer that never comes, or tries again.
+
+<Callout type="warning">
+Never rely on the system prompt to prevent a dangerous action. "Do not delete anything without
+asking" is a request, not a control. If a tool can do damage, the gate must be in the code path
+that executes it.
+</Callout>
+
+## Observability
+
+An agent that cannot be explained afterwards cannot be improved. Log every step as a structured
+record:
+
+<Run id="llm-agent-5" code={`from types import SimpleNamespace
+import json
+
+class Trace:
+    def __init__(self, run_id):
+        self.run_id = run_id
+        self.steps = []
+
+    def record(self, **fields):
+        self.steps.append({"run": self.run_id, "step": len(self.steps) + 1, **fields})
+
+    def dump(self):
+        for step in self.steps:
+            print(json.dumps(step))
+
+    def summary(self):
+        tools = [s["tool"] for s in self.steps if s.get("event") == "tool"]
+        return {
+            "steps": len(self.steps),
+            "tool_calls": len(tools),
+            "distinct_tools": sorted(set(tools)),
+            "outcome": self.steps[-1].get("outcome") if self.steps else None,
+        }
+
+trace = Trace("run-2026-03-01-17")
+trace.record(event="request", round=1, messages=1, input_tokens=420)
+trace.record(event="tool", round=1, tool="search", arguments={"query": "chunking"}, ms=31)
+trace.record(event="request", round=2, messages=3, input_tokens=980)
+trace.record(event="tool", round=2, tool="search", arguments={"query": "overlap"}, ms=28)
+trace.record(event="request", round=3, messages=5, input_tokens=1480)
+trace.record(event="finish", round=3, outcome="answered", reason="model called finish")
+
+trace.dump()
+print()
+print(trace.summary())`} />
+
+Two searches for nearly the same thing, visible immediately. That is the kind of waste a trace
+surfaces and a final answer hides.
+
+## The history problem
+
+Every round resends everything, so an agent's context grows steadily until it does not fit:
+
+<Run id="llm-agent-6" code={`def history_growth(rounds, per_round_tokens=800, system_tokens=1200):
+    total = 0
+    for round_number in range(1, rounds + 1):
+        request = system_tokens + per_round_tokens * round_number
+        total += request
+        if round_number in (1, 5, 10, 20, 40):
+            print(f"round {round_number:>3}: request {request:>7,} tokens   cumulative {total:>9,}")
+    return total
+
+total = history_growth(40)
+print()
+print(f"40 rounds cost {total:,} input tokens")
+print("strategies, in order of preference:")
+for strategy in [
+    "Return less from each tool — summarise, paginate, or return ids not blobs",
+    "Drop stale tool results once their conclusion is in the conversation",
+    "Summarise the older turns and keep the summary",
+    "Start a fresh conversation carrying only what the next stage needs",
+]:
+    print("  -", strategy)`} />
+
+The first strategy is the one people skip and the one that pays most. A tool that returns a
+20,000-token document body puts that body in every subsequent request; a tool that returns three
+relevant sentences and an id does not.
+
+## Putting it together
+
+<Run id="llm-agent-7" code={`from types import SimpleNamespace
+import json
+
+class ScriptedClient:
+    def __init__(self, script):
+        self.script = list(script)
+    def create(self, **request):
+        return self.script.pop(0)
+
+INDEX = {"chunking": "Use 10-20% overlap.", "overlap": "Use 10-20% overlap."}
+REQUIRES_APPROVAL = {"publish"}
+
+def agent(client, question, *, max_rounds=6, auto_approve=(), verbose=True):
+    messages = [{"role": "user", "content": question}]
+    trace, rounds = [], 0
+
+    while True:
+        if rounds >= max_rounds:
+            return {"outcome": "budget", "reason": f"round limit {max_rounds}", "trace": trace}
+
+        response = client.create(model="claude-opus-5", max_tokens=16000, messages=messages)
+        rounds += 1
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason != "tool_use":
+            text = "".join(b.text for b in response.content if b.type == "text")
+            return {"outcome": "answered", "answer": text, "trace": trace}
+
+        results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+
+            if block.name == "finish":
+                trace.append({"round": rounds, "tool": "finish"})
+                return {"outcome": "answered", "answer": block.input["answer"], "trace": trace}
+
+            if block.name in REQUIRES_APPROVAL and block.name not in auto_approve:
+                trace.append({"round": rounds, "tool": block.name, "declined": True})
+                results.append({"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                                "content": "Declined by the operator. Explain and stop."})
+                continue
+
+            content = INDEX.get(str(block.input.get("query", "")).lower(), "No match.")
+            trace.append({"round": rounds, "tool": block.name, "args": block.input})
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": content})
+
+        messages.append({"role": "user", "content": results})
+
+script = [
+    SimpleNamespace(stop_reason="tool_use", content=[
+        SimpleNamespace(type="tool_use", id="1", name="search", input={"query": "chunking"})]),
+    SimpleNamespace(stop_reason="tool_use", content=[
+        SimpleNamespace(type="tool_use", id="2", name="publish", input={"page": "guide"})]),
+    SimpleNamespace(stop_reason="tool_use", content=[
+        SimpleNamespace(type="tool_use", id="3", name="finish",
+                        input={"answer": "Use 10-20% overlap. I did not publish anything."})]),
+]
+
+result = agent(ScriptedClient(script), "What overlap should I use, and publish the guide")
+print(result["outcome"], "->", result.get("answer"))
+print()
+for step in result["trace"]:
+    print(json.dumps(step))`} />
+
+## Try it yourself
+
+<Exercise
+  id="llm-agent-ex1"
+  title="Exercise 1"
+  brief="Write <code>Budget</code> with <code>record(input_tokens, output_tokens)</code>, a <code>spent_usd</code> property at Opus 5 rates, and <code>exceeded()</code> returning a reason string or None."
+  code={`class Budget:
+    def __init__(self, max_rounds=8, max_tokens=50_000, max_usd=0.50):
+        self.max_rounds = max_rounds
+        self.max_tokens = max_tokens
+        self.max_usd = max_usd
+        self.rounds = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    def record(self, input_tokens, output_tokens):
+        # Count one round and add the tokens.
+        ...
+
+    @property
+    def spent_usd(self):
+        # Opus 5: $5 per million input, $25 per million output.
+        ...
+
+    def exceeded(self):
+        # Return a short reason when any limit is reached, else None.
+        # Check rounds, then tokens, then spend.
+        ...
+
+
+budget = Budget(max_rounds=3)
+for _ in range(4):
+    budget.record(1000, 200)
+    print(budget.rounds, round(budget.spent_usd, 6), budget.exceeded())`}
+  hint="record increments rounds and adds both counts; spent_usd is (input*5 + output*25) / 1e6; exceeded compares each limit with >= and returns None at the end."
+  solution={`class Budget:
+    def __init__(self, max_rounds=8, max_tokens=50_000, max_usd=0.50):
+        self.max_rounds = max_rounds
+        self.max_tokens = max_tokens
+        self.max_usd = max_usd
+        self.rounds = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    def record(self, input_tokens, output_tokens):
+        self.rounds += 1
+        self.input_tokens += input_tokens
+        self.output_tokens += output_tokens
+
+    @property
+    def spent_usd(self):
+        return (self.input_tokens * 5.00 + self.output_tokens * 25.00) / 1_000_000
+
+    def exceeded(self):
+        if self.rounds >= self.max_rounds:
+            return f"round limit ({self.max_rounds})"
+        if self.input_tokens + self.output_tokens >= self.max_tokens:
+            return f"token limit ({self.max_tokens})"
+        if self.spent_usd >= self.max_usd:
+            return f"spend limit ({self.max_usd})"
+        return None
+
+
+budget = Budget(max_rounds=3)
+for _ in range(4):
+    budget.record(1000, 200)
+    print(budget.rounds, round(budget.spent_usd, 6), budget.exceeded())`}
+  tests={`budget = Budget(max_rounds=3, max_tokens=10_000, max_usd=1.0)
+
+budget.record(1000, 200)
+assert budget.rounds == 1, f"record should count a round, got {budget.rounds}."
+assert budget.input_tokens == 1000 and budget.output_tokens == 200, "Both counts must accumulate."
+assert abs(budget.spent_usd - (1000 * 5 + 200 * 25) / 1e6) < 1e-12, (
+    f"Opus 5 is $5/$25 per million; got {budget.spent_usd}."
+)
+assert budget.exceeded() is None, "Nothing is exceeded after one small round."
+
+budget.record(1000, 200)
+assert budget.exceeded() is None, "Two of three rounds is still under the limit."
+budget.record(1000, 200)
+assert budget.exceeded() is not None, "The third round reaches max_rounds=3."
+assert "round" in budget.exceeded().lower(), (
+    f"The reason should name the limit that was hit, got {budget.exceeded()!r}."
+)
+
+# Tokens can trip first.
+tokens = Budget(max_rounds=99, max_tokens=1000, max_usd=99.0)
+tokens.record(900, 200)
+reason = tokens.exceeded()
+assert reason is not None and "token" in reason.lower(), (
+    f"1100 tokens should trip a 1000-token limit, got {reason!r}."
+)
+
+# So can spend.
+spend = Budget(max_rounds=99, max_tokens=10**9, max_usd=0.01)
+spend.record(1_000_000, 0)
+money = spend.exceeded()
+assert money is not None and "spend" in money.lower(), (
+    f"$5 should trip a $0.01 limit, got {money!r}."
+)
+
+assert Budget().exceeded() is None, "A fresh budget has exceeded nothing."`}
+/>
+
+<Exercise
+  id="llm-agent-ex2"
+  title="Exercise 2"
+  brief="Write <code>gate(block, requires_approval, approved)</code>: run the tool normally, or return a declined <code>tool_result</code> with <code>is_error</code> when it needs approval it does not have."
+  code={`from types import SimpleNamespace
+
+def gate(block, requires_approval, approved):
+    # If block.name is in requires_approval and not in approved, return
+    #   {"type": "tool_result", "tool_use_id": ..., "is_error": True,
+    #    "content": "Declined by the operator."}
+    # Otherwise return a normal tool_result whose content is
+    #   f"ran {block.name}".
+    ...
+
+
+blocks = [
+    SimpleNamespace(type="tool_use", id="a", name="search", input={}),
+    SimpleNamespace(type="tool_use", id="b", name="delete_records", input={}),
+    SimpleNamespace(type="tool_use", id="c", name="send_email", input={}),
+]
+
+for block in blocks:
+    print(gate(block, {"delete_records", "send_email"}, approved={"send_email"}))`}
+  hint="One condition: block.name in requires_approval and block.name not in approved."
+  solution={`from types import SimpleNamespace
+
+def gate(block, requires_approval, approved):
+    if block.name in requires_approval and block.name not in approved:
+        return {
+            "type": "tool_result",
+            "tool_use_id": block.id,
+            "is_error": True,
+            "content": "Declined by the operator.",
+        }
+    return {"type": "tool_result", "tool_use_id": block.id, "content": f"ran {block.name}"}
+
+
+blocks = [
+    SimpleNamespace(type="tool_use", id="a", name="search", input={}),
+    SimpleNamespace(type="tool_use", id="b", name="delete_records", input={}),
+    SimpleNamespace(type="tool_use", id="c", name="send_email", input={}),
+]
+
+for block in blocks:
+    print(gate(block, {"delete_records", "send_email"}, approved={"send_email"}))`}
+  tests={`from types import SimpleNamespace
+
+needs = {"delete_records", "send_email"}
+
+safe = gate(SimpleNamespace(type="tool_use", id="a", name="search", input={}), needs, approved=set())
+assert safe["content"] == "ran search", f"An ungated tool should just run, got {safe!r}."
+assert not safe.get("is_error"), "A safe tool is not an error."
+assert safe["tool_use_id"] == "a", "The id must be carried through."
+
+blocked = gate(SimpleNamespace(type="tool_use", id="b", name="delete_records", input={}), needs, approved=set())
+assert blocked.get("is_error") is True, "An unapproved gated tool must be declined."
+assert blocked["type"] == "tool_result", (
+    "A decline is still a tool_result — the model has to be told, or it waits forever."
+)
+assert blocked["tool_use_id"] == "b", "Even a declined call needs its id."
+assert "Declined" in blocked["content"], f"Say it was declined. Got {blocked['content']!r}."
+
+allowed = gate(SimpleNamespace(type="tool_use", id="c", name="send_email", input={}), needs, approved={"send_email"})
+assert allowed["content"] == "ran send_email", (
+    f"An approved gated tool should run. Got {allowed!r}."
+)
+assert not allowed.get("is_error"), "An approved call is not an error."
+
+# Approval of one tool must not approve another.
+still_blocked = gate(SimpleNamespace(type="tool_use", id="d", name="delete_records", input={}),
+                     needs, approved={"send_email"})
+assert still_blocked.get("is_error") is True, (
+    "Approving send_email must not approve delete_records."
+)`}
+/>
+
+<Quiz
+  question="Why should a destructive tool be gated in code rather than forbidden in the system prompt?"
+  choices={[
+    { text: "A prompt is a request the model can misread or be talked out of; the code path is the only real control", correct: true, why: "Injected content in a retrieved document, or a plain misunderstanding, is enough to route around an instruction — but not around an if-statement before execution." },
+    { text: "System prompts cannot mention tool names", why: "They can, and often should — it just does not make the instruction enforceable." },
+    { text: "The API strips safety instructions from system prompts", why: "Nothing is stripped; the instruction is simply not a guarantee." },
+    { text: "Because prompts are not cached", why: "They usually are, and caching has nothing to do with enforcement." },
+  ]}
+/>
+
+<Quiz
+  question="An agent's cost grows faster than its number of rounds. Why?"
+  choices={[
+    { text: "Each round resends the whole history, so the input grows with every previous round", correct: true, why: "Round N carries rounds 1 to N-1 with it, which makes the total quadratic — and a tool returning large blobs multiplies the effect." },
+    { text: "Later rounds use a more expensive model", why: "The model is whatever you passed; it does not change between rounds." },
+    { text: "Output tokens grow with each round", why: "Output stays roughly constant per turn; the growth is on the input side." },
+    { text: "The API charges a per-round surcharge", why: "There is no such charge — it is the resent context you are paying for." },
+  ]}
+/>
+
+## Recap
+
+- An agent is the tool loop plus a termination policy. Most problems are workflows and should stay
+  workflows.
+- Check complexity, value, viability and cost of error before building one; a "no" anywhere means
+  a simpler tier.
+- Give it an explicit `finish` tool, and ceilings on rounds, tokens and spend — checked before
+  each request.
+- Gate irreversible tools in code, and return the decline as a `tool_result` so the model knows.
+- Log every step as structured records; the trace is what makes a bad run explainable.
+- The history grows every round, so return less from each tool before reaching for summarisation.

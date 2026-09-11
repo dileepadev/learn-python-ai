@@ -87,18 +87,8 @@ export const MODULES: Module[] = [
     description:
       "Working with a large language model as a component in a program. The Messages API, streaming, system prompts, structured JSON output, tool use, and the agent loop that turns a model into something that acts.",
     level: "advanced",
-    status: "planned",
+    status: "published",
     icon: "message",
-    plannedLessons: [
-      "How an LLM API call actually works",
-      "The Anthropic Python SDK: messages and streaming",
-      "System prompts, few-shot examples and prompt files",
-      "Structured output and schema validation with Pydantic",
-      "Tool use and the function-calling loop",
-      "Building an agent loop from first principles",
-      "The Model Context Protocol (MCP)",
-      "Token accounting, caching and cost control",
-    ],
   },
   {
     slug: "rag-and-retrieval",
