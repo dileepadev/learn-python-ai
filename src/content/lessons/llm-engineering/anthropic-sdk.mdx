@@ -1,0 +1,514 @@
+---
+title: "The Anthropic Python SDK: messages and streaming"
+description: Install it, call it, stream it, and handle the errors properly — including the retry rules that decide whether your client survives a bad afternoon.
+module: llm-engineering
+order: 2
+level: advanced
+minutes: 20
+objectives:
+  - Create a client and make a request without hard-coding a key
+  - Stream a response and accumulate it correctly
+  - Read the stream event types and know which ones matter
+  - Catch the SDK's typed exceptions, most specific first
+  - Configure timeouts and retries, and know what the SDK already retries
+  - Turn on adaptive thinking and choose an effort level
+---
+
+The SDK is a thin, well-shaped wrapper over the one endpoint from the last lesson. This lesson is
+about using it well — which is mostly about streaming and about failing properly.
+
+## Getting started
+
+```bash
+pip install anthropic
+export ANTHROPIC_API_KEY="sk-ant-..."      # never in the source
+```
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()             # reads the environment
+
+response = client.messages.create(
+    model="claude-opus-5",
+    max_tokens=16000,
+    system="You are a careful assistant.",
+    messages=[{"role": "user", "content": "Explain embeddings in two sentences."}],
+)
+
+print("".join(b.text for b in response.content if b.type == "text"))
+print(response.usage.input_tokens, "in,", response.usage.output_tokens, "out")
+```
+
+<Callout type="tip">
+Do not lowball `max_tokens`. It is a ceiling, not a target — you are billed for what is produced,
+not for the ceiling. About 16,000 is a sensible default for a non-streaming request and 64,000
+when streaming; drop to a few hundred only for genuinely short outputs like a classification
+label.
+</Callout>
+
+## Streaming
+
+Streaming matters for two separate reasons. The visible one is that a reader sees words appear
+instead of waiting. The invisible one matters more: a long non-streaming request can sit past an
+idle-connection timeout and fail after doing all the work.
+
+```python
+with client.messages.stream(
+    model="claude-opus-5",
+    max_tokens=64000,
+    messages=[{"role": "user", "content": "Write a short essay on retrieval."}],
+) as stream:
+    for text in stream.text_stream:
+        print(text, end="", flush=True)
+
+    final = stream.get_final_message()
+
+print()
+print(final.stop_reason, final.usage.output_tokens)
+```
+
+`stream.text_stream` yields text as it arrives; `get_final_message()` gives you the assembled
+message afterwards — the same object a non-streaming call would have returned. You almost always
+want both.
+
+<Callout type="warning">
+`messages.create` with a very large `max_tokens` and no streaming raises `ValueError` before it
+sends anything: the SDK refuses requests it estimates will outlive the connection. Use
+`messages.stream(...)`, or pass an explicit `timeout` if you really mean it.
+</Callout>
+
+Here is that loop against a recorded stream, so you can see the accumulation:
+
+<Run id="llm-sdk-1" code={`def recorded_stream(text, chunk=6):
+    """Stand-in for stream.text_stream — a generator of text deltas."""
+    for start in range(0, len(text), chunk):
+        yield text[start:start + chunk]
+
+collected = []
+for delta in recorded_stream("Retrieval grounds an answer in documents you control."):
+    collected.append(delta)
+    print(delta, end="")
+
+print()
+print()
+print("deltas:", len(collected))
+print("assembled:", repr("".join(collected)))`} />
+
+## The event stream
+
+`text_stream` is a convenience over a richer event stream. Iterate the stream itself when you need
+tool calls, thinking, or usage as it updates:
+
+<Run id="llm-sdk-2" code={`from types import SimpleNamespace
+
+def recorded_events():
+    """The event sequence the SDK yields, in order."""
+    yield SimpleNamespace(type="message_start")
+    yield SimpleNamespace(type="content_block_start",
+                          content_block=SimpleNamespace(type="thinking"))
+    yield SimpleNamespace(type="content_block_delta",
+                          delta=SimpleNamespace(type="thinking_delta", thinking="Weighing options"))
+    yield SimpleNamespace(type="content_block_stop")
+    yield SimpleNamespace(type="content_block_start",
+                          content_block=SimpleNamespace(type="text"))
+    for piece in ["Retrieval ", "grounds ", "the answer."]:
+        yield SimpleNamespace(type="content_block_delta",
+                              delta=SimpleNamespace(type="text_delta", text=piece))
+    yield SimpleNamespace(type="content_block_stop")
+    yield SimpleNamespace(type="message_delta",
+                          delta=SimpleNamespace(stop_reason="end_turn"),
+                          usage=SimpleNamespace(output_tokens=24))
+    yield SimpleNamespace(type="message_stop")
+
+answer, reasoning, output_tokens = [], [], 0
+
+for event in recorded_events():
+    if event.type == "content_block_delta":
+        if event.delta.type == "text_delta":
+            answer.append(event.delta.text)
+        elif event.delta.type == "thinking_delta":
+            reasoning.append(event.delta.thinking)
+    elif event.type == "message_delta":
+        output_tokens = event.usage.output_tokens
+
+print("answer:   ", "".join(answer))
+print("reasoning:", "".join(reasoning))
+print("tokens:   ", output_tokens)`} />
+
+| Event | Fires |
+| --- | --- |
+| `message_start` | once, at the beginning |
+| `content_block_start` | when a text, thinking or tool_use block begins |
+| `content_block_delta` | for each chunk — check `delta.type` |
+| `content_block_stop` | when a block finishes |
+| `message_delta` | carries `stop_reason` and updated usage |
+| `message_stop` | once, at the end |
+
+## Errors
+
+The SDK raises typed exceptions. Catch them most specific first, because the difference between
+them is the difference between retrying and giving up:
+
+<Run id="llm-sdk-3" code={`# Stand-ins for anthropic's exception classes, in the same hierarchy.
+class APIError(Exception): pass
+class APIStatusError(APIError):
+    def __init__(self, message, status_code):
+        super().__init__(message)
+        self.status_code = status_code
+class BadRequestError(APIStatusError): pass          # 400
+class AuthenticationError(APIStatusError): pass      # 401
+class NotFoundError(APIStatusError): pass            # 404
+class RateLimitError(APIStatusError): pass           # 429
+class APIConnectionError(APIError): pass
+class APITimeoutError(APIConnectionError): pass
+
+def classify(error):
+    if isinstance(error, NotFoundError):
+        return "permanent — the model id is wrong"
+    if isinstance(error, AuthenticationError):
+        return "permanent — fix the key"
+    if isinstance(error, BadRequestError):
+        return "permanent — the request itself is invalid"
+    if isinstance(error, RateLimitError):
+        return "retryable — back off and try again"
+    if isinstance(error, APIStatusError) and error.status_code >= 500:
+        return "retryable — the service is unhappy"
+    if isinstance(error, APIConnectionError):
+        return "retryable — the network was"
+    return "unknown"
+
+for error in [
+    NotFoundError("no such model", 404),
+    AuthenticationError("bad key", 401),
+    BadRequestError("max_tokens too large", 400),
+    RateLimitError("slow down", 429),
+    APIStatusError("overloaded", 529),
+    APITimeoutError("timed out"),
+]:
+    print(f"{type(error).__name__:22} {classify(error)}")`} />
+
+On your own machine that chain is:
+
+```python
+try:
+    response = client.messages.create(...)
+except anthropic.NotFoundError:
+    ...                      # wrong model id — do not retry
+except anthropic.RateLimitError:
+    ...                      # 429 — back off
+except anthropic.APIStatusError as error:
+    if error.status_code >= 500:
+        ...                  # retryable
+    else:
+        raise                # a 400 will fail identically next time
+except anthropic.APIConnectionError:
+    ...                      # network — retryable
+```
+
+<Callout type="warning">
+Catching one broad `except anthropic.APIError` throws away the distinction that matters. A 400 is
+your bug and retrying it burns money to get the same error; a 429 is the service asking you to
+wait. Never string-match on the message text — the classes carry the information.
+</Callout>
+
+## What the SDK already retries
+
+<Run id="llm-sdk-4" code={`SDK_RETRIES = {
+    "connection errors": True,
+    "408 request timeout": True,
+    "409 conflict": True,
+    "429 rate limited": True,
+    "500 and above": True,
+    "400 bad request": False,
+    "401 unauthorised": False,
+    "404 not found": False,
+}
+
+for condition, retried in SDK_RETRIES.items():
+    print(f"{condition:22} {'retried automatically' if retried else 'raised immediately'}")
+
+print()
+print("default attempts: 1 + 2 retries, with exponential backoff")`} />
+
+So you do not need a retry loop for the ordinary cases — the SDK has one. Configure it rather
+than reimplementing it:
+
+```python
+client = anthropic.Anthropic(max_retries=5, timeout=30.0)     # seconds, in Python
+
+# Or per request, without mutating the client:
+client.with_options(timeout=5.0, max_retries=0).messages.create(...)
+```
+
+<Callout type="warning">
+Timeouts are themselves retried, so worst-case wall-clock is roughly
+`timeout × (max_retries + 1)`. A 60-second timeout with five retries can block for six minutes —
+budget for the product, not just the call.
+</Callout>
+
+## Thinking and effort
+
+Adaptive thinking lets the model decide how much reasoning a request deserves; `effort` sets the
+overall depth and spend:
+
+```python
+response = client.messages.create(
+    model="claude-opus-5",
+    max_tokens=16000,
+    thinking={"type": "adaptive", "display": "summarized"},
+    output_config={"effort": "high"},     # low | medium | high | xhigh | max
+    messages=[{"role": "user", "content": "Work through this carefully..."}],
+)
+
+for block in response.content:
+    if block.type == "thinking":
+        print("[thinking]", block.thinking)
+    elif block.type == "text":
+        print(block.text)
+```
+
+Two details that catch people out. Thinking is **on by default** on Claude Opus 5, so omitting the
+parameter still gets you adaptive thinking. And `display` defaults to `"omitted"`, which returns
+`thinking` blocks with empty text — if you are streaming reasoning to a reader, ask for
+`"summarized"` explicitly or the page just looks frozen.
+
+<Callout type="ai" title="Why this matters for AI">
+`effort` is the first quality-for-cost lever worth reaching for, and it is per route rather than
+global. Coding and long-horizon agent work repay `high` or `xhigh`; classification, routing and
+high-volume chat usually hold their quality at `low` for a fraction of the spend. Measure on real
+requests before you change a default — and judge cost per *completed task*, not per request,
+because a cheaper call that needs three attempts is not cheaper.
+</Callout>
+
+## Async
+
+For concurrency — the subject of module 8 — the same API exists as `AsyncAnthropic`:
+
+```python
+import asyncio, anthropic
+
+async def main():
+    client = anthropic.AsyncAnthropic()
+    response = await client.messages.create(
+        model="claude-opus-5",
+        max_tokens=16000,
+        messages=[{"role": "user", "content": "Hello"}],
+    )
+    print(response.content[0].text)
+
+asyncio.run(main())
+```
+
+## Try it yourself
+
+<Exercise
+  id="llm-sdk-ex1"
+  title="Exercise 1"
+  brief="Write <code>collect(events)</code>: return a dict with <code>text</code>, <code>thinking</code>, <code>stop_reason</code> and <code>output_tokens</code> gathered from one pass over the event stream."
+  code={`from types import SimpleNamespace
+
+def collect(events):
+    # Walk the events once. Accumulate text_delta into text,
+    # thinking_delta into thinking, and read stop_reason and
+    # output_tokens from the message_delta event.
+    ...
+
+
+def sample():
+    yield SimpleNamespace(type="message_start")
+    yield SimpleNamespace(type="content_block_delta",
+                          delta=SimpleNamespace(type="thinking_delta", thinking="hmm"))
+    yield SimpleNamespace(type="content_block_delta",
+                          delta=SimpleNamespace(type="text_delta", text="Hello "))
+    yield SimpleNamespace(type="content_block_delta",
+                          delta=SimpleNamespace(type="text_delta", text="there"))
+    yield SimpleNamespace(type="message_delta",
+                          delta=SimpleNamespace(stop_reason="end_turn"),
+                          usage=SimpleNamespace(output_tokens=7))
+    yield SimpleNamespace(type="message_stop")
+
+print(collect(sample()))`}
+  hint="Start with empty lists and defaults, loop once over events, branch on event.type and then on event.delta.type."
+  solution={`from types import SimpleNamespace
+
+def collect(events):
+    text, thinking = [], []
+    stop_reason, output_tokens = None, 0
+
+    for event in events:
+        if event.type == "content_block_delta":
+            if event.delta.type == "text_delta":
+                text.append(event.delta.text)
+            elif event.delta.type == "thinking_delta":
+                thinking.append(event.delta.thinking)
+        elif event.type == "message_delta":
+            stop_reason = event.delta.stop_reason
+            output_tokens = event.usage.output_tokens
+
+    return {
+        "text": "".join(text),
+        "thinking": "".join(thinking),
+        "stop_reason": stop_reason,
+        "output_tokens": output_tokens,
+    }
+
+
+def sample():
+    yield SimpleNamespace(type="message_start")
+    yield SimpleNamespace(type="content_block_delta",
+                          delta=SimpleNamespace(type="thinking_delta", thinking="hmm"))
+    yield SimpleNamespace(type="content_block_delta",
+                          delta=SimpleNamespace(type="text_delta", text="Hello "))
+    yield SimpleNamespace(type="content_block_delta",
+                          delta=SimpleNamespace(type="text_delta", text="there"))
+    yield SimpleNamespace(type="message_delta",
+                          delta=SimpleNamespace(stop_reason="end_turn"),
+                          usage=SimpleNamespace(output_tokens=7))
+    yield SimpleNamespace(type="message_stop")
+
+print(collect(sample()))`}
+  tests={`from types import SimpleNamespace
+
+def sample():
+    yield SimpleNamespace(type="message_start")
+    yield SimpleNamespace(type="content_block_delta",
+                          delta=SimpleNamespace(type="thinking_delta", thinking="hmm"))
+    yield SimpleNamespace(type="content_block_delta",
+                          delta=SimpleNamespace(type="text_delta", text="Hello "))
+    yield SimpleNamespace(type="content_block_delta",
+                          delta=SimpleNamespace(type="text_delta", text="there"))
+    yield SimpleNamespace(type="message_delta",
+                          delta=SimpleNamespace(stop_reason="end_turn"),
+                          usage=SimpleNamespace(output_tokens=7))
+    yield SimpleNamespace(type="message_stop")
+
+result = collect(sample())
+assert isinstance(result, dict), f"Return a dict, got {type(result).__name__}."
+assert result["text"] == "Hello there", f"Text deltas should be joined in order, got {result['text']!r}."
+assert result["thinking"] == "hmm", f"Thinking deltas belong in their own field, got {result['thinking']!r}."
+assert result["stop_reason"] == "end_turn", f"stop_reason comes from message_delta, got {result['stop_reason']!r}."
+assert result["output_tokens"] == 7, f"output_tokens comes from message_delta.usage, got {result['output_tokens']!r}."
+
+# An empty stream should not crash.
+empty = collect(iter([]))
+assert empty["text"] == "" and empty["thinking"] == "", "An empty stream yields empty strings."
+assert empty["stop_reason"] is None, "With no message_delta there is no stop_reason."
+
+# It must consume a generator in one pass, not index it.
+def text_only():
+    yield SimpleNamespace(type="content_block_delta",
+                          delta=SimpleNamespace(type="text_delta", text="just text"))
+assert collect(text_only())["text"] == "just text", (
+    "A stream with only text deltas should still work."
+)`}
+/>
+
+<Exercise
+  id="llm-sdk-ex2"
+  title="Exercise 2"
+  brief="Write <code>should_retry(error)</code>: True for rate limits, 5xx statuses and connection errors; False for 400, 401 and 404."
+  code={`class APIError(Exception): pass
+class APIStatusError(APIError):
+    def __init__(self, message, status_code):
+        super().__init__(message)
+        self.status_code = status_code
+class BadRequestError(APIStatusError): pass
+class AuthenticationError(APIStatusError): pass
+class NotFoundError(APIStatusError): pass
+class RateLimitError(APIStatusError): pass
+class APIConnectionError(APIError): pass
+
+
+def should_retry(error):
+    # True only for transient failures.
+    ...
+
+
+for error in [RateLimitError("x", 429), APIStatusError("x", 529),
+              APIConnectionError("x"), BadRequestError("x", 400),
+              AuthenticationError("x", 401), NotFoundError("x", 404)]:
+    print(f"{type(error).__name__:22} {should_retry(error)}")`}
+  hint="Check the permanent subclasses first and return False, then RateLimitError, then a status_code of 500 or more, then APIConnectionError."
+  solution={`class APIError(Exception): pass
+class APIStatusError(APIError):
+    def __init__(self, message, status_code):
+        super().__init__(message)
+        self.status_code = status_code
+class BadRequestError(APIStatusError): pass
+class AuthenticationError(APIStatusError): pass
+class NotFoundError(APIStatusError): pass
+class RateLimitError(APIStatusError): pass
+class APIConnectionError(APIError): pass
+
+
+def should_retry(error):
+    if isinstance(error, RateLimitError):
+        return True
+    if isinstance(error, (BadRequestError, AuthenticationError, NotFoundError)):
+        return False
+    if isinstance(error, APIStatusError):
+        return error.status_code >= 500
+    if isinstance(error, APIConnectionError):
+        return True
+    return False
+
+
+for error in [RateLimitError("x", 429), APIStatusError("x", 529),
+              APIConnectionError("x"), BadRequestError("x", 400),
+              AuthenticationError("x", 401), NotFoundError("x", 404)]:
+    print(f"{type(error).__name__:22} {should_retry(error)}")`}
+  tests={`assert should_retry(RateLimitError("x", 429)) is True, "A 429 is the canonical retryable failure."
+assert should_retry(APIStatusError("x", 500)) is True, "A 500 is retryable."
+assert should_retry(APIStatusError("x", 529)) is True, "A 529 overloaded response is retryable."
+assert should_retry(APIConnectionError("x")) is True, "A network failure is retryable."
+
+assert should_retry(BadRequestError("x", 400)) is False, (
+    "A 400 will fail identically on every retry — it is your request that is wrong."
+)
+assert should_retry(AuthenticationError("x", 401)) is False, "A bad key does not fix itself."
+assert should_retry(NotFoundError("x", 404)) is False, "A wrong model id does not fix itself."
+
+# RateLimitError subclasses APIStatusError with a 4xx code, so ordering matters.
+assert should_retry(RateLimitError("x", 429)) is True, (
+    "Check RateLimitError before the generic status test, or the 429 falls into the 4xx branch."
+)
+
+# An unrelated exception should not be retried.
+assert should_retry(ValueError("not an API error")) is False, (
+    "Only API failures are retryable; a programming error is not."
+)`}
+/>
+
+<Quiz
+  question="Why does the SDK refuse a non-streaming request with a very large max_tokens?"
+  choices={[
+    { text: "The response could take longer than the connection stays open, wasting the whole request", correct: true, why: "Streaming keeps data flowing so the connection is never idle — the guard exists to stop you paying for work that is then discarded." },
+    { text: "Large max_tokens values are not supported at all", why: "They are — up to 128K on current models; streaming is simply required to get them." },
+    { text: "It would exceed the context window", why: "Output and context limits are different things, and this refusal happens before the request is sent." },
+    { text: "Because the SDK cannot buffer that much text", why: "Buffering is not the constraint; the idle connection is." },
+  ]}
+/>
+
+<Quiz
+  question="Your client catches `except anthropic.APIError` and retries five times. What goes wrong?"
+  choices={[
+    { text: "Permanent failures like a 400 or a wrong model id get retried pointlessly, and real bugs look like network flakiness", correct: true, why: "The typed subclasses exist precisely to separate 'try again' from 'this will never work'." },
+    { text: "Nothing — APIError covers every case correctly", why: "It covers every case identically, which is the problem." },
+    { text: "The SDK forbids catching the base class", why: "It is catchable; it is just too coarse to act on." },
+    { text: "Retrying is never appropriate", why: "It is exactly right for 429s, 5xx responses and connection errors." },
+  ]}
+/>
+
+## Recap
+
+- `anthropic.Anthropic()` reads the key from the environment; never hard-code it.
+- Stream anything long: `messages.stream(...)`, `stream.text_stream`, then `get_final_message()`.
+- The event stream carries `content_block_delta` (branch on `delta.type`), and `message_delta`
+  carries `stop_reason` and usage.
+- Catch typed exceptions most specific first; 429, 5xx and connection errors are retryable, 400,
+  401 and 404 are not.
+- The SDK already retries the transient cases — configure `max_retries` and `timeout` instead of
+  writing your own loop, and remember worst-case wall-clock multiplies.
+- `thinking={"type": "adaptive"}` with `output_config={"effort": ...}`; ask for
+  `display="summarized"` if you want to show the reasoning.

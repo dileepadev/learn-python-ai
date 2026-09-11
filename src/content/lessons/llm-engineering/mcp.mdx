@@ -1,0 +1,509 @@
+---
+title: The Model Context Protocol (MCP)
+description: One standard for exposing tools, resources and prompts to any model client — what the protocol actually is, how to connect to a server, and why an MCP server is code you are trusting.
+module: llm-engineering
+order: 7
+level: advanced
+minutes: 20
+objectives:
+  - Explain what MCP standardises and what problem that solves
+  - "Describe the three primitives: tools, resources and prompts"
+  - Convert an MCP tool descriptor into an API tool definition
+  - Connect to a local server over stdio and a remote one over HTTP
+  - Judge the trust you are extending to a server
+---
+
+Every integration in the last two lessons was bespoke: you wrote the tool definition, you wrote
+the dispatch, you wrote the execution. MCP standardises that, so a server someone else wrote
+plugs into a client you did not write.
+
+## What it standardises
+
+<Run id="llm-mcp-1" code={`PRIMITIVES = [
+    ("Tools",
+     "Things the model can invoke.",
+     "search_issues, run_query, create_ticket"),
+    ("Resources",
+     "Things the client can read and put into context.",
+     "a file, a database row, a wiki page — addressed by URI"),
+    ("Prompts",
+     "Reusable prompt templates the server offers.",
+     "'summarise-incident', taking an incident id"),
+]
+
+for name, what, examples in PRIMITIVES:
+    print(f"{name}\\n  {what}\\n  e.g. {examples}\\n")
+
+print("The server declares these. The client discovers them at runtime.")`} />
+
+Without MCP, connecting three assistants to four systems means twelve integrations. With it, each
+system exposes one server and each assistant speaks one protocol — four plus three.
+
+<Callout type="tip">
+The word "client" here means the thing holding the model: an IDE assistant, a chat application,
+your own agent. The **server** is the thing wrapping a system — your issue tracker, your database,
+a filesystem. The model itself never speaks MCP; the client translates.
+</Callout>
+
+## Discovery
+
+A server answers "what can you do?" at runtime, which is what makes it pluggable:
+
+<Run id="llm-mcp-2" code={`class DocsServer:
+    """A tiny stand-in for an MCP server, with the same shaped responses."""
+
+    DOCUMENTS = {
+        "docs://guide/chunking": "Use 10-20% overlap so sentences are not cut in half.",
+        "docs://guide/embeddings": "Store embeddings as float32.",
+    }
+
+    def list_tools(self):
+        return [
+            {
+                "name": "search_docs",
+                "description": "Search the documentation index and return matching passages.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string", "description": "Search terms."}},
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "read_doc",
+                "description": "Read one document by its URI.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"uri": {"type": "string"}},
+                    "required": ["uri"],
+                },
+            },
+        ]
+
+    def list_resources(self):
+        return [{"uri": uri, "name": uri.rsplit("/", 1)[-1], "mimeType": "text/plain"}
+                for uri in self.DOCUMENTS]
+
+    def call_tool(self, name, arguments):
+        if name == "search_docs":
+            term = arguments["query"].lower()
+            hits = [text for uri, text in self.DOCUMENTS.items() if term in uri or term in text.lower()]
+            return {"content": [{"type": "text", "text": "\\n".join(hits) or "No match."}],
+                    "isError": False}
+        if name == "read_doc":
+            text = self.DOCUMENTS.get(arguments["uri"])
+            if text is None:
+                return {"content": [{"type": "text", "text": "No such document."}], "isError": True}
+            return {"content": [{"type": "text", "text": text}], "isError": False}
+        return {"content": [{"type": "text", "text": f"Unknown tool {name!r}"}], "isError": True}
+
+server = DocsServer()
+
+print("tools:")
+for tool in server.list_tools():
+    print(f"  {tool['name']:12} {tool['description']}")
+
+print()
+print("resources:")
+for resource in server.list_resources():
+    print(f"  {resource['uri']}")
+
+print()
+print(server.call_tool("search_docs", {"query": "chunking"}))
+print(server.call_tool("read_doc", {"uri": "docs://nope"}))`} />
+
+## Converting to API tools
+
+An MCP descriptor is nearly an API tool definition already — the field is `inputSchema` rather
+than `input_schema`:
+
+<Run id="llm-mcp-3" code={`def to_api_tool(descriptor, prefix=None):
+    """MCP tool descriptor -> Messages API tool definition."""
+    name = f"{prefix}__{descriptor['name']}" if prefix else descriptor["name"]
+    return {
+        "name": name,
+        "description": descriptor.get("description", ""),
+        "input_schema": descriptor["inputSchema"],
+    }
+
+mcp_tools = [
+    {"name": "search_docs", "description": "Search the documentation index.",
+     "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}},
+                     "required": ["query"]}},
+    {"name": "read_doc", "description": "Read one document by URI.",
+     "inputSchema": {"type": "object", "properties": {"uri": {"type": "string"}},
+                     "required": ["uri"]}},
+]
+
+for tool in [to_api_tool(t, prefix="docs") for t in mcp_tools]:
+    print(tool["name"], "->", sorted(tool["input_schema"]["properties"]))`} />
+
+The prefix matters once you connect more than one server: two servers may both offer `search`, and
+the model needs distinct names. Prefixing at conversion time keeps dispatch unambiguous.
+
+<Run id="llm-mcp-4" code={`from types import SimpleNamespace
+
+class Registry:
+    """Routes a tool call to whichever server declared it."""
+
+    def __init__(self):
+        self.servers = {}
+        self.owner = {}
+
+    def add(self, prefix, server):
+        self.servers[prefix] = server
+        for descriptor in server.list_tools():
+            self.owner[f"{prefix}__{descriptor['name']}"] = (prefix, descriptor["name"])
+
+    def api_tools(self):
+        return [
+            {"name": f"{prefix}__{d['name']}", "description": d.get("description", ""),
+             "input_schema": d["inputSchema"]}
+            for prefix, server in self.servers.items()
+            for d in server.list_tools()
+        ]
+
+    def dispatch(self, block):
+        if block.name not in self.owner:
+            return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                    "content": f"No tool named {block.name!r}."}
+        prefix, tool_name = self.owner[block.name]
+        result = self.servers[prefix].call_tool(tool_name, block.input)
+        text = "".join(part["text"] for part in result["content"] if part["type"] == "text")
+        entry = {"type": "tool_result", "tool_use_id": block.id, "content": text}
+        if result.get("isError"):
+            entry["is_error"] = True
+        return entry
+
+class EchoServer:
+    def list_tools(self):
+        return [{"name": "search", "description": "Echo the query back.",
+                 "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}},
+                                 "required": ["query"]}}]
+    def call_tool(self, name, arguments):
+        return {"content": [{"type": "text", "text": f"echo: {arguments['query']}"}], "isError": False}
+
+class DocsServer:
+    def list_tools(self):
+        return [{"name": "search", "description": "Search the docs.",
+                 "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}},
+                                 "required": ["query"]}}]
+    def call_tool(self, name, arguments):
+        return {"content": [{"type": "text", "text": "Use 10-20% overlap."}], "isError": False}
+
+registry = Registry()
+registry.add("echo", EchoServer())
+registry.add("docs", DocsServer())
+
+print("tools offered to the model:", [t["name"] for t in registry.api_tools()])
+print()
+for name in ["docs__search", "echo__search", "wiki__search"]:
+    print(registry.dispatch(SimpleNamespace(type="tool_use", id="t", name=name, input={"query": "chunking"})))`} />
+
+## Connecting for real
+
+There are two shapes, and they suit different situations.
+
+**A local server over stdio** — the client launches the process and talks to it over pipes. This
+is how a filesystem or database server on your own machine works:
+
+```python
+from anthropic import AsyncAnthropic
+from anthropic.lib.tools.mcp import async_mcp_tool
+from mcp import ClientSession
+from mcp.client.stdio import stdio_client, StdioServerParameters
+
+client = AsyncAnthropic()
+
+async with stdio_client(StdioServerParameters(command="my-mcp-server")) as (read, write):
+    async with ClientSession(read, write) as mcp_client:
+        await mcp_client.initialize()
+
+        discovered = await mcp_client.list_tools()
+
+        runner = client.beta.messages.tool_runner(
+            model="claude-opus-5",
+            max_tokens=16000,
+            messages=[{"role": "user", "content": "What changed in the guide yesterday?"}],
+            tools=[async_mcp_tool(t, mcp_client) for t in discovered.tools],
+        )
+        async for message in runner:
+            print(message.stop_reason)
+```
+
+Install it with `pip install anthropic[mcp]`. `async_mcp_tool` wraps each discovered tool so the
+tool runner can call it — the conversion you wrote by hand above, plus the execution path.
+
+**A remote server over HTTP** — the API connects to it directly, so nothing runs on your machine:
+
+```python
+response = client.beta.messages.create(
+    model="claude-opus-5",
+    max_tokens=16000,
+    betas=["mcp-client-2025-11-20"],
+    mcp_servers=[
+        {"type": "url", "url": "https://mcp.example.com/sse", "name": "docs"},
+    ],
+    tools=[
+        {"type": "mcp_toolset", "mcp_server_name": "docs"},
+    ],
+    messages=[{"role": "user", "content": "Search the docs for chunking guidance."}],
+)
+```
+
+<Callout type="warning">
+Both halves are required. `mcp_servers` alone is rejected as a validation error — you must also
+declare the matching `mcp_toolset` entry in `tools`, with `mcp_server_name` exactly equal to the
+server's `name`. This trips up nearly everyone the first time.
+</Callout>
+
+## Resources and prompts
+
+Tools are the part people use first, but a server can also hand over content and templates:
+
+```python
+from anthropic.lib.tools.mcp import mcp_resource_to_content, mcp_message
+
+# A resource becomes a content block in a user message.
+resource = await mcp_client.read_resource(uri="file:///runbooks/incident.md")
+response = await client.beta.messages.create(
+    model="claude-opus-5",
+    max_tokens=16000,
+    messages=[{"role": "user", "content": [
+        mcp_resource_to_content(resource),
+        {"type": "text", "text": "Summarise the escalation path."},
+    ]}],
+)
+
+# A server-provided prompt becomes messages.
+prompt = await mcp_client.get_prompt(name="summarise-incident")
+response = await client.beta.messages.create(
+    model="claude-opus-5",
+    max_tokens=16000,
+    messages=[mcp_message(m) for m in prompt.messages],
+)
+```
+
+The distinction is worth holding on to: a **tool** is something the model chooses to invoke; a
+**resource** is something your client decides to include. Making a document a resource keeps the
+decision with you.
+
+## Trust
+
+<Run id="llm-mcp-5" code={`RISKS = [
+    ("The server is code you run",
+     "A stdio server is a local process with your privileges. Treat installing one like "
+     "installing any dependency."),
+    ("Tool descriptions are prompt content",
+     "The server's text goes into your model's context. A malicious description can attempt "
+     "to steer the model."),
+    ("Tool results are untrusted input",
+     "Whatever comes back is data, not instructions — wrap it and say so, as in the "
+     "prompting lesson."),
+    ("Names can collide",
+     "Two servers offering 'search' need prefixing, or dispatch becomes ambiguous."),
+    ("Capability is not intent",
+     "Discovery tells you what a server can do, not what it should be allowed to do here. "
+     "Allow-list the tools you actually want."),
+]
+
+for risk, note in RISKS:
+    print(f"- {risk}\\n    {note}")`} />
+
+<Run id="llm-mcp-6" code={`def allowed_tools(discovered, allow_list):
+    """Expose only the tools you deliberately chose."""
+    return [t for t in discovered if t["name"] in allow_list]
+
+discovered = [
+    {"name": "search_docs", "description": "Search the docs."},
+    {"name": "read_doc", "description": "Read a document."},
+    {"name": "delete_doc", "description": "Delete a document permanently."},
+    {"name": "run_shell", "description": "Run an arbitrary shell command."},
+]
+
+chosen = allowed_tools(discovered, {"search_docs", "read_doc"})
+print("offered by the server:", [t["name"] for t in discovered])
+print("exposed to the model: ", [t["name"] for t in chosen])
+print()
+print("dropped:", [t["name"] for t in discovered if t not in chosen])`} />
+
+<Callout type="ai" title="Why this matters for AI">
+MCP is how an assistant reaches the systems that make it useful — your issue tracker, your
+warehouse, your runbooks — without a bespoke integration per pairing. That reach is exactly why
+the trust question matters. A server you did not write contributes both *capability* and *text* to
+your model's context, and the text arrives with whatever the server's author wanted it to say.
+Allow-list the tools, keep the destructive ones behind the approval gate from the last lesson, and
+treat every result as data.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="llm-mcp-ex1"
+  title="Exercise 1"
+  brief="Write <code>to_api_tools(descriptors, prefix)</code>: convert each MCP descriptor to an API tool definition, prefixing the name with <code>prefix__</code> and renaming <code>inputSchema</code> to <code>input_schema</code>."
+  code={`def to_api_tools(descriptors, prefix):
+    # Each descriptor has name, description and inputSchema.
+    # Produce {"name": f"{prefix}__{name}", "description": ..., "input_schema": ...}.
+    # A descriptor with no description should give an empty string.
+    ...
+
+
+descriptors = [
+    {"name": "search", "description": "Search the docs.",
+     "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}},
+                     "required": ["query"]}},
+    {"name": "read", "inputSchema": {"type": "object", "properties": {"uri": {"type": "string"}}}},
+]
+
+for tool in to_api_tools(descriptors, "docs"):
+    print(tool)`}
+  hint="A list comprehension over the descriptors, using descriptor.get('description', '') for the optional field."
+  solution={`def to_api_tools(descriptors, prefix):
+    return [
+        {
+            "name": f"{prefix}__{descriptor['name']}",
+            "description": descriptor.get("description", ""),
+            "input_schema": descriptor["inputSchema"],
+        }
+        for descriptor in descriptors
+    ]
+
+
+descriptors = [
+    {"name": "search", "description": "Search the docs.",
+     "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}},
+                     "required": ["query"]}},
+    {"name": "read", "inputSchema": {"type": "object", "properties": {"uri": {"type": "string"}}}},
+]
+
+for tool in to_api_tools(descriptors, "docs"):
+    print(tool)`}
+  tests={`descriptors = [
+    {"name": "search", "description": "Search the docs.",
+     "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}},
+                     "required": ["query"]}},
+    {"name": "read", "inputSchema": {"type": "object", "properties": {"uri": {"type": "string"}}}},
+]
+
+tools = to_api_tools(descriptors, "docs")
+assert isinstance(tools, list) and len(tools) == 2, f"One tool per descriptor, got {tools!r}."
+
+assert tools[0]["name"] == "docs__search", (
+    f"Names must be prefixed so two servers can both offer 'search'. Got {tools[0]['name']!r}."
+)
+assert tools[0]["description"] == "Search the docs.", "The description carries over."
+assert "input_schema" in tools[0], "The API field is input_schema, not inputSchema."
+assert "inputSchema" not in tools[0], "Do not leave the MCP spelling in the API definition."
+assert tools[0]["input_schema"] == descriptors[0]["inputSchema"], "The schema passes through unchanged."
+
+assert tools[1]["description"] == "", (
+    f"A descriptor with no description should give an empty string, got {tools[1]['description']!r}."
+)
+
+# A different prefix must change every name.
+other = to_api_tools(descriptors, "wiki")
+assert [t["name"] for t in other] == ["wiki__search", "wiki__read"], (
+    f"Got {[t['name'] for t in other]}."
+)
+assert to_api_tools([], "x") == [], "No descriptors means no tools."`}
+/>
+
+<Exercise
+  id="llm-mcp-ex2"
+  title="Exercise 2"
+  brief="Write <code>expose(discovered, allow_list)</code>: return only the tools whose names are in the allow-list, and <code>rejected(discovered, allow_list)</code> returning the names that were held back."
+  code={`def expose(discovered, allow_list):
+    # Keep only the descriptors whose "name" is in allow_list, in order.
+    ...
+
+
+def rejected(discovered, allow_list):
+    # The names that were NOT exposed, in order.
+    ...
+
+
+discovered = [
+    {"name": "search_docs", "description": "Search."},
+    {"name": "read_doc", "description": "Read."},
+    {"name": "delete_doc", "description": "Delete permanently."},
+    {"name": "run_shell", "description": "Run any command."},
+]
+
+print([t["name"] for t in expose(discovered, {"search_docs", "read_doc"})])
+print(rejected(discovered, {"search_docs", "read_doc"}))`}
+  hint="Two comprehensions over discovered, filtering on whether the name is in allow_list."
+  solution={`def expose(discovered, allow_list):
+    return [tool for tool in discovered if tool["name"] in allow_list]
+
+
+def rejected(discovered, allow_list):
+    return [tool["name"] for tool in discovered if tool["name"] not in allow_list]
+
+
+discovered = [
+    {"name": "search_docs", "description": "Search."},
+    {"name": "read_doc", "description": "Read."},
+    {"name": "delete_doc", "description": "Delete permanently."},
+    {"name": "run_shell", "description": "Run any command."},
+]
+
+print([t["name"] for t in expose(discovered, {"search_docs", "read_doc"})])
+print(rejected(discovered, {"search_docs", "read_doc"}))`}
+  tests={`discovered = [
+    {"name": "search_docs", "description": "Search."},
+    {"name": "read_doc", "description": "Read."},
+    {"name": "delete_doc", "description": "Delete permanently."},
+    {"name": "run_shell", "description": "Run any command."},
+]
+allow = {"search_docs", "read_doc"}
+
+kept = expose(discovered, allow)
+assert [t["name"] for t in kept] == ["search_docs", "read_doc"], (
+    f"Only the allow-listed tools, in their original order. Got {[t['name'] for t in kept]}."
+)
+assert all(isinstance(t, dict) for t in kept), "Return the descriptors, not just their names."
+assert kept[0] is discovered[0], "Pass the descriptors through unchanged."
+
+held = rejected(discovered, allow)
+assert held == ["delete_doc", "run_shell"], f"Expected the two dangerous tools, got {held}."
+
+# An empty allow-list exposes nothing, which is the safe default.
+assert expose(discovered, set()) == [], "An empty allow-list should expose nothing."
+assert len(rejected(discovered, set())) == 4, "...and reject everything."
+
+# A name in the allow-list that the server does not offer is simply absent.
+assert [t["name"] for t in expose(discovered, {"search_docs", "not_offered"})] == ["search_docs"], (
+    "An allow-listed name the server does not offer should not appear."
+)`}
+/>
+
+<Quiz
+  question="You pass mcp_servers to the API and get a validation error. What is missing?"
+  choices={[
+    { text: "The matching mcp_toolset entry in tools, with mcp_server_name equal to the server's name", correct: true, why: "Declaring the connection and declaring that you want its tools are two separate halves, and both are required." },
+    { text: "The server URL must use stdio rather than https", why: "The URL connector is exactly for remote HTTP servers; stdio is the local transport." },
+    { text: "An API key for the MCP server", why: "Some servers need credentials, but the validation error here is about the missing toolset declaration." },
+    { text: "The tools must be listed individually by name", why: "The toolset entry covers the server's tools; you do not enumerate them." },
+  ]}
+/>
+
+<Quiz
+  question="Why allow-list the tools an MCP server offers rather than exposing everything it discovers?"
+  choices={[
+    { text: "Discovery tells you what a server can do, not what it should be allowed to do in this application", correct: true, why: "A server may legitimately offer delete or shell tools for other callers; exposing them here widens your blast radius for no benefit." },
+    { text: "Exposing too many tools exceeds the API's tool limit", why: "Limits exist, but the reason to allow-list is control, not capacity." },
+    { text: "Undeclared tools cannot be called anyway", why: "Anything you pass in tools can be called — which is exactly why the filtering matters." },
+    { text: "It reduces the server's hosting cost", why: "It has no effect on the server; the benefit is entirely on your side." },
+  ]}
+/>
+
+## Recap
+
+- MCP standardises **tools** (the model invokes), **resources** (your client includes) and
+  **prompts** (templates the server offers), discovered at runtime.
+- An MCP descriptor becomes an API tool by renaming `inputSchema` to `input_schema` — and prefix
+  the names, because servers collide.
+- stdio for a local server your client launches; the `mcp_servers` URL connector for a remote one.
+  The connector needs **both** `mcp_servers` and a matching `mcp_toolset` in `tools`.
+- A server contributes capability *and* text to your context: allow-list its tools, gate the
+  destructive ones, and treat every result as data.
