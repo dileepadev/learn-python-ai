@@ -1,0 +1,506 @@
+---
+title: "asyncio: concurrency for I/O-bound AI workloads"
+description: A hundred API calls one after another take a hundred times as long as one. Run them concurrently, bound the concurrency, and never block the event loop.
+module: production-ai
+order: 1
+level: expert
+minutes: 22
+objectives:
+  - Explain when async helps and when it does nothing
+  - Write coroutines and run them concurrently with gather
+  - Bound concurrency with a semaphore
+  - Handle failures and timeouts without losing the other results
+  - Avoid blocking the event loop
+---
+
+<Callout type="warning" title="A difference in this page only">
+In a script you start the event loop yourself with `asyncio.run(main())`. This page already runs
+your code *inside* a loop, so `await` works at the top level and `asyncio.run` does not. Every
+other detail is identical, and the listings show the `asyncio.run` form where it belongs.
+</Callout>
+
+## When async helps
+
+<Run id="prod-async-1" code={`WORKLOADS = [
+    ("I/O-bound", "API calls, database queries, reading files, fetching URLs",
+     "The program spends its time *waiting*. asyncio lets it wait for many things at once. "
+     "Huge win."),
+    ("CPU-bound", "matrix multiplication, parsing a million rows, training",
+     "The program spends its time *computing*. There is nothing to overlap. "
+     "Use processes, or a vectorised library. asyncio does nothing."),
+]
+
+for kind, examples, verdict in WORKLOADS:
+    print(f"{kind}\\n  {examples}\\n  {verdict}\\n")
+
+print("An LLM call is 99.9% waiting. This is the best case asyncio has.")`} />
+
+## Sequential against concurrent
+
+<Run id="prod-async-2" code={`import asyncio, time
+
+async def fake_api_call(prompt, latency=0.05):
+    """Stands in for a model call: mostly waiting."""
+    await asyncio.sleep(latency)
+    return f"reply to {prompt}"
+
+prompts = [f"question {n}" for n in range(10)]
+
+started = time.perf_counter()
+sequential = []
+for prompt in prompts:
+    sequential.append(await fake_api_call(prompt))
+sequential_ms = (time.perf_counter() - started) * 1000
+
+started = time.perf_counter()
+concurrent = await asyncio.gather(*(fake_api_call(p) for p in prompts))
+concurrent_ms = (time.perf_counter() - started) * 1000
+
+print(f"sequential: {sequential_ms:7.1f} ms")
+print(f"concurrent: {concurrent_ms:7.1f} ms")
+print(f"speed-up:   {sequential_ms / concurrent_ms:7.1f}x")
+print()
+print("same answers:", sequential == concurrent)`} />
+
+Ten calls that each wait 50 ms take 500 ms in sequence and about 50 ms together. Nothing got
+faster — the waiting simply overlapped.
+
+<Callout type="warning">
+`await` on its own does **not** create concurrency. `await a(); await b()` runs `a` to completion
+before starting `b`, exactly like synchronous code. Concurrency comes from `gather`, `TaskGroup`
+or `create_task` — from starting things before awaiting them.
+</Callout>
+
+<Run id="prod-async-3" code={`import asyncio, time
+
+async def work(name, seconds):
+    await asyncio.sleep(seconds)
+    return name
+
+# Sequential, despite every line having an await.
+started = time.perf_counter()
+first = await work("a", 0.05)
+second = await work("b", 0.05)
+print(f"awaited in turn:  {(time.perf_counter() - started) * 1000:6.1f} ms")
+
+# Concurrent.
+started = time.perf_counter()
+both = await asyncio.gather(work("a", 0.05), work("b", 0.05))
+print(f"gathered:         {(time.perf_counter() - started) * 1000:6.1f} ms")`} />
+
+## Bounding concurrency
+
+Launching a thousand calls at once will hit a rate limit, exhaust your connection pool, or both.
+A semaphore caps how many run at a time:
+
+<Run id="prod-async-4" code={`import asyncio, time
+
+async def fake_api_call(n, latency=0.03):
+    await asyncio.sleep(latency)
+    return n * 2
+
+async def run_all(items, limit):
+    semaphore = asyncio.Semaphore(limit)
+    in_flight, peak = 0, 0
+
+    async def guarded(item):
+        nonlocal in_flight, peak
+        async with semaphore:
+            in_flight += 1
+            peak = max(peak, in_flight)
+            try:
+                return await fake_api_call(item)
+            finally:
+                in_flight -= 1
+
+    results = await asyncio.gather(*(guarded(i) for i in items))
+    return results, peak
+
+items = list(range(40))
+for limit in [1, 5, 20]:
+    started = time.perf_counter()
+    results, peak = await run_all(items, limit)
+    elapsed = (time.perf_counter() - started) * 1000
+    print(f"limit {limit:>3}: {elapsed:7.1f} ms   peak in flight {peak:>3}   results {len(results)}")`} />
+
+The semaphore is the single most important line in a production async client. Without it,
+concurrency is whatever the input size happens to be.
+
+<Callout type="ai" title="Why this matters for AI">
+Embedding a corpus, running an evaluation set, or answering a batch of questions are all the same
+shape: hundreds of independent calls that are almost entirely waiting. Sequentially, a
+500-question evaluation at two seconds a call takes seventeen minutes; at a concurrency of twenty
+it takes under a minute, and you will actually run it on every change. The semaphore is what keeps
+that from turning into a wall of 429s — and note that the right limit comes from the rate limit
+and the pool size, not from how many items you have.
+</Callout>
+
+## Failures
+
+By default `gather` propagates the first exception and you lose every other result.
+`return_exceptions=True` keeps them:
+
+<Run id="prod-async-5" code={`import asyncio
+
+async def flaky(n):
+    await asyncio.sleep(0.01)
+    if n % 3 == 0:
+        raise ValueError(f"item {n} failed")
+    return n * 2
+
+# Default: one failure loses everything.
+try:
+    await asyncio.gather(*(flaky(n) for n in range(6)))
+except ValueError as error:
+    print("gather raised:", error, "— and the other five results are gone")
+
+print()
+
+outcomes = await asyncio.gather(*(flaky(n) for n in range(6)), return_exceptions=True)
+succeeded = [o for o in outcomes if not isinstance(o, Exception)]
+failed = [(n, o) for n, o in enumerate(outcomes) if isinstance(o, Exception)]
+
+print(f"succeeded: {succeeded}")
+for position, error in failed:
+    print(f"failed:    item {position}: {type(error).__name__}: {error}")`} />
+
+For a batch job that is almost always what you want: finish everything, then report what failed.
+
+<Run id="prod-async-6" code={`import asyncio
+from dataclasses import dataclass
+
+@dataclass
+class Outcome:
+    item: object
+    value: object = None
+    error: Exception | None = None
+
+    @property
+    def ok(self):
+        return self.error is None
+
+async def run_batch(items, worker, limit=8):
+    """Run everything, keep every outcome, never lose a result to one failure."""
+    semaphore = asyncio.Semaphore(limit)
+
+    async def guarded(item):
+        async with semaphore:
+            try:
+                return Outcome(item, value=await worker(item))
+            except Exception as error:
+                return Outcome(item, error=error)
+
+    return await asyncio.gather(*(guarded(i) for i in items))
+
+async def embed(text):
+    await asyncio.sleep(0.01)
+    if "bad" in text:
+        raise ValueError("unembeddable")
+    return len(text)
+
+outcomes = await run_batch(["alpha", "bad input", "gamma", "delta", "also bad"], embed)
+
+print(f"{sum(o.ok for o in outcomes)} of {len(outcomes)} succeeded")
+for outcome in outcomes:
+    print(f"  {'ok  ' if outcome.ok else 'FAIL'} {outcome.item!r:14} {outcome.value or outcome.error}")`} />
+
+## Timeouts
+
+A call that hangs holds a semaphore slot for ever. Bound it:
+
+<Run id="prod-async-7" code={`import asyncio
+
+async def slow(seconds):
+    await asyncio.sleep(seconds)
+    return "finished"
+
+for budget, duration in [(0.10, 0.02), (0.05, 0.50)]:
+    try:
+        async with asyncio.timeout(budget):
+            result = await slow(duration)
+        print(f"budget {budget}s, took {duration}s -> {result}")
+    except TimeoutError:
+        print(f"budget {budget}s, took {duration}s -> timed out")
+
+print()
+# wait_for is the older spelling of the same idea.
+try:
+    await asyncio.wait_for(slow(0.5), timeout=0.05)
+except TimeoutError:
+    print("asyncio.wait_for also raises TimeoutError")`} />
+
+## Results as they arrive
+
+`gather` waits for everything. When you want to stream progress, take results as they finish:
+
+<Run id="prod-async-8" code={`import asyncio, random, time
+
+async def work(n):
+    await asyncio.sleep(random.Random(n).uniform(0.01, 0.08))
+    return n
+
+started = time.perf_counter()
+for coroutine in asyncio.as_completed([work(n) for n in range(8)]):
+    result = await coroutine
+    print(f"  {(time.perf_counter() - started) * 1000:6.1f} ms  finished {result}")`} />
+
+Results arrive out of order, which is the point — a progress bar can move, and a downstream stage
+can start on the first result instead of waiting for the slowest.
+
+## Never block the loop
+
+One synchronous call blocks *everything*, because there is only one thread:
+
+<Run id="prod-async-9" code={`import asyncio, time
+
+async def ticker(name, ticks=4):
+    for tick in range(ticks):
+        await asyncio.sleep(0.02)
+        print(f"  {name} tick {tick}")
+
+async def blocking_work():
+    time.sleep(0.12)                 # the wrong sleep: blocks the whole loop
+    print("  blocking work done")
+
+async def cooperative_work():
+    await asyncio.sleep(0.12)        # yields, so other tasks run
+    print("  cooperative work done")
+
+print("with a blocking call:")
+await asyncio.gather(ticker("tick"), blocking_work())
+
+print()
+print("with an awaited call:")
+await asyncio.gather(ticker("tick"), cooperative_work())`} />
+
+In the first run every tick is stuck behind the blocking call. The rule: inside `async def`, never
+call anything that waits without `await`. If you must — a synchronous SDK, a CPU-heavy function —
+push it to a thread:
+
+```python
+import asyncio
+
+def parse_huge_file(path):          # synchronous, CPU-heavy
+    ...
+
+result = await asyncio.to_thread(parse_huge_file, "corpus.jsonl")
+```
+
+## The shape in a real script
+
+```python
+import asyncio, anthropic
+
+client = anthropic.AsyncAnthropic()
+
+async def answer(question: str, semaphore: asyncio.Semaphore) -> str:
+    async with semaphore:
+        async with asyncio.timeout(60):
+            response = await client.messages.create(
+                model="claude-opus-5",
+                max_tokens=1024,
+                messages=[{"role": "user", "content": question}],
+            )
+        return "".join(b.text for b in response.content if b.type == "text")
+
+async def main() -> None:
+    semaphore = asyncio.Semaphore(8)
+    questions = load_questions()
+    outcomes = await asyncio.gather(
+        *(answer(q, semaphore) for q in questions),
+        return_exceptions=True,
+    )
+    for question, outcome in zip(questions, outcomes):
+        record(question, outcome)
+
+asyncio.run(main())          # the entry point a script needs, and this page does not
+```
+
+## Try it yourself
+
+<Exercise
+  id="prod-async-ex1"
+  title="Exercise 1"
+  brief="Write <code>run_limited(items, worker, limit)</code>: run <code>worker</code> over every item concurrently, with at most <code>limit</code> running at a time, returning the results in the original order."
+  code={`import asyncio
+
+async def run_limited(items, worker, limit=4):
+    # Use an asyncio.Semaphore(limit) and asyncio.gather.
+    # Results must line up with items, whatever order they finish in.
+    ...
+
+
+async def double(n):
+    await asyncio.sleep(0.01)
+    return n * 2
+
+print(await run_limited(list(range(8)), double, limit=3))`}
+  hint="Define an inner async function that takes the semaphore with 'async with' and awaits worker(item), then gather those coroutines."
+  solution={`import asyncio
+
+async def run_limited(items, worker, limit=4):
+    semaphore = asyncio.Semaphore(limit)
+
+    async def guarded(item):
+        async with semaphore:
+            return await worker(item)
+
+    return await asyncio.gather(*(guarded(item) for item in items))
+
+
+async def double(n):
+    await asyncio.sleep(0.01)
+    return n * 2
+
+print(await run_limited(list(range(8)), double, limit=3))`}
+  tests={`import asyncio, time
+
+async def double(n):
+    await asyncio.sleep(0.01)
+    return n * 2
+
+results = await run_limited(list(range(8)), double, limit=3)
+assert list(results) == [0, 2, 4, 6, 8, 10, 12, 14], (
+    f"Results must line up with the input order, got {list(results)}."
+)
+
+# The limit must actually bound concurrency.
+in_flight = 0
+peak = 0
+
+async def watched(n):
+    global in_flight, peak
+    in_flight += 1
+    peak = max(peak, in_flight)
+    await asyncio.sleep(0.02)
+    in_flight -= 1
+    return n
+
+await run_limited(list(range(12)), watched, limit=3)
+assert peak <= 3, f"At most 3 should run at once, but {peak} did — is the semaphore held?"
+assert peak > 1, f"Only {peak} ran at a time — the work should still be concurrent."
+
+# And it must really be concurrent, not sequential.
+async def slow(n):
+    await asyncio.sleep(0.03)
+    return n
+
+started = time.perf_counter()
+await run_limited(list(range(8)), slow, limit=8)
+elapsed = time.perf_counter() - started
+assert elapsed < 0.15, (
+    f"Eight 30 ms calls at a limit of 8 should take about 30 ms, not {elapsed * 1000:.0f} ms — "
+    "start them all before awaiting."
+)
+
+assert list(await run_limited([], double, limit=3)) == [], "No items means no results."`}
+/>
+
+<Exercise
+  id="prod-async-ex2"
+  title="Exercise 2"
+  brief="Write <code>settle(items, worker)</code>: run everything concurrently and return a list of <code>(item, value, error)</code> triples, so one failure never loses the other results."
+  code={`import asyncio
+
+async def settle(items, worker):
+    # Run worker over every item. For each, return (item, value, None) on
+    # success or (item, None, exception) on failure. Keep the input order.
+    ...
+
+
+async def flaky(n):
+    await asyncio.sleep(0.01)
+    if n % 3 == 0:
+        raise ValueError(f"item {n} failed")
+    return n * 2
+
+for item, value, error in await settle(list(range(6)), flaky):
+    print(item, value, type(error).__name__ if error else None)`}
+  hint="asyncio.gather(..., return_exceptions=True) gives you values and exceptions mixed; zip them back with the items and split on isinstance(outcome, Exception)."
+  solution={`import asyncio
+
+async def settle(items, worker):
+    outcomes = await asyncio.gather(
+        *(worker(item) for item in items), return_exceptions=True
+    )
+    return [
+        (item, None, outcome) if isinstance(outcome, Exception) else (item, outcome, None)
+        for item, outcome in zip(items, outcomes)
+    ]
+
+
+async def flaky(n):
+    await asyncio.sleep(0.01)
+    if n % 3 == 0:
+        raise ValueError(f"item {n} failed")
+    return n * 2
+
+for item, value, error in await settle(list(range(6)), flaky):
+    print(item, value, type(error).__name__ if error else None)`}
+  tests={`import asyncio
+
+async def flaky(n):
+    await asyncio.sleep(0.01)
+    if n % 3 == 0:
+        raise ValueError(f"item {n} failed")
+    return n * 2
+
+results = await settle(list(range(6)), flaky)
+assert len(results) == 6, f"One triple per item, got {len(results)}."
+assert [r[0] for r in results] == list(range(6)), "Keep the input order."
+
+assert results[0][1] is None and isinstance(results[0][2], ValueError), (
+    f"Item 0 fails, so expect (0, None, ValueError). Got {results[0]!r}."
+)
+assert results[1][1] == 2 and results[1][2] is None, (
+    f"Item 1 succeeds, so expect (1, 2, None). Got {results[1]!r}."
+)
+assert results[3][2] is not None, "Item 3 fails too."
+
+succeeded = [r for r in results if r[2] is None]
+assert len(succeeded) == 4, (
+    f"Four of six should succeed — one failure must not lose the rest. Got {len(succeeded)}."
+)
+
+# Every item must be attempted, even when the first one raises.
+async def always_fails(n):
+    raise RuntimeError("nope")
+
+everything = await settle([1, 2, 3], always_fails)
+assert len(everything) == 3, "All three must be attempted and reported."
+assert all(isinstance(r[2], RuntimeError) for r in everything), (
+    "Each failure should be captured, not raised."
+)
+
+assert await settle([], flaky) == [], "No items means no results."`}
+/>
+
+<Quiz
+  question="You replace ten sequential awaits with ten awaits inside a loop. Is the code now concurrent?"
+  choices={[
+    { text: "No — awaiting in a loop runs each call to completion before starting the next", correct: true, why: "await means 'wait here'. Concurrency needs the calls started before any is awaited, which is what gather, TaskGroup and create_task do." },
+    { text: "Yes — anything inside an async function runs concurrently", why: "async marks a function as awaitable; it does nothing about scheduling." },
+    { text: "Yes, as long as the function is declared async", why: "The declaration changes how the function is called, not how many run at once." },
+    { text: "Only if the loop is a comprehension", why: "The syntax makes no difference; what matters is when you await." },
+  ]}
+/>
+
+<Quiz
+  question="An async worker calls a synchronous library function that takes 200 ms. What happens?"
+  choices={[
+    { text: "The whole event loop stalls for 200 ms — every other task is frozen", correct: true, why: "There is one thread. A call that does not await cannot be interrupted, so nothing else progresses. Push it to a thread with asyncio.to_thread." },
+    { text: "Only that worker is delayed; the others continue", why: "That would be true of threads, but an event loop cannot pre-empt a blocking call." },
+    { text: "asyncio raises an error for blocking calls", why: "It cannot detect them — which is why this bug is so easy to ship." },
+    { text: "The call is automatically moved to a thread pool", why: "Nothing is automatic; you have to ask for it explicitly." },
+  ]}
+/>
+
+## Recap
+
+- async helps I/O-bound work — API calls, queries, fetches — and does nothing for CPU-bound work.
+- `await` alone is sequential. Concurrency comes from `gather`, `TaskGroup` or `create_task`.
+- Bound concurrency with `asyncio.Semaphore`, sized from your rate limit, not your input.
+- `gather(..., return_exceptions=True)` keeps every result when one call fails.
+- `async with asyncio.timeout(n)` stops a hung call holding a slot; `as_completed` streams results
+  as they arrive.
+- One blocking call freezes the whole loop. Use `asyncio.to_thread` for synchronous work.

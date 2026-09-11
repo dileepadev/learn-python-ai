@@ -1,0 +1,456 @@
+---
+title: Structured logging, tracing and observability
+description: A print statement cannot be queried. Emit JSON events with a request id, time every stage as a span, record the fields that explain an answer — and never log the key or the prompt by accident.
+module: production-ai
+order: 6
+level: expert
+minutes: 20
+objectives:
+  - Emit structured JSON logs instead of formatted strings
+  - Configure the logging module with a custom formatter
+  - Correlate every event in a request with one id
+  - Time stages as spans and record their outcome
+  - Redact secrets and personal data before they reach a log
+---
+
+When an answer is wrong, the answer tells you nothing. What tells you something is the record of
+what was retrieved, what was sent, what came back and how long each part took.
+
+## Strings you cannot query
+
+<Run id="prod-obs-1" code={`import json, time
+
+question = "How much overlap between chunks?"
+latency_ms = 1342
+tokens = {"input": 1820, "output": 74}
+
+print("as a string:")
+print(f"answered {question!r} in {latency_ms}ms using {tokens['input']}+{tokens['output']} tokens")
+print()
+print("as an event:")
+print(json.dumps({
+    "event": "answer",
+    "question": question,
+    "latency_ms": latency_ms,
+    "input_tokens": tokens["input"],
+    "output_tokens": tokens["output"],
+}))`} />
+
+The first line is readable and useless: "what is the p95 latency for questions over 2,000 input
+tokens?" cannot be answered without parsing prose. The second is one field access away.
+
+## A JSON formatter
+
+<Run id="prod-obs-2" code={`import json, logging, sys, time
+
+class JsonFormatter(logging.Formatter):
+    """One JSON object per line, with anything passed via extra merged in."""
+
+    RESERVED = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {
+        "message", "asctime", "taskName"
+    }
+
+    def format(self, record):
+        event = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
+            "level": record.levelname.lower(),
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for key, value in record.__dict__.items():
+            if key not in self.RESERVED:
+                event[key] = value
+        if record.exc_info:
+            event["error"] = self.formatException(record.exc_info).splitlines()[-1]
+        return json.dumps(event, default=str)
+
+logger = logging.getLogger("rag")
+logger.setLevel(logging.INFO)
+logger.handlers.clear()
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JsonFormatter())
+logger.addHandler(handler)
+logger.propagate = False
+
+logger.info("retrieved", extra={"request_id": "r-1", "k": 5, "top_score": 0.82})
+logger.warning("low confidence", extra={"request_id": "r-1", "top_score": 0.19})
+
+try:
+    raise ValueError("embedding dimension mismatch")
+except ValueError:
+    logger.exception("embedding failed", extra={"request_id": "r-1"})`} />
+
+`extra=` is the whole technique: structured fields travel with the message instead of being
+formatted into it.
+
+<Callout type="warning">
+`logging` reserves a set of attribute names on every record — `name`, `module`, `args`, `msg` and
+others. Passing one of them in `extra` raises `KeyError` at the call site. `request_id`,
+`latency_ms` and their kind are safe; `message` and `module` are not.
+</Callout>
+
+## One id per request
+
+Without a correlation id, concurrent requests interleave into an unreadable stream:
+
+<Run id="prod-obs-3" code={`import json, uuid
+
+def emit(event, **fields):
+    print(json.dumps({"event": event, **fields}))
+
+def handle(question):
+    request_id = "r-" + uuid.uuid4().hex[:8]
+    emit("request.start", request_id=request_id, question=question)
+    emit("retrieval", request_id=request_id, k=5, kept=2, top_score=0.81)
+    emit("generation", request_id=request_id, model="claude-opus-5",
+         input_tokens=1820, output_tokens=74)
+    emit("request.end", request_id=request_id, outcome="answered", latency_ms=1342)
+    return request_id
+
+for question in ["how much overlap?", "what dtype?"]:
+    handle(question)`} />
+
+Every line carries `request_id`, so one grep reassembles a single request out of a day of traffic.
+In an async service the id belongs in a `contextvars.ContextVar`, so it follows the work without
+being threaded through every function signature.
+
+## Spans
+
+<Run id="prod-obs-4" code={`import json, time
+from contextlib import contextmanager
+
+@contextmanager
+def span(name, request_id, **fields):
+    """Time a stage and record whether it succeeded — the module 2 pattern, applied."""
+    started = time.perf_counter()
+    status = "ok"
+    try:
+        yield fields
+    except Exception as error:
+        status = "error"
+        fields["error"] = f"{type(error).__name__}: {error}"
+        raise
+    finally:
+        print(json.dumps({
+            "event": "span",
+            "span": name,
+            "request_id": request_id,
+            "status": status,
+            "ms": round((time.perf_counter() - started) * 1000, 2),
+            **fields,
+        }))
+
+request_id = "r-4f2a"
+
+with span("embed_query", request_id, model="voyage-3"):
+    time.sleep(0.01)
+
+with span("retrieve", request_id) as fields:
+    time.sleep(0.02)
+    fields["candidates"] = 50
+    fields["kept"] = 4
+
+try:
+    with span("generate", request_id, model="claude-opus-5"):
+        time.sleep(0.01)
+        raise TimeoutError("upstream took too long")
+except TimeoutError:
+    pass`} />
+
+The `yield fields` is what lets a stage record what it *found* as well as how long it took — the
+candidate count is only known inside the block.
+
+## What to record for an LLM call
+
+<Run id="prod-obs-5" code={`FIELDS = [
+    ("request_id", "Correlates every event in one request."),
+    ("model", "Which model actually served it. Changes more often than you expect."),
+    ("prompt_version / prompt_hash", "Which prompt produced this. Essential for a diff."),
+    ("input_tokens / output_tokens", "Cost, and the input growth that signals a context leak."),
+    ("cache_read_tokens / cache_write_tokens", "Whether caching is working at all."),
+    ("stop_reason", "Distinguishes a finished answer from a truncation or a refusal."),
+    ("latency_ms / time_to_first_token_ms", "The two latencies users experience differently."),
+    ("retrieved / kept / top_score", "Why the answer had the context it had."),
+    ("cited / unsupported", "The citation check from module 7."),
+    ("outcome", "answered, refused, no_context, budget, error."),
+    ("cost_usd", "Computed at the edge, so it is queryable without a join."),
+]
+
+for field, why in FIELDS:
+    print(f"{field:<32} {why}")`} />
+
+<Callout type="ai" title="Why this matters for AI">
+These systems fail in ways a stack trace never shows: retrieval returned the wrong passages, the
+prompt changed last Tuesday, input tokens have tripled since a context-clearing bug, the cache hit
+rate quietly went to zero. None of those raise an exception, and none are visible in the answer.
+Logging `outcome`, `top_score`, the token counts and the prompt hash turns every one of them into
+a query you can run — and a dashboard you can watch before a user complains.
+</Callout>
+
+## Redaction
+
+<Run id="prod-obs-6" code={`import json, re
+
+SECRET_KEYS = {"api_key", "authorization", "password", "token", "secret"}
+EMAIL = re.compile(r"[\\w.+-]+@[\\w-]+\\.[\\w.]+")
+CARD = re.compile(r"\\b(?:\\d[ -]*?){13,16}\\b")
+KEYLIKE = re.compile(r"\\bsk-[A-Za-z0-9_-]{8,}\\b")
+
+def scrub(value):
+    if isinstance(value, dict):
+        return {k: ("[redacted]" if k.lower() in SECRET_KEYS else scrub(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [scrub(v) for v in value]
+    if isinstance(value, str):
+        value = KEYLIKE.sub("[key]", value)
+        value = EMAIL.sub("[email]", value)
+        value = CARD.sub("[card]", value)
+        return value
+    return value
+
+event = {
+    "request_id": "r-1",
+    "api_key": "sk-ant-abc123def456",
+    "user": {"email": "dileepa@example.com", "id": 42},
+    "question": "My card 4111 1111 1111 1111 was charged twice, mail me at a@b.com",
+    "headers": {"authorization": "Bearer sk-ant-xyz789abc", "accept": "application/json"},
+}
+
+print(json.dumps(scrub(event), indent=2))`} />
+
+<Callout type="warning">
+Logs are copied to places your application is not: a search index, a vendor's storage, a laptop
+during an incident. Redact at the point of emission, not in the pipeline afterwards — and treat
+prompts as data that may contain anything a user pasted, because it will.
+</Callout>
+
+## Sampling
+
+Logging every token of every prompt is expensive and rarely useful. Log the metadata always, the
+bodies rarely — and always when something went wrong:
+
+<Run id="prod-obs-7" code={`import hashlib
+
+def should_log_body(request_id, outcome, rate=0.01):
+    """Always on failure; otherwise a deterministic sample by request id."""
+    if outcome != "answered":
+        return True, "not a clean answer"
+    digest = int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16)
+    sampled = (digest % 10_000) < rate * 10_000
+    return sampled, "sampled" if sampled else "skipped"
+
+outcomes = ["answered"] * 8 + ["error", "refused"]
+logged = 0
+for n, outcome in enumerate(outcomes):
+    request_id = f"r-{n:04d}"
+    decision, why = should_log_body(request_id, outcome, rate=0.25)
+    logged += decision
+    print(f"{request_id}  {outcome:<9} {'LOG ' if decision else '    '} {why}")
+
+print()
+print(f"bodies logged: {logged} of {len(outcomes)}")`} />
+
+Hashing the request id rather than drawing randomly means the decision is stable — the same
+request logs the same way if it is retried, and two services in one trace agree about it.
+
+## Try it yourself
+
+<Exercise
+  id="prod-obs-ex1"
+  title="Exercise 1"
+  brief="Write <code>scrub(value)</code>: recursively redact any dict key in <code>SECRET_KEYS</code>, and replace email addresses and <code>sk-</code> keys inside strings."
+  code={`import re
+
+SECRET_KEYS = {"api_key", "authorization", "password", "token", "secret"}
+EMAIL = re.compile(r"[\\w.+-]+@[\\w-]+\\.[\\w.]+")
+KEYLIKE = re.compile(r"\\bsk-[A-Za-z0-9_-]{8,}\\b")
+
+def scrub(value):
+    # dict:  redact a value entirely when its key (lower-cased) is in
+    #        SECRET_KEYS, otherwise recurse into it.
+    # list:  recurse into each item.
+    # str:   replace sk- keys with "[key]" and emails with "[email]".
+    # anything else: return it unchanged.
+    ...
+
+
+print(scrub({"api_key": "sk-ant-abc12345", "user": {"email": "a@b.com"}, "count": 3}))`}
+  hint="Four branches, in order: dict, list, str, else. Use '[redacted]' for a secret key's value."
+  solution={`import re
+
+SECRET_KEYS = {"api_key", "authorization", "password", "token", "secret"}
+EMAIL = re.compile(r"[\\w.+-]+@[\\w-]+\\.[\\w.]+")
+KEYLIKE = re.compile(r"\\bsk-[A-Za-z0-9_-]{8,}\\b")
+
+def scrub(value):
+    if isinstance(value, dict):
+        return {
+            key: ("[redacted]" if key.lower() in SECRET_KEYS else scrub(inner))
+            for key, inner in value.items()
+        }
+    if isinstance(value, list):
+        return [scrub(item) for item in value]
+    if isinstance(value, str):
+        return EMAIL.sub("[email]", KEYLIKE.sub("[key]", value))
+    return value
+
+
+print(scrub({"api_key": "sk-ant-abc12345", "user": {"email": "a@b.com"}, "count": 3}))`}
+  tests={`result = scrub({"api_key": "sk-ant-abc12345", "user": {"email": "a@b.com"}, "count": 3})
+assert result["api_key"] == "[redacted]", f"A secret key's value goes entirely. Got {result['api_key']!r}."
+assert result["user"]["email"] == "[email]", f"Emails are replaced. Got {result['user']['email']!r}."
+assert result["count"] == 3, "Non-string values pass through untouched."
+
+assert scrub({"Authorization": "Bearer x"})["Authorization"] == "[redacted]", (
+    "Key matching must ignore case."
+)
+
+nested = scrub({"a": [{"password": "hunter2"}, "mail me at x@y.co"]})
+assert nested["a"][0]["password"] == "[redacted]", "Recursion must reach inside lists."
+assert nested["a"][1] == "mail me at [email]", f"Got {nested['a'][1]!r}."
+
+text = scrub("key sk-ant-abcdef123456 and mail a.b+c@example.co.uk")
+assert "sk-ant" not in text, f"The key should be gone. Got {text!r}."
+assert "[key]" in text and "[email]" in text, f"Both replacements should fire. Got {text!r}."
+assert "@example" not in text, "The whole address goes, not just the local part."
+
+assert scrub(42) == 42 and scrub(None) is None, "Other types are returned unchanged."
+assert scrub([]) == [] and scrub({}) == {}, "Empty containers are fine."
+
+# A short sk- string is not key-shaped and should survive.
+assert scrub("sk-ab") == "sk-ab", "Do not over-match: the pattern needs at least 8 characters."`}
+/>
+
+<Exercise
+  id="prod-obs-ex2"
+  title="Exercise 2"
+  brief="Write the <code>span</code> context manager: yield a dict the block can add fields to, and append one record with <code>name</code>, <code>status</code>, <code>ms</code> and those fields to <code>RECORDS</code> — even when the block raises."
+  code={`import time
+from contextlib import contextmanager
+
+RECORDS = []
+
+@contextmanager
+def span(name, **fields):
+    # Yield the fields dict so the block can add to it.
+    # On exit append {"name", "status", "ms", **fields} to RECORDS.
+    # status is "ok" normally and "error" when the block raises —
+    # and the exception must still propagate.
+    ...
+
+
+with span("retrieve", k=5) as fields:
+    fields["kept"] = 2
+
+try:
+    with span("generate"):
+        raise TimeoutError("too slow")
+except TimeoutError:
+    pass
+
+for record in RECORDS:
+    print({key: value for key, value in record.items() if key != "ms"})`}
+  hint="try: yield fields / except Exception: set status and re-raise / finally: append the record."
+  solution={`import time
+from contextlib import contextmanager
+
+RECORDS = []
+
+@contextmanager
+def span(name, **fields):
+    started = time.perf_counter()
+    status = "ok"
+    try:
+        yield fields
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        RECORDS.append({
+            "name": name,
+            "status": status,
+            "ms": round((time.perf_counter() - started) * 1000, 2),
+            **fields,
+        })
+
+
+with span("retrieve", k=5) as fields:
+    fields["kept"] = 2
+
+try:
+    with span("generate"):
+        raise TimeoutError("too slow")
+except TimeoutError:
+    pass
+
+for record in RECORDS:
+    print({key: value for key, value in record.items() if key != "ms"})`}
+  tests={`RECORDS.clear()
+
+with span("retrieve", k=5) as fields:
+    fields["kept"] = 2
+
+assert len(RECORDS) == 1, f"One record per span, got {len(RECORDS)}."
+record = RECORDS[0]
+assert record["name"] == "retrieve", f"Got {record['name']!r}."
+assert record["status"] == "ok", "A clean block is 'ok'."
+assert record["k"] == 5, "Fields passed at entry must be recorded."
+assert record["kept"] == 2, (
+    "Fields added inside the block must be recorded — yield the dict, do not copy it."
+)
+assert isinstance(record["ms"], (int, float)) and record["ms"] >= 0, "Record a duration."
+
+RECORDS.clear()
+try:
+    with span("generate", model="claude-opus-5"):
+        raise TimeoutError("too slow")
+except TimeoutError:
+    pass
+else:
+    raise AssertionError("The exception must propagate — do not swallow it.")
+
+assert len(RECORDS) == 1, "A failing span must still be recorded."
+assert RECORDS[0]["status"] == "error", f"Got {RECORDS[0]['status']!r}."
+assert RECORDS[0]["model"] == "claude-opus-5", "Entry fields survive a failure."
+
+# Nested spans should produce two records, innermost first.
+RECORDS.clear()
+with span("outer"):
+    with span("inner"):
+        pass
+assert [r["name"] for r in RECORDS] == ["inner", "outer"], (
+    f"The inner span finishes first. Got {[r['name'] for r in RECORDS]}."
+)`}
+/>
+
+<Quiz
+  question="Why log JSON events rather than formatted message strings?"
+  choices={[
+    { text: "Fields can be filtered, aggregated and alerted on without parsing prose", correct: true, why: "\"p95 latency where input_tokens > 2000 and outcome = refused\" is a query over fields and an impossibility over sentences." },
+    { text: "JSON logs are smaller", why: "They are usually larger — the keys are repeated on every line." },
+    { text: "The logging module only supports JSON", why: "It formats however you tell it to; JSON is a choice." },
+    { text: "It avoids needing a request id", why: "The id is still what correlates events; the format is a separate concern." },
+  ]}
+/>
+
+<Quiz
+  question="Which field most often explains a wrong answer in a RAG system?"
+  choices={[
+    { text: "The retrieval fields — what was retrieved, what was kept, and the top score", correct: true, why: "Most wrong answers are wrong context, and without those fields the failure is indistinguishable from a model problem." },
+    { text: "The model's temperature", why: "It affects phrasing far more than substance, and it rarely changes between requests." },
+    { text: "The total latency", why: "Useful for performance work, silent about correctness." },
+    { text: "The log level", why: "It says how the line was classified, not what happened." },
+  ]}
+/>
+
+## Recap
+
+- Emit JSON events with `extra=`, not formatted strings — fields are queryable, prose is not.
+- Give every request an id and put it on every event; in async code keep it in a `ContextVar`.
+- Wrap each stage in a span that records duration, status and what the stage found.
+- For an LLM call record the model, prompt hash, token counts, cache reads, `stop_reason`,
+  retrieval fields, citation check, outcome and cost.
+- Redact secrets and personal data at the point of emission; prompts contain whatever a user
+  pasted.
+- Always log metadata, sample bodies deterministically by request id, and always keep the body
+  when something failed.

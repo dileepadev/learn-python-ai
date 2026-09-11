@@ -1,0 +1,555 @@
+---
+title: Serving models with FastAPI
+description: Typed request and response models, async endpoints, streaming, dependency injection for the client, and error handling that turns an upstream 429 into the right status code.
+module: production-ai
+order: 7
+level: expert
+minutes: 22
+objectives:
+  - Define an endpoint with typed request and response models
+  - Validate input at the boundary and return a useful 422
+  - Inject the model client as a dependency so the app is testable
+  - Map upstream failures onto correct HTTP status codes
+  - Stream a response, and expose health and readiness checks
+---
+
+<Callout type="tip" title="These apps really run">
+FastAPI is available in this sandbox, but a web *server* is not — there are no sockets and no
+threads here. The blocks below therefore call the ASGI application directly, which is exactly what
+a server does after accepting a connection. The apps, the validation and the responses are real.
+</Callout>
+
+## The smallest useful service
+
+<Run id="prod-api-1" code={`import json
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+app = FastAPI(title="answers")
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+    max_words: int = Field(default=60, ge=10, le=500)
+
+class AskResponse(BaseModel):
+    answer: str
+    citations: list[str] = Field(default_factory=list)
+    model: str
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+@app.post("/ask", response_model=AskResponse)
+async def ask(body: AskRequest) -> AskResponse:
+    return AskResponse(
+        answer=f"You asked: {body.question} (at most {body.max_words} words)",
+        citations=["c1"],
+        model="claude-opus-5",
+    )
+
+async def call(app, method, path, body=None):
+    """Drive an ASGI app directly — what a server does once a request arrives."""
+    payload = b"" if body is None else json.dumps(body).encode()
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": method, "path": path, "raw_path": path.encode(),
+        "query_string": b"", "root_path": "", "scheme": "http",
+        "headers": [(b"host", b"test"), (b"content-type", b"application/json"),
+                    (b"content-length", str(len(payload)).encode())],
+        "client": ("test", 1), "server": ("test", 80),
+    }
+    pending = [{"type": "http.request", "body": payload, "more_body": False}]
+    async def receive():
+        return pending.pop(0) if pending else {"type": "http.disconnect"}
+    out = {"body": b"", "status": None}
+    async def send(message):
+        if message["type"] == "http.response.start":
+            out["status"] = message["status"]
+        elif message["type"] == "http.response.body":
+            out["body"] += message.get("body", b"")
+    await app(scope, receive, send)
+    text = out["body"].decode()
+    return out["status"], (json.loads(text) if text else None)
+
+print(await call(app, "GET", "/healthz"))
+print(await call(app, "POST", "/ask", {"question": "How much overlap?"}))`} />
+
+Everything typed in `AskRequest` is enforced before your function runs. Everything in
+`AskResponse` is enforced on the way out, so a handler cannot quietly return a shape the client
+does not expect.
+
+## Validation is free
+
+<Run id="prod-api-2" code={`import json
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+    max_words: int = Field(default=60, ge=10, le=500)
+
+@app.post("/ask")
+async def ask(body: AskRequest):
+    return {"echo": body.question, "max_words": body.max_words}
+
+async def call(app, method, path, body=None):
+    payload = b"" if body is None else json.dumps(body).encode()
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "method": method, "path": path, "raw_path": path.encode(),
+             "query_string": b"", "root_path": "", "scheme": "http",
+             "headers": [(b"host", b"t"), (b"content-type", b"application/json"),
+                         (b"content-length", str(len(payload)).encode())],
+             "client": ("t", 1), "server": ("t", 80)}
+    pending = [{"type": "http.request", "body": payload, "more_body": False}]
+    async def receive():
+        return pending.pop(0) if pending else {"type": "http.disconnect"}
+    out = {"body": b"", "status": None}
+    async def send(message):
+        if message["type"] == "http.response.start":
+            out["status"] = message["status"]
+        elif message["type"] == "http.response.body":
+            out["body"] += message.get("body", b"")
+    await app(scope, receive, send)
+    text = out["body"].decode()
+    return out["status"], (json.loads(text) if text else None)
+
+for label, body in [
+    ("valid", {"question": "hi"}),
+    ("missing field", {}),
+    ("empty question", {"question": ""}),
+    ("max_words too large", {"question": "hi", "max_words": 9999}),
+    ("wrong type", {"question": "hi", "max_words": "lots"}),
+]:
+    status, payload = await call(app, "POST", "/ask", body)
+    print(f"{status}  {label}")
+    if status == 422:
+        for problem in payload["detail"]:
+            print(f"       {'.'.join(str(p) for p in problem['loc'])}: {problem['msg']}")`} />
+
+Five cases, one model definition, no validation code. The 422 body names the field and the
+problem, which is what a client integrating against you needs.
+
+## Inject the client
+
+The same seam as the testing lesson, expressed as a FastAPI dependency:
+
+<Run id="prod-api-3" code={`import json
+from types import SimpleNamespace
+from fastapi import FastAPI, Depends
+from pydantic import BaseModel
+
+class FakeClient:
+    def __init__(self, reply="A short answer [c1]."):
+        self.reply = reply
+        self.requests = []
+    async def create(self, **request):
+        self.requests.append(request)
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=self.reply)],
+            stop_reason="end_turn",
+        )
+
+async def get_client():
+    """In production this returns anthropic.AsyncAnthropic(); tests override it.
+
+    Declared async so FastAPI awaits it on the event loop. A synchronous
+    dependency is run in a worker thread instead, which is wasted work when
+    there is nothing blocking to do.
+    """
+    return FakeClient()
+
+app = FastAPI()
+
+class AskRequest(BaseModel):
+    question: str
+
+@app.post("/ask")
+async def ask(body: AskRequest, client=Depends(get_client)):
+    response = await client.create(
+        model="claude-opus-5",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": body.question}],
+    )
+    return {"answer": "".join(b.text for b in response.content if b.type == "text")}
+
+# A test overrides the dependency — no monkeypatching, no global state.
+recorder = FakeClient("Overridden reply [c9].")
+
+async def use_recorder():
+    return recorder
+
+app.dependency_overrides[get_client] = use_recorder
+
+async def call(app, method, path, body=None):
+    payload = b"" if body is None else json.dumps(body).encode()
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "method": method, "path": path, "raw_path": path.encode(),
+             "query_string": b"", "root_path": "", "scheme": "http",
+             "headers": [(b"host", b"t"), (b"content-type", b"application/json"),
+                         (b"content-length", str(len(payload)).encode())],
+             "client": ("t", 1), "server": ("t", 80)}
+    pending = [{"type": "http.request", "body": payload, "more_body": False}]
+    async def receive():
+        return pending.pop(0) if pending else {"type": "http.disconnect"}
+    out = {"body": b"", "status": None}
+    async def send(message):
+        if message["type"] == "http.response.start":
+            out["status"] = message["status"]
+        elif message["type"] == "http.response.body":
+            out["body"] += message.get("body", b"")
+    await app(scope, receive, send)
+    text = out["body"].decode()
+    return out["status"], (json.loads(text) if text else None)
+
+print(await call(app, "POST", "/ask", {"question": "How much overlap?"}))
+print("the fake saw:", recorder.requests[0]["messages"])`} />
+
+`dependency_overrides` is why this matters: the test swaps the client without touching the
+handler, and production wiring stays in one function.
+
+## Error handling
+
+An upstream failure must become the right status code, not a 500:
+
+<Run id="prod-api-4" code={`import json
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+class RateLimited(Exception):
+    def __init__(self, retry_after=30):
+        self.retry_after = retry_after
+class Overloaded(Exception): pass
+class InvalidRequest(Exception): pass
+
+app = FastAPI()
+
+@app.exception_handler(RateLimited)
+async def rate_limited(request, error):
+    return JSONResponse(status_code=429, content={"detail": "upstream rate limited"},
+                        headers={"Retry-After": str(error.retry_after)})
+
+@app.exception_handler(Overloaded)
+async def overloaded(request, error):
+    return JSONResponse(status_code=503, content={"detail": "upstream overloaded"})
+
+@app.exception_handler(InvalidRequest)
+async def invalid(request, error):
+    return JSONResponse(status_code=400, content={"detail": str(error) or "invalid request"})
+
+class AskRequest(BaseModel):
+    question: str
+
+@app.post("/ask")
+async def ask(body: AskRequest):
+    if body.question == "rate-limit":
+        raise RateLimited(retry_after=12)
+    if body.question == "overloaded":
+        raise Overloaded()
+    if body.question == "too-long":
+        raise InvalidRequest("prompt exceeds the context window")
+    if body.question == "not-found":
+        raise HTTPException(status_code=404, detail="no such document")
+    return {"answer": "fine"}
+
+async def call(app, method, path, body=None):
+    payload = b"" if body is None else json.dumps(body).encode()
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "method": method, "path": path, "raw_path": path.encode(),
+             "query_string": b"", "root_path": "", "scheme": "http",
+             "headers": [(b"host", b"t"), (b"content-type", b"application/json"),
+                         (b"content-length", str(len(payload)).encode())],
+             "client": ("t", 1), "server": ("t", 80)}
+    pending = [{"type": "http.request", "body": payload, "more_body": False}]
+    async def receive():
+        return pending.pop(0) if pending else {"type": "http.disconnect"}
+    out = {"body": b"", "status": None, "headers": []}
+    async def send(message):
+        if message["type"] == "http.response.start":
+            out["status"] = message["status"]
+            out["headers"] = message.get("headers", [])
+        elif message["type"] == "http.response.body":
+            out["body"] += message.get("body", b"")
+    await app(scope, receive, send)
+    text = out["body"].decode()
+    return out, (json.loads(text) if text else None)
+
+for question in ["fine", "rate-limit", "overloaded", "too-long", "not-found"]:
+    out, payload = await call(app, "POST", "/ask", {"question": question})
+    headers = {k.decode(): v.decode() for k, v in out["headers"]}
+    extra = f"  Retry-After: {headers['retry-after']}" if "retry-after" in headers else ""
+    print(f"{out['status']}  {question:<12} {payload}{extra}")`} />
+
+<Callout type="warning">
+Never let an upstream 429 surface as a 500. A 500 tells the caller "this is broken and retrying
+will not help"; a 429 with `Retry-After` tells them exactly what to do. Mapping upstream failures
+onto honest status codes is what makes your service usable by someone else's retry logic.
+</Callout>
+
+## Streaming
+
+For a chat endpoint, streaming is the difference between a spinner and visible progress:
+
+```python
+import json
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+
+@app.post("/ask/stream")
+async def ask_stream(body: AskRequest):
+    async def events():
+        async with client.messages.stream(
+            model="claude-opus-5",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": body.question}],
+        ) as stream:
+            async for text in stream.text_stream:
+                yield f"data: {json.dumps({'delta': text})}\n\n"
+            final = await stream.get_final_message()
+            yield f"data: {json.dumps({'done': True, 'usage': final.usage.model_dump()})}\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+```
+
+Server-sent events are the simplest transport that works: a plain HTTP response, one `data:` line
+per chunk, and no WebSocket to manage. Send a final event carrying the usage so the client can
+show what the answer cost.
+
+## Health and readiness
+
+Two checks, and they are not the same:
+
+<Run id="prod-api-5" code={`import json
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
+state = {"index_loaded": False}
+
+@app.get("/healthz")
+async def healthz():
+    """Is the process alive? Must never depend on anything external."""
+    return {"status": "ok"}
+
+@app.get("/readyz")
+async def readyz():
+    """Can it serve traffic? May check that dependencies are ready."""
+    if not state["index_loaded"]:
+        return JSONResponse(status_code=503, content={"status": "loading the index"})
+    return {"status": "ready"}
+
+async def call(app, method, path):
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "method": method, "path": path, "raw_path": path.encode(),
+             "query_string": b"", "root_path": "", "scheme": "http",
+             "headers": [(b"host", b"t")], "client": ("t", 1), "server": ("t", 80)}
+    pending = [{"type": "http.request", "body": b"", "more_body": False}]
+    async def receive():
+        return pending.pop(0) if pending else {"type": "http.disconnect"}
+    out = {"body": b"", "status": None}
+    async def send(message):
+        if message["type"] == "http.response.start":
+            out["status"] = message["status"]
+        elif message["type"] == "http.response.body":
+            out["body"] += message.get("body", b"")
+    await app(scope, receive, send)
+    return out["status"], json.loads(out["body"].decode())
+
+print("before the index loads:")
+print(" ", await call(app, "GET", "/healthz"))
+print(" ", await call(app, "GET", "/readyz"))
+
+state["index_loaded"] = True
+print("after:")
+print(" ", await call(app, "GET", "/readyz"))`} />
+
+A liveness check that calls the model API will restart your pods during an upstream incident. Keep
+`/healthz` dependency-free and put the dependency checks in `/readyz`.
+
+<Callout type="ai" title="Why this matters for AI">
+An LLM endpoint has a latency profile nothing else in your stack shares: seconds rather than
+milliseconds, and highly variable. That changes the operational defaults — timeouts measured in
+tens of seconds, streaming so the connection never idles, a concurrency limit sized by your API
+rate limit rather than by CPU, and a queue in front when demand exceeds it. Sizing a worker pool
+the way you would for a database-backed endpoint gives you either idle capacity or a queue that
+never drains.
+</Callout>
+
+## Running it
+
+```bash
+pip install "fastapi[standard]" uvicorn
+uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4
+```
+
+Because the handlers are `async` and almost all of their time is spent waiting on the model API,
+a small number of workers serves a large number of concurrent requests — the module's first lesson
+applied to a server. Add the concurrency limit and the token bucket from lesson 2 *inside* the
+process, so your own service shapes the load before the upstream API has to.
+
+## Try it yourself
+
+<Exercise
+  id="prod-api-ex1"
+  title="Exercise 1"
+  brief="Define <code>AskRequest</code> and <code>AskResponse</code>: a non-empty question of at most 500 characters, <code>top_k</code> between 1 and 20 defaulting to 5, and a response with an answer, a list of citations and a boolean <code>refused</code>."
+  code={`from pydantic import BaseModel, Field
+
+class AskRequest(BaseModel):
+    # question: 1 to 500 characters
+    # top_k:    integer from 1 to 20, default 5
+    ...
+
+
+class AskResponse(BaseModel):
+    # answer:    string
+    # citations: list of strings, empty by default
+    # refused:   bool, default False
+    ...
+
+
+print(AskRequest(question="hi"))
+print(AskResponse(answer="ok"))`}
+  hint="Field(min_length=1, max_length=500) and Field(default=5, ge=1, le=20); default_factory=list for the citations."
+  solution={`from pydantic import BaseModel, Field
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+    top_k: int = Field(default=5, ge=1, le=20)
+
+
+class AskResponse(BaseModel):
+    answer: str
+    citations: list[str] = Field(default_factory=list)
+    refused: bool = False
+
+
+print(AskRequest(question="hi"))
+print(AskResponse(answer="ok"))`}
+  tests={`from pydantic import ValidationError
+
+request = AskRequest(question="hi")
+assert request.top_k == 5, f"top_k should default to 5, got {request.top_k}."
+
+for bad, why in [
+    ({"question": ""}, "an empty question must be refused"),
+    ({"question": "x" * 501}, "over 500 characters must be refused"),
+    ({"top_k": 5}, "question is required"),
+    ({"question": "hi", "top_k": 0}, "top_k below 1 must be refused"),
+    ({"question": "hi", "top_k": 21}, "top_k above 20 must be refused"),
+]:
+    try:
+        AskRequest(**bad)
+    except ValidationError:
+        pass
+    else:
+        raise AssertionError(why)
+
+assert AskRequest(question="x" * 500).question, "Exactly 500 characters is allowed."
+assert AskRequest(question="hi", top_k=1).top_k == 1, "1 is allowed."
+assert AskRequest(question="hi", top_k=20).top_k == 20, "20 is allowed."
+
+response = AskResponse(answer="ok")
+assert response.citations == [], f"citations should default to empty, got {response.citations}."
+assert response.refused is False, "refused should default to False."
+
+a, b = AskResponse(answer="x"), AskResponse(answer="y")
+a.citations.append("c1")
+assert b.citations == [], "Use default_factory=list so instances do not share one list."
+
+full = AskResponse(answer="hi", citations=["c1", "c2"], refused=False)
+assert full.citations == ["c1", "c2"]`}
+/>
+
+<Exercise
+  id="prod-api-ex2"
+  title="Exercise 2"
+  brief="Write <code>status_for(error)</code>: map <code>RateLimited</code> to 429, <code>Overloaded</code> to 503, <code>InvalidRequest</code> to 400, <code>NotFound</code> to 404, and anything else to 500."
+  code={`class RateLimited(Exception): pass
+class Overloaded(Exception): pass
+class InvalidRequest(Exception): pass
+class NotFound(Exception): pass
+
+
+def status_for(error):
+    # Return the HTTP status code this upstream failure should become.
+    ...
+
+
+for error in [RateLimited(), Overloaded(), InvalidRequest(), NotFound(), RuntimeError()]:
+    print(type(error).__name__, status_for(error))`}
+  hint="A chain of isinstance checks, or a dict keyed on type(error) with a 500 default."
+  solution={`class RateLimited(Exception): pass
+class Overloaded(Exception): pass
+class InvalidRequest(Exception): pass
+class NotFound(Exception): pass
+
+
+STATUS = {
+    RateLimited: 429,
+    Overloaded: 503,
+    InvalidRequest: 400,
+    NotFound: 404,
+}
+
+def status_for(error):
+    return STATUS.get(type(error), 500)
+
+
+for error in [RateLimited(), Overloaded(), InvalidRequest(), NotFound(), RuntimeError()]:
+    print(type(error).__name__, status_for(error))`}
+  tests={`assert status_for(RateLimited()) == 429, "An upstream rate limit is a 429 downstream."
+assert status_for(Overloaded()) == 503, "Overloaded is a 503."
+assert status_for(InvalidRequest()) == 400, "A bad request is a 400."
+assert status_for(NotFound()) == 404, "Not found is a 404."
+
+assert status_for(RuntimeError("something else")) == 500, (
+    "An unrecognised failure is a genuine 500."
+)
+assert status_for(ValueError("x")) == 500, "So is any other exception."
+
+# The distinction that matters: a rate limit must never be reported as a server error.
+assert status_for(RateLimited()) != 500, (
+    "Reporting a 429 as a 500 tells the caller retrying will not help, which is wrong."
+)
+
+# It must work on instances carrying arguments.
+assert status_for(RateLimited("slow down")) == 429, "Arguments should not change the mapping."
+assert status_for(InvalidRequest("prompt too long")) == 400`}
+/>
+
+<Quiz
+  question="Why should /healthz not check the model API?"
+  choices={[
+    { text: "A liveness check that depends on an upstream service restarts your pods during someone else's outage", correct: true, why: "Liveness answers 'is this process alive?'. Dependency checks belong in readiness, which removes an instance from the load balancer instead of killing it." },
+    { text: "Health checks must not make network calls at all", why: "Readiness checks often do; it is liveness specifically that must stay local." },
+    { text: "It would cost too much", why: "The cost is negligible; the restart loop is the problem." },
+    { text: "FastAPI forbids async work in health endpoints", why: "It allows it — this is an operational convention, not a framework rule." },
+  ]}
+/>
+
+<Quiz
+  question="What does declaring a Pydantic response_model give you?"
+  choices={[
+    { text: "The response is validated and shaped on the way out, so a handler cannot return an unexpected shape", correct: true, why: "It also documents the contract in the generated OpenAPI schema, so clients see the real response type." },
+    { text: "Nothing beyond documentation", why: "It genuinely validates and filters the outgoing payload." },
+    { text: "It makes the endpoint faster", why: "It adds a small amount of work; the benefit is correctness and documentation." },
+    { text: "It replaces the need to validate the request", why: "Request and response validation are separate declarations." },
+  ]}
+/>
+
+## Recap
+
+- Declare typed request and response models; validation, the 422 body and the OpenAPI schema all
+  come from them.
+- Inject the client with `Depends`, and swap it in tests with `dependency_overrides`.
+- Map upstream failures onto honest status codes — a 429 with `Retry-After`, not a 500.
+- Stream with `StreamingResponse` and server-sent events, and send a final event carrying usage.
+- `/healthz` must be dependency-free; dependency checks belong in `/readyz`.
+- LLM endpoints are seconds-long and variable: long timeouts, streaming, and concurrency sized by
+  your rate limit rather than by CPU.

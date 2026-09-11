@@ -1,0 +1,521 @@
+---
+title: Building an evaluation harness
+description: A runnable eval set, graders that check properties, results recorded with the prompt and model that produced them, and a comparison that tells you exactly which examples changed.
+module: production-ai
+order: 4
+level: expert
+minutes: 22
+objectives:
+  - Design an eval set that catches real regressions
+  - Write graders, from exact match to property checks
+  - Run an evaluation concurrently, within a cost budget
+  - Record results so two runs can be compared example by example
+  - Split the set so prompt tuning does not overfit it
+---
+
+An evaluation harness is the instrument that makes every other decision in this module possible.
+Without one, "the new prompt is better" is a feeling.
+
+## The eval set
+
+<Run id="prod-eval-1" code={`import json
+from pathlib import Path
+
+EXAMPLES = [
+    {"id": "e1", "question": "How much overlap between chunks?",
+     "expect": {"contains": ["10", "20"], "cites": ["c1"], "max_words": 40}},
+    {"id": "e2", "question": "What dtype for embeddings?",
+     "expect": {"contains": ["float32"], "cites": ["c2"], "max_words": 40}},
+    {"id": "e3", "question": "What does E4021 mean?",
+     "expect": {"contains": ["dimension"], "cites": ["c3"], "max_words": 40}},
+    {"id": "e4", "question": "What is the weather in Colombo?",
+     "expect": {"refuse": True}},
+    {"id": "e5", "question": "Who is the CEO?",
+     "expect": {"refuse": True}},
+    {"id": "e6", "question": "How many documents per request?",
+     "expect": {"contains": ["100"], "cites": ["c4"], "max_words": 40}},
+]
+
+Path("eval.jsonl").write_text(
+    "\\n".join(json.dumps(example) for example in EXAMPLES) + "\\n", encoding="utf-8"
+)
+
+print(Path("eval.jsonl").read_text().strip()[:240], "...")
+print()
+print(f"{len(EXAMPLES)} examples, {sum(1 for e in EXAMPLES if e['expect'].get('refuse'))} of which must be refused")`} />
+
+JSONL again, for the same reasons as module 2: append a case without rewriting the file, and read
+a large set without loading it.
+
+<Callout type="tip">
+Start with twenty examples, not two hundred. Include every bug you have actually shipped, a
+quarter that must be refused, and a few that are genuinely ambiguous. A small set you curate and
+actually run beats a large one you generated and never look at.
+</Callout>
+
+## Graders
+
+A grader turns an answer and an expectation into a pass or a fail. Compose several:
+
+<Run id="prod-eval-2" code={`import re
+
+REFUSAL = "I don't know based on the provided documentation."
+
+def grade_refusal(answer, expect, context_ids):
+    should_refuse = expect.get("refuse", False)
+    refused = answer.strip() == REFUSAL
+    if should_refuse:
+        return refused, "refused as required" if refused else "answered a question it should refuse"
+    return not refused, "answered" if not refused else "refused an answerable question"
+
+def grade_contains(answer, expect, context_ids):
+    required = expect.get("contains", [])
+    missing = [term for term in required if term.lower() not in answer.lower()]
+    return not missing, "all terms present" if not missing else f"missing {missing}"
+
+def grade_citations(answer, expect, context_ids):
+    if expect.get("refuse"):
+        return True, "not applicable"
+    cited = set(re.findall(r"\\[([a-zA-Z0-9_]+)\\]", answer))
+    unsupported = cited - set(context_ids)
+    if unsupported:
+        return False, f"cited unsupplied {sorted(unsupported)}"
+    if not cited:
+        return False, "no citations"
+    wanted = set(expect.get("cites", []))
+    if wanted and not (cited & wanted):
+        return False, f"cited {sorted(cited)}, expected one of {sorted(wanted)}"
+    return True, f"cited {sorted(cited)}"
+
+def grade_length(answer, expect, context_ids):
+    limit = expect.get("max_words")
+    if limit is None:
+        return True, "no limit"
+    words = len(answer.split())
+    return words <= limit, f"{words} words (limit {limit})"
+
+GRADERS = {
+    "refusal": grade_refusal,
+    "contains": grade_contains,
+    "citations": grade_citations,
+    "length": grade_length,
+}
+
+expect = {"contains": ["10", "20"], "cites": ["c1"], "max_words": 40}
+for answer in ["Use an overlap of 10 to 20 percent [c1].",
+               "Use a bit of overlap [c1].",
+               "Use 10 to 20 percent [c9]."]:
+    verdicts = {name: grader(answer, expect, ["c1", "c2"]) for name, grader in GRADERS.items()}
+    passed = all(ok for ok, _ in verdicts.values())
+    print(f"{'PASS' if passed else 'FAIL'}  {answer}")
+    for name, (ok, note) in verdicts.items():
+        if not ok:
+            print(f"        {name}: {note}")`} />
+
+Each grader answers one question, so a failure says *which* property broke — which is the
+difference between a number that drops and a number you can act on.
+
+## Running it
+
+<Run id="prod-eval-3" code={`import asyncio, json, re, time
+from pathlib import Path
+from types import SimpleNamespace
+
+REFUSAL = "I don't know based on the provided documentation."
+
+RECORDED = {
+    "How much overlap between chunks?": ("Use an overlap of 10 to 20 percent [c1].", ["c1", "c2"]),
+    "What dtype for embeddings?": ("Store vectors as float32 [c2].", ["c1", "c2"]),
+    "What does E4021 mean?": ("The embedding dimension did not match the index [c3].", ["c3"]),
+    "What is the weather in Colombo?": (REFUSAL, []),
+    "Who is the CEO?": ("The CEO is not documented here [c1].", ["c1"]),
+    "How many documents per request?": ("At most 100 documents [c4].", ["c4"]),
+}
+
+class RecordedSystem:
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = 0
+    async def answer(self, question):
+        self.calls += 1
+        await asyncio.sleep(0.01)
+        text, context = self.responses.get(question, (REFUSAL, []))
+        return SimpleNamespace(text=text, context_ids=context,
+                               usage=SimpleNamespace(input_tokens=900, output_tokens=40))
+
+def grade(answer, expect, context_ids):
+    cited = set(re.findall(r"\\[([a-zA-Z0-9_]+)\\]", answer))
+    refused = answer.strip() == REFUSAL
+    checks = {
+        "refusal": refused if expect.get("refuse") else not refused,
+        "contains": all(t.lower() in answer.lower() for t in expect.get("contains", [])),
+        "citations": True if expect.get("refuse") else (bool(cited) and not (cited - set(context_ids))),
+        "length": len(answer.split()) <= expect.get("max_words", 10**6),
+    }
+    return checks, all(checks.values())
+
+async def run_evaluation(system, examples, *, limit=4, cost_per_call=0.0053):
+    semaphore = asyncio.Semaphore(limit)
+    started = time.perf_counter()
+
+    async def one(example):
+        async with semaphore:
+            response = await system.answer(example["question"])
+        checks, passed = grade(response.text, example["expect"], response.context_ids)
+        return {
+            "id": example["id"], "question": example["question"], "answer": response.text,
+            "checks": checks, "passed": passed,
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+        }
+
+    results = await asyncio.gather(*(one(e) for e in examples))
+    return {
+        "results": results,
+        "passed": sum(r["passed"] for r in results),
+        "total": len(results),
+        "seconds": round(time.perf_counter() - started, 3),
+        "cost_usd": round(len(results) * cost_per_call, 4),
+    }
+
+EXAMPLES = [json.loads(line) for line in Path("eval.jsonl").read_text().splitlines() if line.strip()]
+system = RecordedSystem(RECORDED)
+report = await run_evaluation(system, EXAMPLES)
+
+print(f"{report['passed']}/{report['total']} passed in {report['seconds']}s, "
+      f"about \\u0024{report['cost_usd']}")
+print()
+for result in report["results"]:
+    if not result["passed"]:
+        failed = [name for name, ok in result["checks"].items() if not ok]
+        print(f"FAIL {result['id']}  {failed}")
+        print(f"     Q: {result['question']}")
+        print(f"     A: {result['answer']}")`} />
+
+One example fails — the system answered a question it should have refused, and cited a chunk to do
+it. That is precisely the failure an eval set exists to catch.
+
+## Record everything
+
+A result without its provenance cannot be compared to anything:
+
+<Run id="prod-eval-4" code={`import hashlib, json
+from pathlib import Path
+
+PROMPT = "You answer from the provided context only. Cite every claim."
+
+run = {
+    "run_id": "2026-03-01T17:20:00Z",
+    "git_sha": "a1b2c3d",
+    "model": "claude-opus-5",
+    "effort": "high",
+    "prompt_version": "answer@3",
+    "prompt_hash": hashlib.sha256(PROMPT.encode()).hexdigest()[:12],
+    "retrieval": {"k": 5, "minimum": 0.25, "chunk_size": 300, "overlap": 40},
+    "eval_set": "eval.jsonl",
+    "eval_set_hash": hashlib.sha256(Path("eval.jsonl").read_bytes()).hexdigest()[:12],
+    "passed": 5,
+    "total": 6,
+    "cost_usd": 0.0318,
+}
+
+Path("runs.jsonl").write_text(json.dumps(run) + "\\n", encoding="utf-8")
+print(json.dumps(run, indent=2))`} />
+
+<Callout type="ai" title="Why this matters for AI">
+The eval-set hash is the one people forget, and it is the one that ruins comparisons. If somebody
+adds three easy examples between two runs, the pass rate moves and no code changed. Hash the set,
+record it with every run, and refuse to compare two runs whose hashes differ — otherwise you will
+eventually chase a "regression" that was a curation change.
+</Callout>
+
+## Comparing two runs
+
+The aggregate number tells you *whether* something changed. The per-example diff tells you *what*:
+
+<Run id="prod-eval-5" code={`def compare(before, after):
+    ids = sorted(set(before) | set(after))
+    improved, regressed, unchanged = [], [], []
+    for identifier in ids:
+        was, now = before.get(identifier), after.get(identifier)
+        if was is None or now is None:
+            continue
+        if now and not was:
+            improved.append(identifier)
+        elif was and not now:
+            regressed.append(identifier)
+        else:
+            unchanged.append(identifier)
+    return {"improved": improved, "regressed": regressed, "unchanged": unchanged,
+            "before_rate": sum(before.values()) / len(before),
+            "after_rate": sum(after.values()) / len(after)}
+
+before = {"e1": True, "e2": True, "e3": False, "e4": True, "e5": False, "e6": True}
+after  = {"e1": True, "e2": False, "e3": True, "e4": True, "e5": True, "e6": True}
+
+result = compare(before, after)
+print(f"pass rate {result['before_rate']:.2f} -> {result['after_rate']:.2f}")
+print(f"improved:  {result['improved']}")
+print(f"regressed: {result['regressed']}")
+print()
+print("The rate rose by one example, and one case that used to work now does not.")
+print("An aggregate alone would have hidden that entirely.")`} />
+
+A change that fixes three examples and breaks two shows as "+1" on the summary. The regression
+list is what stops you shipping it without looking.
+
+## Do not tune on the test set
+
+The prompt-overfitting warning from module 5, applied here:
+
+<Run id="prod-eval-6" code={`import random
+
+examples = [f"e{n}" for n in range(1, 31)]
+rng = random.Random(0)
+shuffled = examples[:]
+rng.shuffle(shuffled)
+
+train = shuffled[:15]      # iterate freely here
+dev = shuffled[15:23]      # choose between candidates here
+test = shuffled[23:]       # look at this rarely, and never tune on it
+
+print(f"train {len(train):>3}  {sorted(train)}")
+print(f"dev   {len(dev):>3}  {sorted(dev)}")
+print(f"test  {len(test):>3}  {sorted(test)}")
+print()
+print("Tuning twenty prompt variants against one fixed set overfits it, exactly as")
+print("tuning twenty hyperparameters against one validation split does.")`} />
+
+## A regression gate
+
+<Run id="prod-eval-7" code={`def gate(previous, current, *, tolerance=0.0, forbid_regressions=True):
+    """Return (ok, reasons). Used as a CI check before a prompt change merges."""
+    reasons = []
+    if current["eval_set_hash"] != previous["eval_set_hash"]:
+        reasons.append("the eval set changed — compare like with like before judging")
+
+    before_rate = previous["passed"] / previous["total"]
+    after_rate = current["passed"] / current["total"]
+    if after_rate < before_rate - tolerance:
+        reasons.append(f"pass rate fell from {before_rate:.3f} to {after_rate:.3f}")
+
+    if forbid_regressions and current.get("regressed"):
+        reasons.append(f"examples regressed: {current['regressed']}")
+
+    if current["cost_usd"] > previous["cost_usd"] * 1.5:
+        reasons.append(f"cost rose from {previous['cost_usd']} to {current['cost_usd']}")
+
+    return not reasons, reasons
+
+previous = {"passed": 27, "total": 30, "cost_usd": 0.15, "eval_set_hash": "abc123"}
+
+for label, current in [
+    ("a clean improvement", {"passed": 29, "total": 30, "cost_usd": 0.16,
+                             "eval_set_hash": "abc123", "regressed": []}),
+    ("better on average, worse somewhere", {"passed": 28, "total": 30, "cost_usd": 0.16,
+                                            "eval_set_hash": "abc123", "regressed": ["e7"]}),
+    ("much more expensive", {"passed": 29, "total": 30, "cost_usd": 0.40,
+                             "eval_set_hash": "abc123", "regressed": []}),
+    ("the set moved", {"passed": 30, "total": 33, "cost_usd": 0.16,
+                       "eval_set_hash": "def456", "regressed": []}),
+]:
+    ok, reasons = gate(previous, current)
+    print(f"{'PASS' if ok else 'BLOCK'}  {label}")
+    for reason in reasons:
+        print(f"        {reason}")`} />
+
+<Callout type="warning">
+Do not gate on the pass rate alone. A change that improves the average while breaking a case
+somebody depends on is still a regression, and cost is a real axis — a prompt that gains two
+points and triples the bill is a decision for a person, not a threshold.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="prod-eval-ex1"
+  title="Exercise 1"
+  brief="Write <code>grade(answer, expect, context_ids)</code> returning <code>(checks, passed)</code>, where <code>checks</code> has boolean <code>refusal</code>, <code>contains</code>, <code>citations</code> and <code>length</code> entries."
+  code={`import re
+
+REFUSAL = "I don't know based on the provided documentation."
+
+def grade(answer, expect, context_ids):
+    # refusal:   if expect["refuse"] is truthy the answer must be the refusal;
+    #            otherwise it must NOT be.
+    # contains:  every term in expect["contains"] appears, case-insensitively.
+    # citations: True when refusing. Otherwise at least one citation, and no
+    #            citation outside context_ids.
+    # length:    word count at most expect["max_words"] when that key is present.
+    # Return (checks_dict, all_passed).
+    ...
+
+
+expect = {"contains": ["10", "20"], "cites": ["c1"], "max_words": 40}
+print(grade("Use an overlap of 10 to 20 percent [c1].", expect, ["c1", "c2"]))
+print(grade(REFUSAL, {"refuse": True}, []))`}
+  hint="Build the dict with four entries, then return (checks, all(checks.values()))."
+  solution={`import re
+
+REFUSAL = "I don't know based on the provided documentation."
+
+def grade(answer, expect, context_ids):
+    cited = set(re.findall(r"\\[([a-zA-Z0-9_]+)\\]", answer))
+    refused = answer.strip() == REFUSAL
+
+    checks = {
+        "refusal": refused if expect.get("refuse") else not refused,
+        "contains": all(term.lower() in answer.lower() for term in expect.get("contains", [])),
+        "citations": True if expect.get("refuse")
+                     else (bool(cited) and not (cited - set(context_ids))),
+        "length": len(answer.split()) <= expect.get("max_words", 10 ** 6),
+    }
+    return checks, all(checks.values())
+
+
+expect = {"contains": ["10", "20"], "cites": ["c1"], "max_words": 40}
+print(grade("Use an overlap of 10 to 20 percent [c1].", expect, ["c1", "c2"]))
+print(grade(REFUSAL, {"refuse": True}, []))`}
+  tests={`expect = {"contains": ["10", "20"], "cites": ["c1"], "max_words": 40}
+
+checks, passed = grade("Use an overlap of 10 to 20 percent [c1].", expect, ["c1", "c2"])
+assert passed is True, f"A good answer should pass everything, got {checks}."
+assert set(checks) == {"refusal", "contains", "citations", "length"}, (
+    f"Expected exactly those four checks, got {sorted(checks)}."
+)
+
+missing, _ = grade("Use a bit of overlap [c1].", expect, ["c1", "c2"])
+assert missing["contains"] is False, "The required terms are absent."
+assert missing["citations"] is True, "Citations are still fine."
+
+fabricated, _ = grade("Use 10 to 20 percent [c9].", expect, ["c1", "c2"])
+assert fabricated["citations"] is False, "c9 was never supplied."
+
+uncited, _ = grade("Use 10 to 20 percent.", expect, ["c1"])
+assert uncited["citations"] is False, "An answer with no citations fails the citation check."
+
+long_answer, _ = grade("10 20 " + " ".join(["word"] * 60) + " [c1]", expect, ["c1"])
+assert long_answer["length"] is False, "Over the word limit must fail the length check."
+
+# Refusals.
+good_refusal, passed = grade(REFUSAL, {"refuse": True}, [])
+assert passed is True, f"A correct refusal should pass, got {good_refusal}."
+assert good_refusal["citations"] is True, "A refusal needs no citations."
+
+wrong_refusal, _ = grade(REFUSAL, {"contains": []}, ["c1"])
+assert wrong_refusal["refusal"] is False, "Refusing an answerable question must fail."
+
+answered_unanswerable, _ = grade("It is sunny [c1].", {"refuse": True}, ["c1"])
+assert answered_unanswerable["refusal"] is False, (
+    "Answering a question that should be refused must fail the refusal check."
+)
+
+# Case-insensitive term matching.
+cased, _ = grade("Store as FLOAT32 [c2].", {"contains": ["float32"]}, ["c2"])
+assert cased["contains"] is True, "Term matching should ignore case."`}
+/>
+
+<Exercise
+  id="prod-eval-ex2"
+  title="Exercise 2"
+  brief="Write <code>compare(before, after)</code>: given two dicts of id → passed, return <code>improved</code>, <code>regressed</code> and <code>unchanged</code> id lists plus both pass rates. Ignore ids missing from either run."
+  code={`def compare(before, after):
+    # improved:  failed before, passes now
+    # regressed: passed before, fails now
+    # unchanged: same verdict in both
+    # before_rate / after_rate: pass rate over each whole dict
+    # Ids present in only one run are skipped entirely.
+    ...
+
+
+before = {"e1": True, "e2": True, "e3": False}
+after = {"e1": True, "e2": False, "e3": True, "e4": True}
+print(compare(before, after))`}
+  hint="Iterate the intersection of the keys, sorted, and classify each. Compute the rates over the full dicts."
+  solution={`def compare(before, after):
+    improved, regressed, unchanged = [], [], []
+    for identifier in sorted(set(before) & set(after)):
+        was, now = before[identifier], after[identifier]
+        if now and not was:
+            improved.append(identifier)
+        elif was and not now:
+            regressed.append(identifier)
+        else:
+            unchanged.append(identifier)
+    return {
+        "improved": improved,
+        "regressed": regressed,
+        "unchanged": unchanged,
+        "before_rate": sum(before.values()) / len(before) if before else 0.0,
+        "after_rate": sum(after.values()) / len(after) if after else 0.0,
+    }
+
+
+before = {"e1": True, "e2": True, "e3": False}
+after = {"e1": True, "e2": False, "e3": True, "e4": True}
+print(compare(before, after))`}
+  tests={`before = {"e1": True, "e2": True, "e3": False}
+after = {"e1": True, "e2": False, "e3": True, "e4": True}
+
+result = compare(before, after)
+assert result["improved"] == ["e3"], f"e3 failed and now passes. Got {result['improved']}."
+assert result["regressed"] == ["e2"], f"e2 passed and now fails. Got {result['regressed']}."
+assert result["unchanged"] == ["e1"], f"e1 is unchanged. Got {result['unchanged']}."
+
+assert "e4" not in result["improved"] + result["regressed"] + result["unchanged"], (
+    "e4 exists in only one run, so it cannot be compared."
+)
+
+assert abs(result["before_rate"] - 2 / 3) < 1e-9, f"Got {result['before_rate']}."
+assert abs(result["after_rate"] - 3 / 4) < 1e-9, f"Got {result['after_rate']}."
+
+# The case the summary hides: better on average, worse somewhere.
+tricky = compare(
+    {"a": True, "b": True, "c": False, "d": False},
+    {"a": True, "b": False, "c": True, "d": True},
+)
+assert tricky["after_rate"] > tricky["before_rate"], "The rate went up."
+assert tricky["regressed"] == ["b"], (
+    "...and b regressed. That pair is exactly why the aggregate alone is not enough."
+)
+
+identical = compare({"a": True}, {"a": True})
+assert identical["improved"] == [] and identical["regressed"] == [], "Nothing changed."
+assert identical["unchanged"] == ["a"]
+
+both_failing = compare({"a": False}, {"a": False})
+assert both_failing["unchanged"] == ["a"], "Failing in both runs is unchanged, not regressed."
+
+assert compare({}, {})["before_rate"] == 0.0, "An empty run should not divide by zero."`}
+/>
+
+<Quiz
+  question="A prompt change raises the pass rate from 27/30 to 28/30. Is it safe to ship?"
+  choices={[
+    { text: "Not yet — check which examples changed, because the average can rise while a case somebody depends on breaks", correct: true, why: "+1 net can be +3 and -2. The per-example diff is the only view that shows it, and a regression on a known case is a product decision." },
+    { text: "Yes, the number went up", why: "That treats an aggregate as the whole story and hides regressions by construction." },
+    { text: "No, one example is within noise", why: "Noise is a real concern, but the actionable step is to look at which examples moved, not to dismiss the result." },
+    { text: "Only if the model version also changed", why: "The model is one variable among several; the diff matters regardless." },
+  ]}
+/>
+
+<Quiz
+  question="Why hash the eval set and record the hash with every run?"
+  choices={[
+    { text: "So two runs over different sets are never compared — otherwise a curation change looks like a quality change", correct: true, why: "Adding a few easy examples raises the pass rate with no code change at all, and without the hash nothing flags it." },
+    { text: "To detect corrupted files", why: "A useful side effect, but the reason is comparability between runs." },
+    { text: "To deduplicate examples", why: "That needs per-example hashes; this one covers the whole file." },
+    { text: "Because the API requires it", why: "Nothing in the API knows about your eval set." },
+  ]}
+/>
+
+## Recap
+
+- Keep the eval set as JSONL: inputs plus the properties an acceptable answer must have. Twenty
+  curated examples beat two hundred generated ones.
+- Write one grader per property, so a failure names which property broke.
+- Run concurrently with a semaphore and report cost alongside the pass rate.
+- Record the model, prompt version and hash, retrieval settings and the **eval-set hash** with
+  every run.
+- Compare per example, not just on the aggregate — improved, regressed, unchanged.
+- Split into train, dev and test so prompt tuning does not quietly overfit the set.

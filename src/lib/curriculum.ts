@@ -107,19 +107,8 @@ export const MODULES: Module[] = [
     description:
       "The engineering that separates a notebook from a service. asyncio and concurrent API calls, retries and rate limits, pytest for non-deterministic systems, evaluation harnesses, observability, packaging and deployment.",
     level: "expert",
-    status: "planned",
+    status: "published",
     icon: "rocket",
-    plannedLessons: [
-      "asyncio: concurrency for I/O-bound AI workloads",
-      "Retries, timeouts, backoff and rate limits",
-      "Testing non-deterministic systems with pytest",
-      "Building an evaluation harness",
-      "LLM-as-judge, and its failure modes",
-      "Structured logging, tracing and observability",
-      "Serving models with FastAPI",
-      "Packaging, dependency pinning and reproducibility",
-      "Cost, latency and capacity planning",
-    ],
   },
 ];
 
