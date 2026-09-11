@@ -22,7 +22,12 @@ const module = MODULE_BY_SLUG.get(data.module);
 const toc = headings.filter((h) => h.depth === 2 || h.depth === 3);
 ---
 
-<BaseLayout title={data.title} description={data.description} bare>
+<BaseLayout
+  title={data.title}
+  description={data.description}
+  image={`/og/lesson-${lesson.id.replace("/", "--")}.png`}
+  bare
+>
   <div class="mx-auto grid w-full max-w-7xl grid-cols-1 gap-10 px-5 py-10 lg:grid-cols-[240px_minmax(0,1fr)] xl:grid-cols-[240px_minmax(0,1fr)_200px]">
     <!-- Course contents -->
     <aside class="hidden lg:block" data-pagefind-ignore>
