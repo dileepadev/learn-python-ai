@@ -36,8 +36,12 @@ reader's browser via Pyodide. There is no backend, no account and no server-side
 | `npm run build` | Static build into `dist/` |
 | `npm run preview` | Serve the built site |
 | `npm run check` | Astro + TypeScript + content-schema diagnostics |
+| `npm run lint:lessons` | Check lessons against the content rules below, without booting Python |
+| `npm run verify` | Execute every `Run` block and `Exercise` solution in Pyodide |
+| `npm run og` | Render the Open Graph cards into `public/og/` (also runs at `prebuild`) |
 
-`npm run check` and `npm run build` must both pass before you propose a change. CI runs both.
+`npm run lint:lessons`, `npm run check` and `npm run build` must all pass before you propose a
+change, and `npm run verify` must pass whenever you touch lesson code. CI runs all four.
 
 ## Architecture
 
@@ -51,6 +55,7 @@ src/
     python-runtime.ts              Main-thread client for the Pyodide worker
     progress.ts                    localStorage progress
     paths.ts                       withBase(), lessonHref(), SITE constants
+    search.ts                      Command-palette index over lesson metadata
   components/
     mdx/                           What lessons use: Run, Exercise, Quiz, Callout
     CodeRunner.tsx                 Editor + runner island
@@ -58,6 +63,8 @@ src/
   layouts/                         BaseLayout, LessonLayout
   pages/                           Routes
 public/pyodide-worker.js           The Python worker (loads Pyodide from the CDN)
+public/sw.js                       Service worker; caches the Pyodide runtime and wheels
+scripts/                           Lesson linter, exercise verifier, OG card generator
 examples/                          Standalone .py files, a local-run companion
 ```
 
@@ -180,16 +187,18 @@ The three that agents most often get wrong:
 - **No sockets, threads, subprocesses or real filesystem** in the browser sandbox. Lessons that
   need a live LLM API call must use a recorded-response fixture in the browser and ship the real
   script for the reader to run locally.
-- **Never commit build output.** `dist/`, `node_modules/` and `.astro/` are ignored.
+- **Never commit build output.** `dist/`, `node_modules/`, `.astro/` and the generated
+  `public/og/` cards are ignored.
 - **Never commit secrets.** There is no server, so the site has no legitimate use for a key.
 
 ## Definition of done
 
-1. `npm run check` — no errors, warnings or hints.
-2. `npm run build` — succeeds.
-3. New or changed exercises: the `solution` passes its own `tests` in a browser.
-4. Docs updated when behaviour changed (`README.md`, `TODO.md`, `CHANGELOG.md` as applicable).
-5. Commit messages, branch name and PR body follow the guidelines above.
+1. `npm run lint:lessons` — passes.
+2. `npm run check` — no errors, warnings or hints.
+3. `npm run build` — succeeds.
+4. Touched lesson code: `npm run verify` — every block and solution still behaves.
+5. Docs updated when behaviour changed (`README.md`, `TODO.md`, `CHANGELOG.md` as applicable).
+6. Commit messages, branch name and PR body follow the guidelines above.
 
 ## Agent configuration files
 

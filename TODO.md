@@ -21,9 +21,11 @@ in Python".
 ### Releases
 
 Per [VERSIONING.md](VERSIONING.md) this project follows SemVer, so **`v1.0.0` is the first
-stable release — it ships only when every module below is complete.** Everything before that is
-published as `0.x` as it lands: `v0.1.0` is the platform plus module 01, and each subsequent
-module gets its own minor version.
+stable release — it ships only when every module below is complete.** Everything before that was
+published as `0.x` as it landed: `v0.1.0` was the platform plus module 01.
+
+All eight modules are now complete — 67 lessons, 718 runnable blocks — so the work for `v1.0.0`
+is done, but **it has not been released yet.** The list below is the record of what that took.
 
 ### Principles
 
@@ -43,27 +45,27 @@ module gets its own minor version.
 - [x] Task 4: Add an editable CodeMirror 6 editor with Run, Stop, Reset, Copy and stdin support.
 - [x] Task 5: Add automatically checked exercises, quizzes and per-browser progress tracking.
 - [x] Task 6: Deploy to GitHub Pages from `main` via GitHub Actions.
-- [ ] Task 7: Add full-text lesson search (Pagefind), with a keyboard-driven command palette.
-- [ ] Task 8: Render matplotlib figures inline in lesson output.
-- [ ] Task 9: Add a mobile lesson-navigation drawer; the sidebar is desktop-only today.
-- [ ] Task 10: Cache the Pyodide runtime in a service worker so return visits start instantly.
-- [ ] Task 11: Add an Open Graph image generator so shared lesson links preview properly.
-- [ ] Task 12: Run the exercise-solution browser suite in CI, not just locally.
+- [x] Task 7: Add full-text lesson search (Pagefind), with a keyboard-driven command palette.
+- [x] Task 8: Render matplotlib figures inline in lesson output.
+- [x] Task 9: Add a mobile lesson-navigation drawer; the sidebar is desktop-only today.
+- [x] Task 10: Cache the Pyodide runtime in a service worker so return visits start instantly.
+- [x] Task 11: Add an Open Graph image generator so shared lesson links preview properly.
+- [x] Task 12: Run the exercise-solution browser suite in CI, not just locally.
 
 ### Curriculum
 
 - [x] Task 13: Module 01 — Python Foundations (9 lessons).
-- [ ] Task 14: Module 02 — Core Python: functions, comprehensions, modules, files, exceptions,
+- [x] Task 14: Module 02 — Core Python: functions, comprehensions, modules, files, exceptions,
       classes, type hints, decorators, context managers.
-- [ ] Task 15: Module 03 — Numerical Python: arrays, broadcasting, vectorisation, linear algebra.
-- [ ] Task 16: Module 04 — Data Wrangling: pandas, cleaning, group-by, joins, plotting.
-- [ ] Task 17: Module 05 — Machine Learning Foundations: scikit-learn, metrics, cross-validation,
+- [x] Task 15: Module 03 — Numerical Python: arrays, broadcasting, vectorisation, linear algebra.
+- [x] Task 16: Module 04 — Data Wrangling: pandas, cleaning, group-by, joins, plotting.
+- [x] Task 17: Module 05 — Machine Learning Foundations: scikit-learn, metrics, cross-validation,
       gradient descent and a neural network from scratch, then PyTorch.
-- [ ] Task 18: Module 06 — LLM Engineering: the Messages API, streaming, structured output,
+- [x] Task 18: Module 06 — LLM Engineering: the Messages API, streaming, structured output,
       tool use, agent loops, MCP, token accounting.
-- [ ] Task 19: Module 07 — Retrieval and RAG: embeddings, chunking, vector indexes, hybrid
+- [x] Task 19: Module 07 — Retrieval and RAG: embeddings, chunking, vector indexes, hybrid
       search, re-ranking, groundedness evaluation.
-- [ ] Task 20: Module 08 — Production AI Systems: asyncio, retries and rate limits, pytest for
+- [x] Task 20: Module 08 — Production AI Systems: asyncio, retries and rate limits, pytest for
       non-deterministic systems, evaluation harnesses, observability, FastAPI, packaging.
 
 ### Known constraints
