@@ -33,7 +33,7 @@ export const MODULES: Module[] = [
   {
     slug: "foundations",
     title: "Python Foundations",
-    tagline: "The language, from `print` to control flow",
+    tagline: "The language, from print() to control flow",
     description:
       "Everything you need to read and write ordinary Python: values, names, operators, the four core collections, and the statements that make a program branch and repeat. Every page runs in your browser.",
     level: "beginner",
