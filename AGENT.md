@@ -15,8 +15,9 @@ reader's browser via Pyodide. There is no backend, no account and no server-side
 
 - Live site: <https://dileepadev.github.io/learn-python-ai>
 - Roadmap, release criteria and open work: [issue #2](https://github.com/dileepadev/learn-python-ai/issues/2)
-- Per [VERSIONING.md](VERSIONING.md), **`v1.0.0` ships only when all eight curriculum modules are
-  complete.** Everything before that is `0.x`.
+- Per [VERSIONING.md](VERSIONING.md), releases stay on `0.x` until the project is stable.
+  `v0.2.0` completed all eight curriculum modules; **`v1.0.0` ships once the remaining pre-1.0
+  work is done.**
 
 ### Principles that decide arguments
 
