@@ -11,8 +11,13 @@ Changes are organized into the following categories:
 
 ## [Unreleased]
 
+- Changes for the next release are available in development branches.
+
+## [v0.2.0] - 2026-09-12
+
 All eight curriculum modules are now complete: **67 lessons and 718 runnable code blocks**, every
-block and every exercise solution executed against its own assertions in CI. Not yet released.
+block and every exercise solution executed against its own assertions in CI. This is still a
+`0.x` release — `v1.0.0` follows once the remaining pre-1.0 work is done.
 
 ### Added
 
@@ -88,9 +93,10 @@ block and every exercise solution executed against its own assertions in CI. Not
 <!-- v0.2.0 -->
 <!-- v0.1.0 -->
 
-This project reaches **v1.0.0** only once all eight curriculum modules are complete. Progress
-towards that is tracked in
+All eight curriculum modules are complete as of `v0.2.0`. This project reaches **v1.0.0** once
+the remaining pre-1.0 work is done; progress is tracked in
 [issue #2](https://github.com/dileepadev/learn-python-ai/issues/2).
 
-[Unreleased]: https://github.com/dileepadev/learn-python-ai/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/dileepadev/learn-python-ai/compare/v0.2.0...HEAD
+[v0.2.0]: https://github.com/dileepadev/learn-python-ai/compare/v0.1.0...v0.2.0
 [v0.1.0]: https://github.com/dileepadev/learn-python-ai/releases/tag/v0.1.0

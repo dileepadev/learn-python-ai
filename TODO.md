@@ -20,12 +20,12 @@ in Python".
 
 ### Releases
 
-Per [VERSIONING.md](VERSIONING.md) this project follows SemVer, so **`v1.0.0` is the first
-stable release — it ships only when every module below is complete.** Everything before that was
-published as `0.x` as it landed: `v0.1.0` was the platform plus module 01.
+Per [VERSIONING.md](VERSIONING.md) this project follows SemVer, and releases ship as `0.x` until
+the project is stable: `v0.1.0` was the platform plus module 01, and **`v0.2.0` completes the
+curriculum** — all eight modules, 67 lessons, 718 runnable blocks.
 
-All eight modules are now complete — 67 lessons, 718 runnable blocks — so the work for `v1.0.0`
-is done, but **it has not been released yet.** The list below is the record of what that took.
+**`v1.0.0` is still ahead.** Every module is written, but the remaining pre-1.0 work is not done;
+it will be added to the list below as it is decided.
 
 ### Principles
 

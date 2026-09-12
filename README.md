@@ -44,8 +44,9 @@ executed in CI before release.
 The full lesson-by-lesson roadmap is at
 [/curriculum](https://dileepadev.github.io/learn-python-ai/curriculum).
 
-The published release is `v0.1.0`. Following [SemVer](VERSIONING.md), **`v1.0.0` ships only once
-all eight modules are complete** — they now are, and the release is tracked in
+The current release is `v0.2.0`, which completes the curriculum. Following
+[SemVer](VERSIONING.md), releases stay on `0.x` until the project is stable; **`v1.0.0` ships
+once the remaining pre-1.0 work is done**, tracked in
 [issue #2](https://github.com/dileepadev/learn-python-ai/issues/2).
 
 ## Running it locally
