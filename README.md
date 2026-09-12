@@ -19,6 +19,10 @@ payloads, generators before streaming responses.
 - **Exercises are actually checked.** Your program runs, then real Python assertions run
   against it. There is no answer key to pattern-match.
 - **NumPy, pandas, matplotlib and scikit-learn** are one `import` away, fetched on demand.
+- **Full-text search across every lesson**, from a keyboard-driven command palette
+  (`Ctrl`/`Cmd` + `K`).
+- **The runtime is cached after the first visit**, so returning to the site boots Python without
+  re-downloading it.
 - **Your code never leaves your machine.** Nothing is uploaded; there is no backend.
 
 ## Curriculum
@@ -26,19 +30,23 @@ payloads, generators before streaming responses.
 | # | Module | Level | Status |
 | --- | --- | --- | --- |
 | 01 | **Python Foundations** — the language, from `print` to control flow | Beginner | ✅ 9 lessons |
-| 02 | **Core Python** — functions, objects, and the shape of real code | Intermediate | 📋 Planned |
-| 03 | **Numerical Python** — NumPy, vectorisation, thinking in arrays | Intermediate | 📋 Planned |
-| 04 | **Data Wrangling** — pandas, cleaning, honest exploration | Intermediate | 📋 Planned |
-| 05 | **Machine Learning Foundations** — scikit-learn, and a neural net you write yourself | Advanced | 📋 Planned |
-| 06 | **LLM Engineering** — prompts, structured output, tool-calling loops | Advanced | 📋 Planned |
-| 07 | **Retrieval and RAG** — embeddings, vector search, grounded answers | Expert | 📋 Planned |
-| 08 | **Production AI Systems** — async, testing, evals, and shipping it | Expert | 📋 Planned |
+| 02 | **Core Python** — functions, objects, and the shape of real code | Intermediate | ✅ 10 lessons |
+| 03 | **Numerical Python** — NumPy, vectorisation, thinking in arrays | Intermediate | ✅ 7 lessons |
+| 04 | **Data Wrangling** — pandas, cleaning, honest exploration | Intermediate | ✅ 8 lessons |
+| 05 | **Machine Learning Foundations** — scikit-learn, and a neural net you write yourself | Advanced | ✅ 9 lessons |
+| 06 | **LLM Engineering** — prompts, structured output, tool-calling loops | Advanced | ✅ 8 lessons |
+| 07 | **Retrieval and RAG** — embeddings, vector search, grounded answers | Expert | ✅ 7 lessons |
+| 08 | **Production AI Systems** — async, testing, evals, and shipping it | Expert | ✅ 9 lessons |
 
-The full lesson-by-lesson roadmap, including every planned module, is at
+All eight modules are complete: **67 lessons, 718 runnable code blocks**, every one of them
+executed in CI before release.
+
+The full lesson-by-lesson roadmap is at
 [/curriculum](https://dileepadev.github.io/learn-python-ai/curriculum).
 
-This is `v0.1.0`. Following [SemVer](VERSIONING.md), **`v1.0.0` ships only when all eight
-modules are complete** — progress towards it is tracked in
+The current release is `v0.2.0`, which completes the curriculum. Following
+[SemVer](VERSIONING.md), releases stay on `0.x` until the project is stable; **`v1.0.0` ships
+once the remaining pre-1.0 work is done**, tracked in
 [issue #2](https://github.com/dileepadev/learn-python-ai/issues/2).
 
 ## Running it locally
@@ -56,6 +64,9 @@ npm run dev          # http://localhost:4321/learn-python-ai
 | `npm run build` | Build the static site into `dist/` |
 | `npm run preview` | Serve the built site locally |
 | `npm run check` | Type-check Astro, TypeScript and content frontmatter |
+| `npm run lint:lessons` | Check every lesson against the content rules, without booting Python |
+| `npm run verify` | Execute every Run block and Exercise solution in Pyodide |
+| `npm run og` | Render the Open Graph cards into `public/og/` (also runs before a build) |
 
 ## How it is built
 
@@ -83,10 +94,13 @@ src/
     curriculum.ts        Module definitions and the public roadmap
     python-runtime.ts    Main-thread client for the Pyodide worker
     progress.ts          Per-browser progress, stored in localStorage
+    search.ts            Builds the command-palette index
   layouts/               Page and lesson shells
   pages/                 Routes
 public/
   pyodide-worker.js      The Python worker (loads Pyodide from the CDN)
+  sw.js                  Service worker; caches the Pyodide runtime and wheels
+scripts/                 Lesson linter, exercise verifier, OG card generator
 examples/                Standalone .py files you can run locally
 ```
 

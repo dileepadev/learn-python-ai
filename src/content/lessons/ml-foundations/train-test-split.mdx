@@ -1,0 +1,398 @@
+---
+title: Train, validation and test splits
+description: Why a model must be judged on data it has never seen, how to split three ways, and the five kinds of leakage that make a held-out score a lie.
+module: ml-foundations
+order: 2
+level: advanced
+minutes: 18
+objectives:
+  - Split data into training and held-out sets, reproducibly and with stratification
+  - Explain what the validation set is for and why the test set is used once
+  - Recognise preprocessing leakage, duplicate leakage and target leakage
+  - Split by group when rows share a source
+  - Split by time when the data is ordered
+---
+
+A model's score on the data it learned from is not a measurement — it is a memory test. Everything
+in this lesson exists to make sure the number you report is the number you will get in
+production.
+
+## Why hold anything out
+
+<Run id="ml-split-1" code={`from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeClassifier
+
+X, y = make_classification(n_samples=500, n_features=10, n_informative=5,
+                           flip_y=0.15, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=0)
+
+tree = DecisionTreeClassifier(random_state=0).fit(X_train, y_train)
+
+print("on the training data:", round(tree.score(X_train, y_train), 4))
+print("on held-out data:    ", round(tree.score(X_test, y_test), 4))`} />
+
+A full-depth decision tree scores 1.0 on its training data every time — it memorised it. Only the
+second number says anything about a new example.
+
+## Splitting
+
+<Run id="ml-split-2" code={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+
+X, y = make_classification(n_samples=1000, n_features=6, weights=[0.9, 0.1], random_state=0)
+print("class balance overall:", np.bincount(y) / len(y))
+
+# Without stratify, a rare class can land unevenly.
+a_train, a_test, ya_train, ya_test = train_test_split(X, y, test_size=0.2, random_state=7)
+print("plain split, test balance:     ", (np.bincount(ya_test) / len(ya_test)).round(3))
+
+# With stratify, both sides keep the overall proportions.
+b_train, b_test, yb_train, yb_test = train_test_split(
+    X, y, test_size=0.2, random_state=7, stratify=y
+)
+print("stratified split, test balance:", (np.bincount(yb_test) / len(yb_test)).round(3))
+print("stratified split, train balance:", (np.bincount(yb_train) / len(yb_train)).round(3))`} />
+
+<Callout type="tip">
+Pass `stratify=y` for any classification problem, and `random_state` for every split you will
+ever compare against another. Without the seed, two models evaluated on two different splits are
+not comparable — you are measuring the split as much as the model.
+</Callout>
+
+## Three splits, three jobs
+
+- **Training set** — the model learns from it.
+- **Validation set** — you choose between models and settings with it.
+- **Test set** — you use it once, at the end, to report a number.
+
+<Run id="ml-split-3" code={`from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+
+X, y = make_classification(n_samples=1000, n_features=8, n_informative=5, random_state=0)
+
+# First carve off the test set, then split the remainder.
+X_rest, X_test, y_rest, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=0, stratify=y
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_rest, y_rest, test_size=0.25, random_state=0, stratify=y_rest
+)
+
+print(f"train      {len(X_train):5}  {len(X_train) / len(X):.0%}")
+print(f"validation {len(X_val):5}  {len(X_val) / len(X):.0%}")
+print(f"test       {len(X_test):5}  {len(X_test) / len(X):.0%}")`} />
+
+Note the second `test_size=0.25`: a quarter of the remaining 80% is 20% of the whole.
+
+<Run id="ml-split-4" code={`from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeClassifier
+
+X, y = make_classification(n_samples=1200, n_features=8, n_informative=5,
+                           flip_y=0.1, random_state=0)
+X_rest, X_test, y_rest, y_test = train_test_split(X, y, test_size=0.2, random_state=0, stratify=y)
+X_train, X_val, y_train, y_val = train_test_split(X_rest, y_rest, test_size=0.25,
+                                                  random_state=0, stratify=y_rest)
+
+# Choose a setting using the validation set.
+best_depth, best_score = None, -1.0
+for depth in [2, 3, 5, 8, 12, None]:
+    model = DecisionTreeClassifier(max_depth=depth, random_state=0).fit(X_train, y_train)
+    score = model.score(X_val, y_val)
+    print(f"max_depth={str(depth):5} validation {score:.4f}")
+    if score > best_score:
+        best_depth, best_score = depth, score
+
+print()
+print("chosen depth:", best_depth)
+
+# Only now, and only once, the test set.
+final = DecisionTreeClassifier(max_depth=best_depth, random_state=0).fit(X_rest, y_rest)
+print("test score: ", round(final.score(X_test, y_test), 4))`} />
+
+<Callout type="warning">
+The validation score of the chosen setting is optimistic: you picked the best of six, so some of
+that number is luck. The test score is the honest one, and it is honest only because nothing was
+chosen using it. Peek at the test set once to compare two ideas and it quietly becomes another
+validation set.
+</Callout>
+
+## Leakage
+
+Leakage is any way information from outside the training data reaches the model. Its signature is
+a validation score that is too good, followed by disappointing production results.
+
+### Preprocessing before the split
+
+<Run id="ml-split-5" code={`import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(20, 1)) * 10 + 50
+
+# Wrong: the scaler saw every row, including the held-out ones.
+leaky = StandardScaler().fit(X)
+
+X_train, X_test = train_test_split(X, test_size=0.3, random_state=0)
+correct = StandardScaler().fit(X_train)
+
+print("mean over everything: ", round(float(leaky.mean_[0]), 4))
+print("mean over train only: ", round(float(correct.mean_[0]), 4))
+print("difference:           ", round(abs(float(leaky.mean_[0] - correct.mean_[0])), 4))`} />
+
+The difference is small here and enormous on a real dataset with outliers. The rule is absolute:
+**fit every transformer on the training data only.** The next lesson's `Pipeline` makes it
+structurally impossible to get wrong.
+
+### Duplicates across the split
+
+<Run id="ml-split-6" code={`import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.neighbors import KNeighborsClassifier
+
+rng = np.random.default_rng(0)
+base = rng.normal(size=(200, 4))
+labels = (base[:, 0] + base[:, 1] > 0).astype(int)
+
+# The same 200 examples, included twice — as real corpora routinely are.
+X = np.vstack([base, base])
+y = np.concatenate([labels, labels])
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=0)
+with_duplicates = KNeighborsClassifier(n_neighbors=1).fit(X_train, y_train).score(X_test, y_test)
+
+Xc_train, Xc_test, yc_train, yc_test = train_test_split(base, labels, test_size=0.3, random_state=0)
+deduplicated = KNeighborsClassifier(n_neighbors=1).fit(Xc_train, yc_train).score(Xc_test, yc_test)
+
+print(f"with duplicates across the split: {with_duplicates:.4f}")
+print(f"after de-duplicating:             {deduplicated:.4f}")`} />
+
+<Callout type="ai" title="Why this matters for AI">
+This is the single most common way an AI evaluation lies. Web-scraped corpora contain the same
+document many times over, an FAQ appears in three places, and a benchmark's questions end up in a
+model's training data. The result is a score that measures recall of something already seen. Hash
+the normalised content and de-duplicate **before** splitting — and when you evaluate a
+foundation model on a public benchmark, assume contamination until you have checked.
+</Callout>
+
+### Target leakage
+
+A feature that would not exist at prediction time can make a model look superb and be useless:
+
+<Run id="ml-split-7" code={`import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(0)
+n = 600
+prompt_tokens = rng.integers(100, 8000, n)
+was_refused = (prompt_tokens > 6000) | (rng.random(n) < 0.05)
+
+# "refusal_message_length" only exists *because* the request was refused.
+refusal_message_length = np.where(was_refused, rng.integers(40, 80, n), 0)
+
+honest = np.column_stack([prompt_tokens])
+leaky = np.column_stack([prompt_tokens, refusal_message_length])
+
+for name, features in [("prompt length only", honest), ("plus refusal length", leaky)]:
+    X_train, X_test, y_train, y_test = train_test_split(
+        features, was_refused, test_size=0.3, random_state=0
+    )
+    score = LogisticRegression(max_iter=1000).fit(X_train, y_train).score(X_test, y_test)
+    print(f"{name:22} {score:.4f}")`} />
+
+The second model is nearly perfect and completely worthless: at prediction time there is no
+refusal message, because the refusal has not happened yet.
+
+## Splitting by group and by time
+
+When rows share a source — several chunks from one document, several turns from one conversation
+— a random split puts siblings on both sides, and the model recognises the document rather than
+learning the task:
+
+<Run id="ml-split-8" code={`import numpy as np
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
+
+rng = np.random.default_rng(0)
+n_documents, chunks_each = 20, 10
+document_id = np.repeat(np.arange(n_documents), chunks_each)
+X = rng.normal(size=(n_documents * chunks_each, 3))
+y = rng.integers(0, 2, n_documents * chunks_each)
+
+train_idx, test_idx = next(
+    GroupShuffleSplit(n_splits=1, test_size=0.3, random_state=0).split(X, y, groups=document_id)
+)
+
+print("documents in train:", len(set(document_id[train_idx])))
+print("documents in test: ", len(set(document_id[test_idx])))
+print("documents in both: ", len(set(document_id[train_idx]) & set(document_id[test_idx])))
+
+plain_train, plain_test = train_test_split(np.arange(len(X)), test_size=0.3, random_state=0)
+print()
+print("with a plain random split, documents in both:",
+      len(set(document_id[plain_train]) & set(document_id[plain_test])))`} />
+
+For ordered data, the split has to respect time — train on the past, test on the future:
+
+<Run id="ml-split-9" code={`import numpy as np
+from sklearn.model_selection import TimeSeriesSplit
+
+values = np.arange(20).reshape(-1, 1)
+
+for fold, (train_idx, test_idx) in enumerate(TimeSeriesSplit(n_splits=4).split(values), start=1):
+    print(f"fold {fold}: train {train_idx.min():2}-{train_idx.max():2}  "
+          f"test {test_idx.min():2}-{test_idx.max():2}")`} />
+
+## Try it yourself
+
+<Exercise
+  id="ml-split-ex1"
+  title="Exercise 1"
+  brief="Split into 60% train, 20% validation and 20% test, stratified by <code>y</code>, with <code>random_state=0</code> throughout."
+  code={`from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+
+X, y = make_classification(n_samples=1000, n_features=8, weights=[0.7, 0.3], random_state=0)
+
+X_train = X_val = X_test = None
+y_train = y_val = y_test = None
+
+print(len(X_train), len(X_val), len(X_test))`}
+  hint="Split off 20% for the test set first, then split the remaining 80% with test_size=0.25 — a quarter of 80% is 20% of the whole."
+  solution={`from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+
+X, y = make_classification(n_samples=1000, n_features=8, weights=[0.7, 0.3], random_state=0)
+
+X_rest, X_test, y_rest, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=0, stratify=y
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_rest, y_rest, test_size=0.25, random_state=0, stratify=y_rest
+)
+
+print(len(X_train), len(X_val), len(X_test))`}
+  tests={`import numpy as np
+
+assert len(X_train) == 600, f"The training set should hold 600 rows, got {len(X_train)}."
+assert len(X_val) == 200, f"The validation set should hold 200 rows, got {len(X_val)}."
+assert len(X_test) == 200, f"The test set should hold 200 rows, got {len(X_test)}."
+assert len(y_train) == 600 and len(y_val) == 200 and len(y_test) == 200, (
+    "The labels must be split alongside the features."
+)
+
+total = len(X_train) + len(X_val) + len(X_test)
+assert total == 1000, f"Every row should end up in exactly one split, got {total}."
+
+# Stratification: each split should keep roughly the overall 70/30 balance.
+overall = np.bincount(y)[1] / len(y)
+for name, split in [("train", y_train), ("validation", y_val), ("test", y_test)]:
+    share = np.bincount(split, minlength=2)[1] / len(split)
+    assert abs(share - overall) < 0.02, (
+        f"The {name} split is {share:.3f} positive against {overall:.3f} overall — "
+        "pass stratify= so the class balance is preserved."
+    )`}
+/>
+
+<Exercise
+  id="ml-split-ex2"
+  title="Exercise 2"
+  brief="The scaler below is fitted on every row, which leaks the held-out data. Split first, then fit the scaler on the training set only and apply it to both."
+  code={`import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(400, 4)) * 10 + 50
+y = (X[:, 0] + X[:, 1] > 100).astype(int)
+
+scaler = StandardScaler().fit(X)
+X_scaled = scaler.transform(X)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_scaled, y, test_size=0.25, random_state=0
+)
+
+model = LogisticRegression(max_iter=1000).fit(X_train, y_train)
+print("accuracy:", round(model.score(X_test, y_test), 4))`}
+  hint="Split the raw X first. Then scaler.fit(X_train_raw), and transform both halves with that same fitted scaler."
+  solution={`import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(400, 4)) * 10 + 50
+y = (X[:, 0] + X[:, 1] > 100).astype(int)
+
+X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+    X, y, test_size=0.25, random_state=0
+)
+
+scaler = StandardScaler().fit(X_train_raw)
+X_train = scaler.transform(X_train_raw)
+X_test = scaler.transform(X_test_raw)
+
+model = LogisticRegression(max_iter=1000).fit(X_train, y_train)
+print("accuracy:", round(model.score(X_test, y_test), 4))`}
+  tests={`import numpy as np
+from sklearn.model_selection import train_test_split
+
+expected_train_raw, expected_test_raw, _, _ = train_test_split(
+    X, y, test_size=0.25, random_state=0
+)
+
+assert np.allclose(scaler.mean_, expected_train_raw.mean(axis=0)), (
+    "The scaler should have learned the *training* set's means. It currently knows "
+    f"{np.asarray(scaler.mean_).round(3)}, but the training set's means are "
+    f"{expected_train_raw.mean(axis=0).round(3)} — it was fitted before the split."
+)
+assert not np.allclose(scaler.mean_, X.mean(axis=0)), (
+    "The scaler still knows the mean of every row, including the held-out ones."
+)
+
+# The test set must be transformed by that same scaler, not re-fitted.
+assert np.allclose(X_test, scaler.transform(expected_test_raw)), (
+    "Transform the test set with the scaler fitted on training data — never fit a second one."
+)
+assert model.score(X_test, y_test) > 0.9, (
+    "The model should still work; only where the scaler learned its statistics changes."
+)`}
+/>
+
+<Quiz
+  question="You tune ten hyperparameter settings on the validation set and report the best validation score. Why is it optimistic?"
+  choices={[
+    { text: "Picking the best of ten selects partly for luck on that particular split", correct: true, why: "The maximum of ten noisy estimates is biased upwards, which is exactly why a separate, untouched test set exists." },
+    { text: "Validation sets are always smaller than test sets", why: "Size affects the variance, not the selection bias that comes from choosing the maximum." },
+    { text: "It is not — the validation set was held out, so the score is honest", why: "It was held out from *training*, but not from *selection*, and selection is what biases it." },
+    { text: "Because ten settings overfit the training data", why: "The training data is unaffected; it is the validation estimate that becomes optimistic." },
+  ]}
+/>
+
+<Quiz
+  question="Your chunk-level classifier scores 0.97 held out, then 0.62 in production. Chunks come from 200 documents. What is the likely cause?"
+  choices={[
+    { text: "A random split put chunks from the same document on both sides, so the model recognised documents", correct: true, why: "Sibling chunks share vocabulary and style; splitting by document with GroupShuffleSplit gives the honest number." },
+    { text: "The test set was too small", why: "A small test set adds variance, not a consistent 35-point gap." },
+    { text: "The model needed more training data", why: "More data would not close a gap caused by the split itself leaking information." },
+    { text: "Production data is always harder", why: "Sometimes true, but a gap this size with a known group structure points squarely at the split." },
+  ]}
+/>
+
+## Recap
+
+- Score on data the model has not seen; a training score measures memorisation.
+- `train_test_split(..., stratify=y, random_state=0)` keeps class balance and makes the split
+  reproducible.
+- Train to learn, validation to choose, test once to report.
+- Fit every transformer on the training data only — preprocessing before the split leaks.
+- De-duplicate on content before splitting, or the score measures recall.
+- A feature that only exists after the outcome is target leakage: excellent offline, worthless
+  live.
+- Split by group when rows share a source, and by time when the data is ordered.

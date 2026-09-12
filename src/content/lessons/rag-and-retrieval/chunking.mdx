@@ -1,0 +1,524 @@
+---
+title: Chunking strategies that survive contact with real documents
+description: Splitting on a character count cuts sentences in half and answers with them. Split on structure, overlap deliberately, and carry the metadata that lets a chunk explain where it came from.
+module: rag-and-retrieval
+order: 2
+level: expert
+minutes: 20
+objectives:
+  - Explain why documents are chunked at all, and what a chunk competes on
+  - Implement fixed-size chunking with overlap
+  - Split on structure, falling back progressively
+  - Attach the metadata a chunk needs to be useful later
+  - Choose a chunk size from what you are retrieving for
+---
+
+Chunking sets the ceiling on everything downstream. A passage that answers the question but was
+split across two chunks cannot be retrieved as an answer by any ranking function, however good.
+
+## Why chunk
+
+<Run id="rag-chunk-1" code={`REASONS = [
+    ("Precision",
+     "A 40-page document embeds to one vector, which is an average of forty pages. "
+     "It matches everything vaguely and nothing precisely."),
+    ("Context budget",
+     "You can only hand the model a few thousand tokens of context. Retrieving whole "
+     "documents wastes most of that on irrelevant text."),
+    ("Attribution",
+     "A citation that points at a 40-page PDF is not a citation. One that points at a "
+     "paragraph is."),
+]
+
+for name, why in REASONS:
+    print(f"{name}\\n  {why}\\n")`} />
+
+## Fixed size, and why it fails
+
+The simplest splitter cuts every N characters. Watch what it does to the prose:
+
+<Run id="rag-chunk-2" code={`DOCUMENT = (
+    "Retrieval augmented generation grounds an answer in documents you control. "
+    "The retrieval step finds relevant passages. The generation step is instructed to "
+    "answer only from those passages. Chunk overlap matters: use 10 to 20 percent so "
+    "a sentence is not cut in half at a boundary."
+)
+
+def fixed_chunks(text, size=100):
+    return [text[i:i + size] for i in range(0, len(text), size)]
+
+for number, chunk in enumerate(fixed_chunks(DOCUMENT), start=1):
+    print(f"[{number}] {chunk!r}")`} />
+
+Chunk boundaries land mid-word and mid-sentence. A query about overlap now has to match a chunk
+that begins "n is not cut in half" — and the chunk that contains the actual advice has lost the
+word "overlap" to its neighbour.
+
+## Overlap
+
+Repeating a slice of each chunk in the next one means a sentence cut at a boundary still appears
+whole somewhere:
+
+<Run id="rag-chunk-3" code={`DOCUMENT = (
+    "Retrieval augmented generation grounds an answer in documents you control. "
+    "The retrieval step finds relevant passages. The generation step is instructed to "
+    "answer only from those passages. Chunk overlap matters: use 10 to 20 percent so "
+    "a sentence is not cut in half at a boundary."
+)
+
+def word_chunks(text, size=20, overlap=4):
+    words = text.split()
+    step = size - overlap
+    if step < 1:
+        raise ValueError("overlap must be smaller than size")
+    chunks = []
+    for start in range(0, len(words), step):
+        piece = words[start:start + size]
+        if piece:
+            chunks.append(" ".join(piece))
+        if start + size >= len(words):
+            break
+    return chunks
+
+for number, chunk in enumerate(word_chunks(DOCUMENT), start=1):
+    print(f"[{number}] {chunk}")
+    print()
+
+print("words:", len(DOCUMENT.split()))
+print("chunks:", len(word_chunks(DOCUMENT)))
+print("duplication:", f"{sum(len(c.split()) for c in word_chunks(DOCUMENT)) / len(DOCUMENT.split()):.2f}x")`} />
+
+Overlap buys robustness and costs storage — every chunk is embedded, and the duplicated words are
+embedded twice. Ten to twenty per cent is the usual compromise.
+
+<Callout type="warning">
+Two bugs live in that function and are worth naming. If `overlap >= size` the step is zero or
+negative and the loop never terminates — check it. And without the final `break` a text whose
+length divides evenly produces a trailing empty or near-duplicate chunk.
+</Callout>
+
+## Split on structure
+
+A document already tells you where its boundaries are. Use them before falling back to counting:
+
+<Run id="rag-chunk-4" code={`import re
+
+DOCUMENT = """# Retrieval
+
+Retrieval augmented generation grounds an answer in documents you control.
+The retrieval step finds relevant passages.
+
+## Chunking
+
+Use 10 to 20 percent overlap. Split on paragraph boundaries where you can.
+
+## Embeddings
+
+Store vectors as float32. Normalise them at index time so search is a dot product.
+"""
+
+def split_paragraphs(text):
+    return [p.strip() for p in re.split(r"\\n\\s*\\n", text) if p.strip()]
+
+for number, paragraph in enumerate(split_paragraphs(DOCUMENT), start=1):
+    print(f"[{number}] {paragraph!r}")`} />
+
+Markdown headings are better still, because they carry the section a passage belongs to:
+
+<Run id="rag-chunk-5" code={`import re
+
+DOCUMENT = """# Retrieval
+
+Retrieval augmented generation grounds an answer in documents you control.
+
+## Chunking
+
+Use 10 to 20 percent overlap. Split on paragraph boundaries where you can.
+
+## Embeddings
+
+Store vectors as float32. Normalise them at index time.
+"""
+
+def split_by_heading(text):
+    sections, heading, buffer = [], None, []
+    for line in text.splitlines():
+        match = re.match(r"^(#{1,6})\\s+(.*)$", line)
+        if match:
+            if buffer:
+                sections.append((heading, "\\n".join(buffer).strip()))
+            heading, buffer = match.group(2), []
+        else:
+            buffer.append(line)
+    if buffer:
+        sections.append((heading, "\\n".join(buffer).strip()))
+    return [(h, body) for h, body in sections if body]
+
+for heading, body in split_by_heading(DOCUMENT):
+    print(f"{heading!r}: {body[:60]!r}")`} />
+
+## Recursive splitting
+
+The practical strategy: try the biggest natural boundary; if a piece is still too large, split it
+on the next boundary down; only count characters as a last resort.
+
+<Run id="rag-chunk-6" code={`import re
+
+SEPARATORS = ["\\n\\n", "\\n", ". ", " "]
+
+def recursive_split(text, size=120, separators=SEPARATORS):
+    text = text.strip()
+    if len(text) <= size:
+        return [text] if text else []
+    if not separators:
+        return [text[i:i + size] for i in range(0, len(text), size)]
+
+    separator, rest = separators[0], separators[1:]
+    pieces, current = [], ""
+    for part in text.split(separator):
+        candidate = f"{current}{separator}{part}" if current else part
+        if len(candidate) <= size:
+            current = candidate
+        else:
+            if current:
+                pieces.append(current)
+            current = part
+    if current:
+        pieces.append(current)
+
+    output = []
+    for piece in pieces:
+        output.extend(recursive_split(piece, size, rest) if len(piece) > size else [piece.strip()])
+    return [p for p in output if p]
+
+DOCUMENT = (
+    "Retrieval augmented generation grounds an answer in documents you control.\\n\\n"
+    "The retrieval step finds relevant passages. The generation step is instructed to answer "
+    "only from those passages, and to say when it cannot.\\n\\n"
+    "Chunk overlap matters. Use 10 to 20 percent so a sentence is not cut in half."
+)
+
+for number, chunk in enumerate(recursive_split(DOCUMENT, size=120), start=1):
+    print(f"[{number}] ({len(chunk):>3}) {chunk}")`} />
+
+Every chunk now ends on a sentence or a paragraph, and none exceeds the limit.
+
+## Carry the metadata
+
+A chunk with no provenance cannot be cited, filtered or de-duplicated:
+
+<Run id="rag-chunk-7" code={`import hashlib, re
+from dataclasses import dataclass, field
+
+@dataclass(frozen=True)
+class Chunk:
+    text: str
+    doc_id: str
+    heading: str | None
+    position: int
+    source_uri: str
+
+    @property
+    def chunk_id(self):
+        return hashlib.sha256(f"{self.doc_id}\\u0000{self.text}".encode("utf-8")).hexdigest()[:16]
+
+    @property
+    def tokens(self):
+        return len(self.text.split())
+
+def chunk_document(doc_id, source_uri, markdown, size=120):
+    sections, heading, buffer = [], None, []
+    for line in markdown.splitlines():
+        match = re.match(r"^(#{1,6})\\s+(.*)$", line)
+        if match:
+            if buffer:
+                sections.append((heading, "\\n".join(buffer).strip()))
+            heading, buffer = match.group(2), []
+        else:
+            buffer.append(line)
+    if buffer:
+        sections.append((heading, "\\n".join(buffer).strip()))
+
+    chunks, position = [], 0
+    for heading, body in sections:
+        if not body:
+            continue
+        for piece in [body[i:i + size] for i in range(0, len(body), size)]:
+            piece = piece.strip()
+            if not piece:
+                continue
+            chunks.append(Chunk(piece, doc_id, heading, position, source_uri))
+            position += 1
+    return chunks
+
+DOCUMENT = """# Retrieval
+
+Retrieval augmented generation grounds an answer in documents you control.
+
+## Chunking
+
+Use 10 to 20 percent overlap so a sentence is not cut in half at a boundary.
+"""
+
+for chunk in chunk_document("guide", "docs://guide.md", DOCUMENT):
+    print(f"{chunk.chunk_id}  pos={chunk.position}  heading={chunk.heading!r}")
+    print(f"    {chunk.text[:70]}")`} />
+
+<Callout type="tip">
+Prefixing each chunk's text with its heading path — "Retrieval > Chunking: use 10 to 20 percent…"
+— often improves retrieval measurably. The chunk then carries its own context, so a passage that
+never says the word "chunking" still matches a query about it.
+</Callout>
+
+<Callout type="ai" title="Why this matters for AI">
+Chunking is where most RAG quality is won or lost, and it is the part people tune last. If the
+sentence that answers a question is split across a boundary, no embedding model and no re-ranker
+can recover it — the information simply is not in any single chunk. Before blaming the model for a
+bad answer, look at the chunks that were retrieved and ask whether the answer was ever retrievable
+at all. It usually was not.
+</Callout>
+
+## Choosing a size
+
+<Run id="rag-chunk-8" code={`TRADE_OFFS = [
+    (100, "Very precise matches. Often too little context to answer from. "
+          "More chunks, so more vectors and more storage."),
+    (300, "The usual default for prose. One or two paragraphs: enough to answer, "
+          "specific enough to rank."),
+    (800, "Good for reference material where an answer needs surrounding detail. "
+          "Dilutes the embedding; a chunk matches many things weakly."),
+    (2000, "Approaching whole-document retrieval. Consider retrieving small and then "
+           "expanding to the parent section instead."),
+]
+
+print(f"{'tokens':>7}  notes")
+for size, note in TRADE_OFFS:
+    print(f"{size:>7}  {note}")
+
+print()
+print("Rules that survive contact with real corpora:")
+for rule in [
+    "Never split inside a code block, a table row or a list item.",
+    "Keep a heading with the text beneath it.",
+    "Measure retrieval quality at two or three sizes rather than guessing once.",
+    "Retrieve small chunks, then expand to the surrounding section before answering.",
+]:
+    print("  -", rule)`} />
+
+That last rule is worth emphasising: *retrieve* at 200 tokens for precision, then *send* the
+parent section so the model has enough to work with. The two jobs have different optimal sizes.
+
+## Try it yourself
+
+<Exercise
+  id="rag-chunk-ex1"
+  title="Exercise 1"
+  brief="Write <code>chunk_words(text, size, overlap)</code>: split into chunks of <code>size</code> words that share <code>overlap</code> words with the previous chunk, and raise <code>ValueError</code> if the overlap is not smaller than the size."
+  code={`def chunk_words(text, size=10, overlap=2):
+    # Split on whitespace. Each chunk holds at most 'size' words and starts
+    # 'size - overlap' words after the previous one. Raise ValueError when
+    # overlap >= size. No empty chunks, and no trailing duplicate.
+    ...
+
+
+text = " ".join(f"w{n}" for n in range(1, 26))
+for chunk in chunk_words(text, size=10, overlap=2):
+    print(chunk)`}
+  hint="step = size - overlap; loop start over range(0, len(words), step); break once start + size covers the end."
+  solution={`def chunk_words(text, size=10, overlap=2):
+    if overlap >= size:
+        raise ValueError("overlap must be smaller than size")
+    words = text.split()
+    if not words:
+        return []
+    step = size - overlap
+    chunks = []
+    for start in range(0, len(words), step):
+        piece = words[start:start + size]
+        if not piece:
+            break
+        chunks.append(" ".join(piece))
+        if start + size >= len(words):
+            break
+    return chunks
+
+
+text = " ".join(f"w{n}" for n in range(1, 26))
+for chunk in chunk_words(text, size=10, overlap=2):
+    print(chunk)`}
+  tests={`text = " ".join(f"w{n}" for n in range(1, 26))      # w1 .. w25
+
+chunks = chunk_words(text, size=10, overlap=2)
+assert all(chunks), "No chunk should be empty."
+assert all(len(c.split()) <= 10 for c in chunks), (
+    f"No chunk may exceed the size. Got lengths {[len(c.split()) for c in chunks]}."
+)
+assert chunks[0].split()[0] == "w1", "The first chunk starts at the beginning."
+assert chunks[-1].split()[-1] == "w25", (
+    f"The last word must appear — got {chunks[-1].split()[-1]!r}. Check the final chunk is kept."
+)
+
+# Consecutive chunks must actually share the overlapping words.
+first, second = chunks[0].split(), chunks[1].split()
+assert first[-2:] == second[:2], (
+    f"Chunks should share 2 words: {first[-2:]} against {second[:2]}."
+)
+
+# Every word must survive somewhere.
+seen = {word for chunk in chunks for word in chunk.split()}
+assert seen == set(text.split()), "No word may be dropped."
+
+# No overlap is a plain split.
+plain = chunk_words(text, size=5, overlap=0)
+assert [len(c.split()) for c in plain] == [5, 5, 5, 5, 5], (
+    f"With no overlap, 25 words in fives is five chunks. Got {[len(c.split()) for c in plain]}."
+)
+
+assert chunk_words("", size=5, overlap=1) == [], "Empty text gives no chunks."
+assert chunk_words("one two", size=10, overlap=2) == ["one two"], (
+    "Text shorter than one chunk is a single chunk."
+)
+
+try:
+    chunk_words(text, size=4, overlap=4)
+except ValueError:
+    pass
+else:
+    raise AssertionError("overlap >= size must raise ValueError, not loop forever.")`}
+/>
+
+<Exercise
+  id="rag-chunk-ex2"
+  title="Exercise 2"
+  brief="Write <code>split_sections(markdown)</code>: return <code>(heading, body)</code> pairs, where <code>heading</code> is the nearest preceding ATX heading text, or <code>None</code> for text before the first one. Skip sections with an empty body."
+  code={`import re
+
+def split_sections(markdown):
+    # A heading line looks like "# Title" or "### Title" (1-6 hashes).
+    # Text before the first heading has heading None.
+    # Return a list of (heading, body) with the body stripped, and drop
+    # any section whose body is empty.
+    ...
+
+
+DOCUMENT = """Intro text before any heading.
+
+# Retrieval
+
+Grounds an answer in your documents.
+
+## Chunking
+
+Use 10 to 20 percent overlap.
+
+## Empty section
+"""
+
+for heading, body in split_sections(DOCUMENT):
+    print(f"{heading!r}: {body!r}")`}
+  hint="Walk the lines, match r'^(#{1,6})\\s+(.*)$'. On a match, flush the buffer as a section and start a new heading."
+  solution={`import re
+
+def split_sections(markdown):
+    sections, heading, buffer = [], None, []
+    for line in markdown.splitlines():
+        match = re.match(r"^(#{1,6})\\s+(.*)$", line)
+        if match:
+            if buffer:
+                sections.append((heading, "\\n".join(buffer).strip()))
+            heading, buffer = match.group(2), []
+        else:
+            buffer.append(line)
+    if buffer:
+        sections.append((heading, "\\n".join(buffer).strip()))
+    return [(h, body) for h, body in sections if body]
+
+
+DOCUMENT = """Intro text before any heading.
+
+# Retrieval
+
+Grounds an answer in your documents.
+
+## Chunking
+
+Use 10 to 20 percent overlap.
+
+## Empty section
+"""
+
+for heading, body in split_sections(DOCUMENT):
+    print(f"{heading!r}: {body!r}")`}
+  tests={`DOCUMENT = """Intro text before any heading.
+
+# Retrieval
+
+Grounds an answer in your documents.
+
+## Chunking
+
+Use 10 to 20 percent overlap.
+
+## Empty section
+"""
+
+sections = split_sections(DOCUMENT)
+assert isinstance(sections, list), f"Return a list, got {type(sections).__name__}."
+assert len(sections) == 3, (
+    f"Intro, Retrieval and Chunking — the empty section is dropped. Got {len(sections)}: "
+    f"{[h for h, _ in sections]}"
+)
+
+assert sections[0][0] is None, "Text before the first heading has heading None."
+assert sections[0][1] == "Intro text before any heading.", f"Got {sections[0][1]!r}."
+
+assert sections[1] == ("Retrieval", "Grounds an answer in your documents."), f"Got {sections[1]!r}."
+assert sections[2] == ("Chunking", "Use 10 to 20 percent overlap."), f"Got {sections[2]!r}."
+
+assert all(body.strip() == body for _, body in sections), "Bodies must be stripped."
+assert all(body for _, body in sections), "A section with an empty body is dropped."
+
+# Deeper headings count too.
+deep = split_sections("### Deep\\n\\nbody here")
+assert deep == [("Deep", "body here")], f"Got {deep!r}."
+
+# A document with no headings is one section.
+plain = split_sections("just some text")
+assert plain == [(None, "just some text")], f"Got {plain!r}."
+
+# A hash that is not a heading must not split.
+hashless = split_sections("#nospace is not a heading\\n\\nstill the same section")
+assert len(hashless) == 1, f"'#nospace' has no space after the hash. Got {hashless!r}."`}
+/>
+
+<Quiz
+  question="An answer exists in your corpus but retrieval never finds it. What should you check first?"
+  choices={[
+    { text: "Whether the answering sentence was split across two chunks, so no single chunk contains it", correct: true, why: "If the information is not whole in any chunk, no ranking function can retrieve it — the ceiling was set at chunking time." },
+    { text: "Whether the model's temperature is too high", why: "Temperature affects generation, not which passages come back." },
+    { text: "Whether the system prompt is long enough", why: "The prompt cannot conjure a passage retrieval did not return." },
+    { text: "Whether k is too small", why: "Worth checking second — but if the text is split, raising k returns more halves." },
+  ]}
+/>
+
+<Quiz
+  question="Why retrieve small chunks but send the surrounding section to the model?"
+  choices={[
+    { text: "Small chunks rank precisely; larger context answers better — the two jobs want different sizes", correct: true, why: "A 200-token chunk gives a sharp embedding, and expanding to its parent gives the model enough surrounding detail to actually answer." },
+    { text: "It reduces the number of vectors you have to store", why: "The vector count is set by the retrieval chunk size and is unchanged by what you send afterwards." },
+    { text: "Because the model cannot read short passages", why: "It reads them fine; the issue is that a short passage may not contain enough to answer." },
+    { text: "To avoid prompt caching invalidation", why: "Retrieved context sits after the cached prefix either way." },
+  ]}
+/>
+
+## Recap
+
+- Chunking sets the ceiling: information split across a boundary cannot be retrieved whole.
+- Fixed-size splitting cuts words and sentences; overlap of 10-20% repairs most of the damage at
+  the cost of duplicated storage.
+- Guard the overlap against being larger than the size, or the loop never ends.
+- Split on structure first — paragraphs, then headings — and fall back progressively, counting
+  characters last.
+- Carry `doc_id`, heading, position and a content hash on every chunk, and consider prefixing the
+  text with its heading path.
+- Retrieve small for precision, then expand to the parent section before answering.

@@ -19,8 +19,39 @@ jobs:
 
       - run: npm ci
 
+      - name: Check the content rules
+        run: npm run lint:lessons
+
       - name: Type-check Astro, TypeScript and content schemas
         run: npm run check
 
       - name: Build the static site
         run: npm run build
+
+  verify:
+    name: Run every lesson's code
+    runs-on: ubuntu-latest
+    # Booting Pyodide and pulling numpy, pandas, scikit-learn, matplotlib and
+    # pytest from the CDN takes a few minutes on a cold cache.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      # The wheels are large and never change for a given Pyodide release, so
+      # key the cache on the version pinned in the worker.
+      - name: Restore the Pyodide package cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules/.cache/pyodide-packages
+          key: pyodide-${{ hashFiles('public/pyodide-worker.js', 'package-lock.json') }}
+          restore-keys: pyodide-
+
+      - name: Execute every Run block and Exercise solution
+        run: npm run verify

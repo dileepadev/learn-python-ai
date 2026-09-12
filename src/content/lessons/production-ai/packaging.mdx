@@ -1,0 +1,429 @@
+---
+title: Packaging, dependency pinning and reproducibility
+description: Declare dependencies in pyproject.toml, lock them so a build resolves identically in a year, and record the seeds, versions and data hashes that let somebody reproduce a number you reported.
+module: production-ai
+order: 8
+level: expert
+minutes: 20
+objectives:
+  - Lay a project out so it is importable and installable
+  - Declare dependencies in pyproject.toml with honest constraints
+  - Explain the difference between a constraint and a lock
+  - Containerise a service so the image is reproducible
+  - Record what an experiment needs to be repeated
+---
+
+Everything in this module assumes the code you evaluated is the code that runs. That assumption
+holds only if you pin what it depends on.
+
+## Layout
+
+<Run id="prod-pkg-1" code={`LAYOUT = """
+rag-service/
+  pyproject.toml          what it is, what it needs
+  uv.lock                 exactly which versions resolve, committed
+  README.md
+  Dockerfile
+  src/
+    rag_service/
+      __init__.py
+      config.py           settings from the environment
+      ingest.py           chunk, embed, index
+      retrieve.py         search and re-rank
+      answer.py           prompt, call, validate
+      api.py              the FastAPI app
+      prompts/
+        answer.md         prompts are files, as in module 6
+  tests/
+    test_retrieve.py
+    test_answer.py
+  evals/
+    eval.jsonl            the set, committed
+    run.py
+"""
+print(LAYOUT.strip())
+print()
+for note in [
+    "src/ layout: tests import the *installed* package, not the directory they sit next to,",
+    "  so a missing file in the wheel fails in CI rather than in production.",
+    "The lock file is committed. The virtual environment is not.",
+    "Prompts and the eval set are source code and live beside it.",
+]:
+    print(note)`} />
+
+## pyproject.toml
+
+<Run id="prod-pkg-2" code={`PYPROJECT = '''
+[project]
+name = "rag-service"
+version = "0.4.2"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.70,<1.0",
+    "fastapi>=0.115",
+    "numpy>=2.0",
+    "pydantic>=2.7,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "mypy>=1.10", "ruff>=0.6"]
+
+[project.scripts]
+rag-ingest = "rag_service.ingest:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: takes more than a second", "live: costs money"]
+
+[tool.mypy]
+strict = true
+
+[tool.ruff]
+line-length = 100
+'''
+
+print(PYPROJECT.strip())`} />
+
+The constraints say what the code is *compatible with*. `>=2.7,<3` for Pydantic means "any 2.x
+from 2.7", which lets a security fix in without letting a breaking 3.0 in.
+
+<Callout type="tip">
+Set an upper bound on anything that has broken you before, and on anything pre-1.0 — where minor
+versions routinely break. Bounding everything tightly is the other failure: it makes your package
+impossible to install alongside anything else.
+</Callout>
+
+## Constraints are not a lock
+
+<Run id="prod-pkg-3" code={`AVAILABLE = {
+    "numpy": ["2.0.0", "2.1.0", "2.2.0", "2.3.1"],
+    "pydantic": ["2.7.0", "2.8.2", "2.9.1", "3.0.0"],
+}
+
+def resolve(constraint_min, constraint_max, versions):
+    """What a fresh install picks: the newest version inside the constraint."""
+    def key(v):
+        return tuple(int(p) for p in v.split("."))
+    allowed = [v for v in versions
+               if key(v) >= key(constraint_min) and (constraint_max is None or key(v) < key(constraint_max))]
+    return allowed[-1] if allowed else None
+
+print("in January:")
+print("  numpy>=2.0    ->", resolve("2.0.0", None, ["2.0.0", "2.1.0"]))
+print("  pydantic>=2.7 ->", resolve("2.7.0", "3.0.0", ["2.7.0", "2.8.2"]))
+print()
+print("in June, with no lock file, the same constraints give:")
+print("  numpy>=2.0    ->", resolve("2.0.0", None, AVAILABLE["numpy"]))
+print("  pydantic>=2.7 ->", resolve("2.7.0", "3.0.0", AVAILABLE["pydantic"]))
+print()
+print("Same pyproject.toml, different build, and nothing in your repository changed.")`} />
+
+A **lock file** records the resolution: every package, its exact version, and a hash of the
+artefact. It is generated, committed, and refreshed deliberately:
+
+```bash
+uv lock                     # resolve and write uv.lock
+uv sync                     # install exactly what the lock says
+uv lock --upgrade-package numpy   # move one dependency on purpose
+```
+
+```bash
+# The pip equivalent, if you are not using uv:
+pip-compile pyproject.toml -o requirements.lock
+pip-sync requirements.lock
+```
+
+<Callout type="warning">
+`pip install -r requirements.txt` with unpinned constraints does **not** reproduce an environment;
+it resolves a fresh one. Two people running the same command on the same repository a month apart
+can get different versions, and the one whose evaluation dropped will spend a day looking in the
+wrong place.
+</Callout>
+
+## A reproducible image
+
+```dockerfile
+FROM python:3.12-slim AS build
+WORKDIR /app
+
+# Copy only what the dependency layer needs, so it caches.
+COPY pyproject.toml uv.lock ./
+RUN pip install --no-cache-dir uv && uv sync --frozen --no-dev
+
+COPY src/ ./src/
+RUN uv pip install --no-deps .
+
+FROM python:3.12-slim
+WORKDIR /app
+COPY --from=build /app/.venv /app/.venv
+COPY --from=build /app/src /app/src
+ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
+
+RUN useradd --create-home app && chown -R app /app
+USER app
+
+EXPOSE 8000
+CMD ["uvicorn", "rag_service.api:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+`--frozen` is the important flag: it fails the build if the lock file disagrees with
+`pyproject.toml`, rather than quietly re-resolving. And the key is not in the image — it arrives
+as an environment variable at run time, exactly as in module 2.
+
+## Versioning your own package
+
+<Run id="prod-pkg-4" code={`CHANGES = [
+    ("0.4.2 -> 0.4.3", "patch", "Fix a crash when a chunk is empty. No API change."),
+    ("0.4.3 -> 0.5.0", "minor", "Add a top_k argument with a default. Existing calls unaffected."),
+    ("0.5.0 -> 1.0.0", "major", "Rename retrieve() to search(). Every caller must change."),
+    ("1.0.0 -> 1.0.1", "patch", "Update a dependency's lower bound."),
+]
+
+for change, kind, why in CHANGES:
+    print(f"{change:<18} {kind:<6} {why}")
+
+print()
+print("A prompt change is a behaviour change. If callers depend on the output")
+print("shape or the refusal wording, it belongs in the version and the changelog.")`} />
+
+That last point is easy to miss. Prompts are not configuration you can edit silently — a
+downstream service parsing your refusal string breaks when you reword it.
+
+## Reproducing a result
+
+<Run id="prod-pkg-5" code={`import hashlib, json, platform, sys
+from pathlib import Path
+
+Path("eval.jsonl").write_text('{"id": "e1", "question": "overlap?"}\\n', encoding="utf-8")
+
+def file_hash(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+
+manifest = {
+    "result": {"pass_rate": 0.93, "cost_usd": 0.42},
+    "code": {"git_sha": "a1b2c3d", "package_version": "0.4.2"},
+    "environment": {
+        "python": sys.version.split()[0],
+        "platform": platform.system().lower(),
+        "lock_hash": "sha256:9f2c...",
+    },
+    "model": {"id": "claude-opus-5", "effort": "high"},
+    "prompt": {"version": "answer@3", "hash": "8b1a2c3d4e5f"},
+    "data": {"eval_set": "evals/eval.jsonl", "eval_set_hash": file_hash("eval.jsonl")},
+    "seeds": {"split": 42, "shuffle": 7},
+}
+
+print(json.dumps(manifest, indent=2))`} />
+
+<Callout type="ai" title="Why this matters for AI">
+Six things move underneath an AI result, and only one of them is your code: the model version, the
+prompt, the eval set, the library versions, the random seeds and the retrieval settings. A number
+recorded without all six cannot be reproduced or defended — and when quality drops three weeks
+later, the manifest is the difference between a diff and an investigation. Write it beside every
+result you would ever quote.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="prod-pkg-ex1"
+  title="Exercise 1"
+  brief="Write <code>satisfies(version, specifier)</code> for specifiers like <code>&gt;=2.7,&lt;3</code>, and <code>resolve(versions, specifier)</code> returning the newest version that satisfies it."
+  code={`def parse(version):
+    return tuple(int(part) for part in version.split("."))
+
+
+def satisfies(version, specifier):
+    # specifier is a comma-separated list of clauses like ">=2.7" or "<3".
+    # Only >=, >, <=, < and == need supporting. Compare as tuples, so
+    # "2.7" is (2, 7) and sorts before (2, 7, 1).
+    ...
+
+
+def resolve(versions, specifier):
+    # The newest version satisfying the specifier, or None.
+    ...
+
+
+VERSIONS = ["2.7.0", "2.8.2", "2.9.1", "3.0.0"]
+print(resolve(VERSIONS, ">=2.7,<3"))
+print(resolve(VERSIONS, ">=3"))
+print(resolve(VERSIONS, ">=4"))`}
+  hint="Split the specifier on commas, then read the operator off the front of each clause — check the two-character operators before the one-character ones."
+  solution={`def parse(version):
+    return tuple(int(part) for part in version.split("."))
+
+
+def satisfies(version, specifier):
+    actual = parse(version)
+    for clause in specifier.split(","):
+        clause = clause.strip()
+        for operator in (">=", "<=", "==", ">", "<"):
+            if clause.startswith(operator):
+                wanted = parse(clause[len(operator):])
+                if operator == ">=" and not actual >= wanted:
+                    return False
+                if operator == "<=" and not actual <= wanted:
+                    return False
+                if operator == "==" and not actual == wanted:
+                    return False
+                if operator == ">" and not actual > wanted:
+                    return False
+                if operator == "<" and not actual < wanted:
+                    return False
+                break
+    return True
+
+
+def resolve(versions, specifier):
+    allowed = [v for v in versions if satisfies(v, specifier)]
+    return max(allowed, key=parse) if allowed else None
+
+
+VERSIONS = ["2.7.0", "2.8.2", "2.9.1", "3.0.0"]
+print(resolve(VERSIONS, ">=2.7,<3"))
+print(resolve(VERSIONS, ">=3"))
+print(resolve(VERSIONS, ">=4"))`}
+  tests={`VERSIONS = ["2.7.0", "2.8.2", "2.9.1", "3.0.0"]
+
+assert satisfies("2.8.2", ">=2.7") is True
+assert satisfies("2.6.0", ">=2.7") is False
+assert satisfies("3.0.0", "<3") is False
+assert satisfies("2.9.1", ">=2.7,<3") is True
+assert satisfies("3.0.0", ">=2.7,<3") is False, "The upper bound must exclude 3.0.0."
+assert satisfies("2.7.0", "==2.7.0") is True
+assert satisfies("2.7.1", "==2.7.0") is False
+
+# ">=2.7" must accept 2.7.0 — (2, 7) <= (2, 7, 0).
+assert satisfies("2.7.0", ">=2.7") is True, "A two-part bound must not exclude its own .0 release."
+
+# The two-character operators must be checked before the one-character ones.
+assert satisfies("2.7.0", "<=2.7.0") is True, (
+    "'<=2.7.0' must not be read as '<' followed by '=2.7.0'."
+)
+assert satisfies("2.8.0", "<=2.7.0") is False
+
+assert resolve(VERSIONS, ">=2.7,<3") == "2.9.1", (
+    f"The newest inside the range, got {resolve(VERSIONS, '>=2.7,<3')!r}."
+)
+assert resolve(VERSIONS, ">=3") == "3.0.0"
+assert resolve(VERSIONS, ">=4") is None, "Nothing satisfies it, so return None."
+assert resolve([], ">=1") is None, "No candidates means None."
+
+# Newest by version, not by list order.
+assert resolve(["1.0.0", "10.0.0", "2.0.0"], ">=1") == "10.0.0", (
+    "Compare as tuples: 10 is newer than 2, even though '10' sorts before '2' as text."
+)`}
+/>
+
+<Exercise
+  id="prod-pkg-ex2"
+  title="Exercise 2"
+  brief="Write <code>manifest(result, **parts)</code>: build the record for a result, hashing the eval set from disk, and raise <code>ValueError</code> when any required part is missing."
+  code={`import hashlib, json
+from pathlib import Path
+
+REQUIRED = ["git_sha", "model", "prompt_version", "eval_set", "seed"]
+
+def manifest(result, **parts):
+    # Raise ValueError naming every missing key from REQUIRED.
+    # Otherwise return a dict with "result", every part, and an
+    # "eval_set_hash": the first 16 hex characters of the sha256 of
+    # the file named by parts["eval_set"].
+    ...
+
+
+Path("eval.jsonl").write_text('{"id": "e1"}\\n')
+print(manifest({"pass_rate": 0.93}, git_sha="a1b2c3d", model="claude-opus-5",
+               prompt_version="answer@3", eval_set="eval.jsonl", seed=42))`}
+  hint="Check the missing keys first and raise with all of them named. Then build the dict and add the hash."
+  solution={`import hashlib, json
+from pathlib import Path
+
+REQUIRED = ["git_sha", "model", "prompt_version", "eval_set", "seed"]
+
+def manifest(result, **parts):
+    missing = [key for key in REQUIRED if key not in parts]
+    if missing:
+        raise ValueError(f"manifest is missing: {', '.join(missing)}")
+
+    digest = hashlib.sha256(Path(parts["eval_set"]).read_bytes()).hexdigest()[:16]
+    return {"result": result, **parts, "eval_set_hash": digest}
+
+
+Path("eval.jsonl").write_text('{"id": "e1"}\\n')
+print(manifest({"pass_rate": 0.93}, git_sha="a1b2c3d", model="claude-opus-5",
+               prompt_version="answer@3", eval_set="eval.jsonl", seed=42))`}
+  tests={`import hashlib
+from pathlib import Path
+
+Path("eval.jsonl").write_text('{"id": "e1"}\\n')
+
+record = manifest({"pass_rate": 0.93}, git_sha="a1b2c3d", model="claude-opus-5",
+                  prompt_version="answer@3", eval_set="eval.jsonl", seed=42)
+
+assert record["result"] == {"pass_rate": 0.93}, "The result goes under 'result'."
+assert record["model"] == "claude-opus-5" and record["seed"] == 42, "Every part is recorded."
+
+expected = hashlib.sha256(Path("eval.jsonl").read_bytes()).hexdigest()[:16]
+assert record["eval_set_hash"] == expected, (
+    f"The hash should be the first 16 hex characters of the file's sha256. Got "
+    f"{record['eval_set_hash']!r}."
+)
+
+# The hash must follow the file's contents.
+Path("eval.jsonl").write_text('{"id": "e1"}\\n{"id": "e2"}\\n')
+changed = manifest({"pass_rate": 0.93}, git_sha="a1b2c3d", model="claude-opus-5",
+                   prompt_version="answer@3", eval_set="eval.jsonl", seed=42)
+assert changed["eval_set_hash"] != record["eval_set_hash"], (
+    "Adding an example must change the hash — that is the whole point of recording it."
+)
+
+# Missing parts must be refused, and named.
+try:
+    manifest({"pass_rate": 1.0}, git_sha="a1b2c3d", model="claude-opus-5")
+except ValueError as error:
+    message = str(error)
+    for key in ["prompt_version", "eval_set", "seed"]:
+        assert key in message, f"The error should name {key}. Got: {message}"
+else:
+    raise AssertionError("A manifest missing required parts must raise ValueError.")`}
+/>
+
+<Quiz
+  question="Your pyproject.toml pins nothing exactly, and an evaluation that scored 0.93 in January scores 0.88 in June with no code change. What is the likely cause?"
+  choices={[
+    { text: "A dependency resolved to a newer version, because constraints are not a lock", correct: true, why: "The same constraints admit whatever is newest at install time, so a tokeniser, a solver default or an SDK default can shift underneath you." },
+    { text: "The model has degraded", why: "Possible, but a version change in your own environment is both more common and far easier to rule out — with a lock file." },
+    { text: "Evaluation is inherently noisy at that scale", why: "Noise is real, but a five-point move deserves a cause, and an unlocked environment is the first place to look." },
+    { text: "The eval set changed", why: "Worth checking via its hash, but the question says nothing in the repository changed." },
+  ]}
+/>
+
+<Quiz
+  question="Why does the src/ layout catch packaging mistakes that a flat layout hides?"
+  choices={[
+    { text: "Tests import the installed package, so a file missing from the wheel fails in CI rather than in production", correct: true, why: "In a flat layout the package directory is importable from the working directory, so tests pass against source that was never packaged." },
+    { text: "It makes imports faster", why: "Import speed is unaffected." },
+    { text: "It is required by pyproject.toml", why: "Both layouts are supported; src/ is a convention that buys this specific safety." },
+    { text: "It prevents circular imports", why: "Circular imports depend on your module structure, not the directory layout." },
+  ]}
+/>
+
+## Recap
+
+- `src/` layout so tests import the installed package; commit the lock file, never the virtual
+  environment.
+- `pyproject.toml` declares constraints — what you are compatible with. A **lock file** records a
+  resolution, with exact versions and hashes.
+- `uv lock` / `uv sync --frozen` (or pip-tools) make a build reproduce; `pip install -r` with loose
+  constraints does not.
+- Build images from the lock with `--frozen`, run as a non-root user, and pass secrets in at run
+  time.
+- A prompt change is a behaviour change and belongs in the version and the changelog.
+- Record git sha, package version, model, prompt hash, eval-set hash, seeds and the lock hash
+  beside every result you would quote.

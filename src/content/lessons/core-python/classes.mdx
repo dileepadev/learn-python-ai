@@ -1,0 +1,428 @@
+---
+title: Classes, dunder methods and dataclasses
+description: Bundle state with behaviour, make your objects work with len, in and == by implementing the protocols, and let dataclasses write the boilerplate for you.
+module: core-python
+order: 7
+level: intermediate
+minutes: 20
+objectives:
+  - Define classes with __init__, attributes and methods
+  - Give an object a useful __repr__, and know how it differs from __str__
+  - Implement the protocols behind len(), in, == and iteration
+  - Expose computed values with @property
+  - Model records with @dataclass instead of writing boilerplate
+  - Use inheritance and super() without overusing them
+---
+
+A class bundles data with the operations that belong to it. In an AI codebase that mostly means
+**records** — a chunk, a message, a retrieval result — and occasionally a component that holds
+configuration and does work, like a retriever or a client.
+
+## A first class
+
+<Run id="cp-cls-1" code={`class Chunk:
+    def __init__(self, text, doc_id):
+        self.text = text          # instance attributes
+        self.doc_id = doc_id
+
+    def tokens(self):             # a method
+        return len(self.text.split())
+
+first = Chunk("retrieval augmented generation works well", "guide.md")
+second = Chunk("shorter chunk", "intro.md")
+
+print(first.text)
+print(first.tokens(), second.tokens())
+print(type(first), isinstance(first, Chunk))`} />
+
+`__init__` runs when you call the class. `self` is the instance being built, and it is the first
+parameter of every method — Python passes it for you at the call site.
+
+## Instance and class attributes
+
+An attribute on the class is shared by every instance; an attribute on `self` belongs to one:
+
+<Run id="cp-cls-2" code={`class Retriever:
+    DEFAULT_TOP_K = 5              # class attribute: one, shared
+    created = 0
+
+    def __init__(self, index, top_k=None):
+        self.index = index                          # instance attribute
+        self.top_k = top_k or Retriever.DEFAULT_TOP_K
+        Retriever.created += 1
+
+a = Retriever({"a": 1})
+b = Retriever({"b": 2}, top_k=10)
+
+print(a.top_k, b.top_k)
+print("shared default:", a.DEFAULT_TOP_K, b.DEFAULT_TOP_K)
+print("instances made:", Retriever.created)`} />
+
+<Callout type="warning">
+Never use a mutable class attribute as if it were per-instance state. `results = []` at class
+level is one list shared by every instance — the same trap as a mutable default argument, and it
+surfaces the same way: two objects mysteriously sharing data.
+</Callout>
+
+## `__repr__`
+
+The default representation tells you nothing. `__repr__` should show what the object *is*,
+ideally in a form you could paste back into Python:
+
+<Run id="cp-cls-3" code={`class Plain:
+    def __init__(self, text):
+        self.text = text
+
+class Useful:
+    def __init__(self, text):
+        self.text = text
+
+    def __repr__(self):
+        return f"Useful(text={self.text!r})"
+
+    def __str__(self):
+        return f"<{self.text}>"
+
+print(Plain("hello"))
+print(Useful("hello"))          # print uses __str__...
+print([Useful("hello")])        # ...but a container always uses __repr__
+print(str(Useful("hi")), repr(Useful("hi")))`} />
+
+Write `__repr__` for every class you expect to debug. `__str__` is optional — without it, `str()`
+falls back to `__repr__`.
+
+## The protocols
+
+`len(x)`, `x in y`, `x == y` and `for i in x` are not built-in magic: each calls a method your
+class can implement.
+
+<Run id="cp-cls-4" code={`class Conversation:
+    def __init__(self, turns=None):
+        self.turns = list(turns or [])
+
+    def __repr__(self):
+        return f"Conversation({self.turns!r})"
+
+    def __len__(self):                       # len(conversation)
+        return len(self.turns)
+
+    def __iter__(self):                      # for turn in conversation
+        return iter(self.turns)
+
+    def __getitem__(self, index):            # conversation[0], and slicing
+        return self.turns[index]
+
+    def __contains__(self, text):            # "hello" in conversation
+        return any(text in turn for turn in self.turns)
+
+    def __eq__(self, other):                 # ==
+        return isinstance(other, Conversation) and self.turns == other.turns
+
+chat = Conversation(["hello", "how can I help?", "explain embeddings"])
+
+print(len(chat))
+print(chat[0], "|", chat[-1])
+print(chat[:2])
+print("embeddings" in chat, "weather" in chat)
+for turn in chat:
+    print(" -", turn)
+print(chat == Conversation(["hello", "how can I help?", "explain embeddings"]))`} />
+
+Implementing `__iter__` alone is enough to make an object work with `for`, `list()`, `sum()`,
+unpacking and every comprehension — the whole iteration ecosystem, from one method.
+
+## `@property`
+
+A property is a method that reads like an attribute. Use it for a value derived from the state
+you already hold:
+
+<Run id="cp-cls-5" code={`class Usage:
+    def __init__(self, input_tokens, output_tokens):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+    @property
+    def total(self):
+        return self.input_tokens + self.output_tokens
+
+    @property
+    def cost_usd(self):
+        return self.input_tokens / 1_000_000 * 3 + self.output_tokens / 1_000_000 * 15
+
+usage = Usage(412_000, 37_000)
+print(usage.total)                 # no parentheses — it looks like data
+print(f"{usage.cost_usd:.4f}")
+
+usage.output_tokens = 100_000      # the derived values follow automatically
+print(usage.total, f"{usage.cost_usd:.4f}")`} />
+
+A property can also validate on the way in:
+
+<Run id="cp-cls-6" code={`class Settings:
+    def __init__(self, temperature=1.0):
+        self.temperature = temperature        # goes through the setter below
+
+    @property
+    def temperature(self):
+        return self._temperature
+
+    @temperature.setter
+    def temperature(self, value):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"temperature must be between 0 and 1, got {value}")
+        self._temperature = value
+
+settings = Settings(0.7)
+print(settings.temperature)
+
+try:
+    settings.temperature = 4.2
+except ValueError as error:
+    print("refused:", error)`} />
+
+## Dataclasses
+
+Most classes in a data pipeline are records: some fields, a sensible `__repr__`, and equality by
+value. `@dataclass` writes all of that:
+
+<Run id="cp-cls-7" code={`from dataclasses import dataclass, field
+
+@dataclass
+class Chunk:
+    text: str
+    doc_id: str
+    index: int = 0
+    tags: list[str] = field(default_factory=list)   # never tags: list = []
+
+    @property
+    def tokens(self):
+        return len(self.text.split())
+
+first = Chunk("retrieval augmented generation", "guide.md", index=3)
+print(first)                                  # __repr__ for free
+print(first.tokens)
+print(first == Chunk("retrieval augmented generation", "guide.md", index=3))
+
+first.tags.append("intro")
+second = Chunk("another", "guide.md")
+print(first.tags, second.tags)                # separate lists, thanks to default_factory`} />
+
+`field(default_factory=list)` is the dataclass answer to the mutable-default trap: the factory
+runs once per instance. A plain `[]` is rejected outright.
+
+Two options worth knowing:
+
+<Run id="cp-cls-8" code={`from dataclasses import dataclass, asdict, astuple
+
+@dataclass(frozen=True, order=True)
+class Score:
+    value: float
+    name: str
+
+a = Score(0.71, "baseline")
+b = Score(0.93, "ensemble")
+
+print(sorted([b, a]))            # order=True gives <, >, sorting
+print(a < b)
+print(asdict(a), astuple(a))
+print({a, b})                    # frozen=True makes it hashable, so usable in a set
+
+try:
+    a.value = 0.99               # frozen: immutable after construction
+except Exception as error:
+    print(f"{type(error).__name__}: {error}")`} />
+
+<Callout type="ai" title="Why this matters for AI">
+A retrieval pipeline passes the same record through six stages: loaded, chunked, embedded,
+scored, re-ranked, assembled. Dictionaries make every stage guess the shape — is it `doc_id` or
+`document_id`? A frozen dataclass gives the record one definition, a readable `repr` in every log
+line, value equality for tests, and hashability so it can go in a set for de-duplication. This is
+the single highest-return refactor in most RAG code.
+</Callout>
+
+## Inheritance
+
+A subclass takes everything from its parent and changes what it needs. `super()` calls the
+parent's version:
+
+<Run id="cp-cls-9" code={`class Retriever:
+    def __init__(self, documents):
+        self.documents = documents
+
+    def search(self, query):
+        return [d for d in self.documents if query in d]
+
+    def describe(self):
+        return f"{type(self).__name__} over {len(self.documents)} documents"
+
+class TopKRetriever(Retriever):
+    def __init__(self, documents, top_k=2):
+        super().__init__(documents)          # let the parent set up its state
+        self.top_k = top_k
+
+    def search(self, query):
+        results = super().search(query)      # extend, do not copy
+        return results[:self.top_k]
+
+docs = ["rag needs chunks", "chunks need overlap", "rag is retrieval", "unrelated"]
+
+print(Retriever(docs).search("rag"))
+print(TopKRetriever(docs, top_k=2).search("rag"))
+print(TopKRetriever(docs).describe())
+print(isinstance(TopKRetriever(docs), Retriever))`} />
+
+<Callout type="tip">
+Reach for inheritance only when the subclass genuinely *is* the parent and can be used anywhere
+the parent can. If you just want to reuse a function, call the function. Deep hierarchies age
+badly; composition — holding an object rather than inheriting from it — usually ages better.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="cp-cls-ex1"
+  title="Exercise 1"
+  brief="Make <code>Chunk</code> a frozen dataclass with <code>text</code>, <code>doc_id</code> and <code>index</code> (defaulting to 0), plus a <code>tokens</code> property returning the word count."
+  code={`from dataclasses import dataclass
+
+# Turn this into a frozen dataclass with a tokens property.
+class Chunk:
+    pass
+
+
+chunk = Chunk("retrieval augmented generation works", "guide.md", 2)
+print(chunk)
+print(chunk.tokens)`}
+  hint="@dataclass(frozen=True) above the class, annotate the three fields, and decorate tokens with @property."
+  solution={`from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Chunk:
+    text: str
+    doc_id: str
+    index: int = 0
+
+    @property
+    def tokens(self):
+        return len(self.text.split())
+
+
+chunk = Chunk("retrieval augmented generation works", "guide.md", 2)
+print(chunk)
+print(chunk.tokens)`}
+  tests={`import dataclasses
+
+assert dataclasses.is_dataclass(Chunk), "Chunk should be decorated with @dataclass."
+
+names = [f.name for f in dataclasses.fields(Chunk)]
+assert names == ["text", "doc_id", "index"], (
+    f"Expected fields text, doc_id, index in that order — got {names}."
+)
+
+one = Chunk("a b c", "doc.md")
+assert one.index == 0, "index should default to 0."
+assert one.tokens == 3, f"tokens should count words, got {one.tokens!r}."
+assert not callable(one.tokens), "tokens should be a @property, read without parentheses."
+
+assert one == Chunk("a b c", "doc.md"), "A dataclass compares by value; two equal chunks should match."
+
+try:
+    one.text = "changed"
+except dataclasses.FrozenInstanceError:
+    pass
+else:
+    raise AssertionError("The dataclass should be frozen=True, so assignment is refused.")
+
+assert len({one, Chunk("a b c", "doc.md")}) == 1, (
+    "A frozen dataclass is hashable, so two equal chunks collapse into one set entry."
+)`}
+/>
+
+<Exercise
+  id="cp-cls-ex2"
+  title="Exercise 2"
+  brief="Give <code>Transcript</code> the four protocol methods so <code>len()</code>, iteration, indexing and <code>in</code> all work on it."
+  code={`class Transcript:
+    def __init__(self, lines):
+        self.lines = list(lines)
+
+    # Add __len__, __iter__, __getitem__ and __contains__.
+    # __contains__ should test whether the text appears anywhere
+    # in any line, not whether a whole line matches exactly.
+
+
+t = Transcript(["hello there", "explain embeddings", "thanks"])
+print(len(t))
+print(t[1])
+print("embed" in t)
+print([line.upper() for line in t])`}
+  hint="__len__ returns len(self.lines); __iter__ returns iter(self.lines); __getitem__ indexes self.lines; __contains__ uses any(text in line for line in self.lines)."
+  solution={`class Transcript:
+    def __init__(self, lines):
+        self.lines = list(lines)
+
+    def __len__(self):
+        return len(self.lines)
+
+    def __iter__(self):
+        return iter(self.lines)
+
+    def __getitem__(self, index):
+        return self.lines[index]
+
+    def __contains__(self, text):
+        return any(text in line for line in self.lines)
+
+
+t = Transcript(["hello there", "explain embeddings", "thanks"])
+print(len(t))
+print(t[1])
+print("embed" in t)
+print([line.upper() for line in t])`}
+  tests={`t = Transcript(["hello there", "explain embeddings", "thanks"])
+
+assert len(t) == 3, f"len() should give 3, got {len(t)}."
+assert t[1] == "explain embeddings", f"t[1] should index the lines, got {t[1]!r}."
+assert t[-1] == "thanks", "Negative indexing should work too."
+assert list(t) == ["hello there", "explain embeddings", "thanks"], (
+    f"Iterating should yield each line, got {list(t)!r}."
+)
+assert "embed" in t, "__contains__ should match text inside a line, not only a whole line."
+assert "thanks" in t, "An exact line should also be found."
+assert "weather" not in t, "Text that appears nowhere should not be found."
+assert [line.upper() for line in t][0] == "HELLO THERE", "A comprehension should iterate it."
+assert len(Transcript([])) == 0, "An empty transcript has length 0."`}
+/>
+
+<Quiz
+  question="Why does @dataclass reject `tags: list = []` but accept `tags: list = field(default_factory=list)`?"
+  choices={[
+    { text: "A plain [] would be shared by every instance, so dataclasses refuse it outright", correct: true, why: "It is the mutable-default trap; default_factory runs once per instance instead, giving each its own list." },
+    { text: "Lists cannot be dataclass fields at all", why: "They can — you just have to say how to build the default." },
+    { text: "field() is required for every field with a default", why: "Immutable defaults like 0, '' or None are written directly; only mutable ones need a factory." },
+    { text: "It is purely a style rule the linter enforces", why: "Python raises a ValueError when the class is defined; it is enforced by the language." },
+  ]}
+/>
+
+<Quiz
+  question="Your class defines __iter__ but not __len__. What works and what does not?"
+  choices={[
+    { text: "for loops, list() and comprehensions work; len() raises TypeError", correct: true, why: "Iteration comes from __iter__, but len() looks for __len__ specifically and will not count items for you." },
+    { text: "Neither works — you need both", why: "__iter__ alone is enough for the entire iteration ecosystem." },
+    { text: "Both work; len() counts by iterating", why: "Python will not silently drain your iterator to answer len() — that could be infinite or destructive." },
+    { text: "len() works but for loops do not", why: "It is precisely the other way round." },
+  ]}
+/>
+
+## Recap
+
+- `__init__` builds an instance; `self` is that instance, passed automatically.
+- Class attributes are shared; never make a mutable one stand in for instance state.
+- Give every debuggable class a `__repr__`. `__str__` is optional and falls back to it.
+- `len()`, `in`, `==`, indexing and `for` are protocols: `__len__`, `__contains__`, `__eq__`,
+  `__getitem__` and `__iter__`.
+- `@property` turns a computed value into something that reads like an attribute, and its setter
+  is where validation belongs.
+- `@dataclass` writes `__init__`, `__repr__` and `__eq__`; `frozen=True` adds immutability and
+  hashability, and `field(default_factory=...)` is how mutable defaults are done.
+- Inherit only for a genuine "is a" relationship, and call `super()` rather than copying.

@@ -13,6 +13,50 @@ Changes are organized into the following categories:
 
 - Changes for the next release are available in development branches.
 
+## [v0.2.0] - 2026-09-12
+
+All eight curriculum modules are now complete: **67 lessons and 718 runnable code blocks**, every
+block and every exercise solution executed against its own assertions in CI. This is still a
+`0.x` release — `v1.0.0` follows once the remaining pre-1.0 work is done.
+
+### Added
+
+- Module 02 — Core Python: ten lessons on functions, comprehensions, generators, modules and
+  virtual environments, files and JSON, exceptions, classes and dataclasses, type hints,
+  decorators and context managers, and a standard-library tour.
+- Module 03 — Numerical Python: seven lessons on arrays, indexing, broadcasting, vectorisation,
+  linear algebra, random numbers and seeding, and gradients.
+- Module 04 — Data Wrangling: eight lessons on Series and DataFrames, selecting and filtering,
+  missing data, group-by, joins and reshaping, time series, plotting, and exploratory analysis.
+- Module 05 — Machine Learning Foundations: nine lessons on the estimator API, train/test splits,
+  metrics, cross-validation, overfitting, pipelines, gradient descent, a neural network written
+  from scratch, and PyTorch.
+- Module 06 — LLM Engineering: eight lessons on how an API call works, tokens and cost,
+  prompting, structured output, tool use, the agent loop, the Anthropic SDK, and MCP.
+- Module 07 — Retrieval and RAG: seven lessons on chunking, embeddings, vector indexes, hybrid
+  search, re-ranking, the RAG pipeline, and evaluating retrieval.
+- Module 08 — Production AI Systems: nine lessons on asyncio, retries and rate limits, testing
+  non-deterministic systems, evaluation harnesses, LLM-as-judge, observability, capacity
+  planning, FastAPI, and packaging.
+- Full-text search across every lesson, powered by Pagefind, behind a keyboard-driven command
+  palette (`Ctrl`/`Cmd` + `K`, or `/`).
+- Inline rendering of matplotlib figures in lesson output, drawn transparent so they sit on the
+  page's own background in both themes.
+- A lesson-navigation drawer for narrow screens, where the sidebar is hidden.
+- A service worker that permanently caches the Pyodide runtime and its wheels, so a return visit
+  boots Python without re-downloading it. Pages stay network-first, so a deploy still lands at
+  once.
+- Generated Open Graph cards, one per lesson plus a site-wide default, so a shared link previews
+  with its title, module, level and length.
+- `npm run lint:lessons`, which checks every lesson against the content rules in `AGENT.md`, and
+  `npm run verify`, which executes every Run block and Exercise solution in Pyodide. Both run in
+  CI on every pull request.
+
+### Changed
+
+- The curriculum page no longer advertises a roadmap once every module is published; its
+  progress line reports lessons and total reading time instead.
+
 ## [v0.1.0] - 2026-09-09
 
 ### Added
@@ -49,9 +93,10 @@ Changes are organized into the following categories:
 <!-- v0.2.0 -->
 <!-- v0.1.0 -->
 
-This project reaches **v1.0.0** only once all eight curriculum modules are complete. Progress
-towards that is tracked in
+All eight curriculum modules are complete as of `v0.2.0`. This project reaches **v1.0.0** once
+the remaining pre-1.0 work is done; progress is tracked in
 [issue #2](https://github.com/dileepadev/learn-python-ai/issues/2).
 
-[Unreleased]: https://github.com/dileepadev/learn-python-ai/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/dileepadev/learn-python-ai/compare/v0.2.0...HEAD
+[v0.2.0]: https://github.com/dileepadev/learn-python-ai/compare/v0.1.0...v0.2.0
 [v0.1.0]: https://github.com/dileepadev/learn-python-ai/releases/tag/v0.1.0

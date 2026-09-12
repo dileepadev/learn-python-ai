@@ -1,0 +1,392 @@
+---
+title: Type hints and static checking with mypy
+description: Annotate what your functions accept and return, model JSON payloads with TypedDict, describe duck typing with Protocol — and let mypy find the bug before you run anything.
+module: core-python
+order: 8
+level: intermediate
+minutes: 18
+objectives:
+  - Annotate parameters, returns, variables and collections
+  - Express optional and alternative types with the | operator
+  - Model a JSON payload with TypedDict and an interface with Protocol
+  - Explain why hints are not enforced at runtime
+  - Run mypy and read what it tells you
+---
+
+Type hints are notes to your reader and your tools about what a function accepts and returns.
+Python does not enforce them; a checker does, before the code ever runs.
+
+## Annotating
+
+<Run id="cp-type-1" code={`def chunk_count(text: str, size: int = 20) -> int:
+    return len(text.split()) // size + 1
+
+print(chunk_count("one two three four five", size=2))
+print(chunk_count.__annotations__)`} />
+
+Collections say what they hold. Built-in generics have worked since Python 3.9, so you need no
+imports for the common cases:
+
+<Run id="cp-type-2" code={`def top_scores(scores: dict[str, float], limit: int = 2) -> list[tuple[str, float]]:
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    return ranked[:limit]
+
+print(top_scores({"baseline": 0.71, "tuned": 0.88, "ensemble": 0.93}))
+
+# Variables can be annotated too, which helps when the value comes later.
+cache: dict[str, list[float]] = {}
+cache["guide.md"] = [0.1, 0.2, 0.3]
+print(cache)`} />
+
+A tuple of fixed length spells out each position; `tuple[str, ...]` means "any number, all
+strings":
+
+<Run id="cp-type-3" code={`def split_id(full: str) -> tuple[str, int]:
+    name, _, index = full.partition(":")
+    return name, int(index)
+
+def join_all(parts: tuple[str, ...]) -> str:
+    return " / ".join(parts)
+
+print(split_id("guide.md:3"))
+print(join_all(("a", "b", "c")))`} />
+
+## Optional and alternatives
+
+`X | None` is the type of "an X, or nothing". Writing it is what forces you to handle the
+`None` case:
+
+<Run id="cp-type-4" code={`def find_chunk(chunks: list[str], query: str) -> str | None:
+    for chunk in chunks:
+        if query in chunk:
+            return chunk
+    return None
+
+chunks = ["rag needs chunks", "chunks need overlap"]
+
+found = find_chunk(chunks, "overlap")
+if found is not None:
+    print(found.upper())          # safe: we checked
+
+missing = find_chunk(chunks, "weather")
+print(missing)`} />
+
+The same `|` expresses any alternative:
+
+<Run id="cp-type-5" code={`def as_text(value: str | bytes | int) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+print(as_text("already text"), as_text(b"bytes here"), as_text(412))`} />
+
+<Callout type="warning">
+A default of `None` does not make a parameter optional to a type checker. Write
+`history: list[str] | None = None` — not `history: list[str] = None`, which mypy rejects and
+which lies to the reader.
+</Callout>
+
+## Functions as parameters
+
+`Callable` describes a function's shape — its arguments and its return type:
+
+<Run id="cp-type-6" code={`from collections.abc import Callable, Iterable, Iterator
+
+def apply_all(text: str, steps: list[Callable[[str], str]]) -> str:
+    for step in steps:
+        text = step(text)
+    return text
+
+def collapse(text: str) -> str:
+    return " ".join(text.split())
+
+print(apply_all("  ragged   TEXT ", [collapse, str.lower]))
+
+def stream(items: Iterable[str]) -> Iterator[str]:
+    for item in items:
+        yield item.upper()
+
+print(list(stream(["a", "b"])))`} />
+
+Take `Iterable` when you only intend to loop once, and return `Iterator` from a generator.
+Accepting `Iterable` rather than `list` means a caller can hand you a generator.
+
+## TypedDict
+
+JSON arrives as a dictionary, and `dict[str, Any]` tells a reader nothing. `TypedDict` gives
+that dictionary a shape without changing it into a class:
+
+<Run id="cp-type-7" code={`from typing import TypedDict, NotRequired
+
+class Usage(TypedDict):
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: NotRequired[int]
+
+class Reply(TypedDict):
+    id: str
+    model: str
+    text: str
+    usage: Usage
+
+def total_tokens(reply: Reply) -> int:
+    usage = reply["usage"]
+    return usage["input_tokens"] + usage["output_tokens"]
+
+reply: Reply = {
+    "id": "msg_017",
+    "model": "claude-opus-5",
+    "text": "Hello!",
+    "usage": {"input_tokens": 412, "output_tokens": 37},
+}
+
+print(total_tokens(reply))
+print(type(reply))            # still an ordinary dict at runtime`} />
+
+## Protocol
+
+`Protocol` describes what an object must *do*, not what it inherits from. It is duck typing that
+a checker can verify:
+
+<Run id="cp-type-8" code={`from typing import Protocol
+
+class Retriever(Protocol):
+    def search(self, query: str, top_k: int) -> list[str]:
+        ...
+
+class KeywordRetriever:
+    def __init__(self, documents: list[str]) -> None:
+        self.documents = documents
+
+    def search(self, query: str, top_k: int) -> list[str]:
+        return [d for d in self.documents if query in d][:top_k]
+
+class EchoRetriever:
+    def search(self, query: str, top_k: int) -> list[str]:
+        return [query] * top_k
+
+def answer(retriever: Retriever, query: str) -> str:
+    hits = retriever.search(query, top_k=2)
+    return f"{len(hits)} hits: {hits}"
+
+docs = ["rag needs chunks", "chunks need overlap", "unrelated"]
+
+print(answer(KeywordRetriever(docs), "chunks"))
+print(answer(EchoRetriever(), "chunks"))`} />
+
+Neither class inherits from `Retriever`. They satisfy it by having the right method — which is
+exactly how you want to describe "anything that can retrieve".
+
+## Literal and type aliases
+
+<Run id="cp-type-9" code={`from typing import Literal
+
+type ModelName = Literal["claude-opus-5", "claude-haiku-4-5"]
+type Scores = dict[str, float]
+
+def call(prompt: str, model: ModelName = "claude-opus-5") -> str:
+    return f"{model}: {prompt}"
+
+def best(scores: Scores) -> str:
+    return max(scores, key=scores.get)
+
+print(call("Hello"))
+print(call("Hello", "claude-haiku-4-5"))
+print(best({"a": 0.1, "b": 0.9}))`} />
+
+`Literal` restricts a value to a fixed set, so a typo in a model name is caught by the checker
+rather than by a 400 from the API. A `type` alias names a shape you use repeatedly.
+
+## Hints are not enforced
+
+This runs perfectly happily, which is the whole point of needing a checker:
+
+<Run id="cp-type-10" code={`def add_tokens(a: int, b: int) -> int:
+    return a + b
+
+print(add_tokens(2, 3))
+print(add_tokens("two", "three"))     # nonsense, and Python does not care
+print(add_tokens.__annotations__)`} />
+
+<Callout type="tip">
+If you want types enforced at runtime — validating a model's JSON output, say, or an API request
+body — that is Pydantic's job, not the type system's. Module 6 covers it. Hints describe intent;
+Pydantic checks reality.
+</Callout>
+
+## Running mypy
+
+Install it into your project's environment and point it at your code:
+
+```bash
+pip install mypy
+mypy src/
+```
+
+For the function above, it reports the bug without running anything:
+
+```text
+src/tokens.py:5: error: Argument 1 to "add_tokens" has incompatible type "str";
+    expected "int"  [arg-type]
+Found 1 error in 1 file (checked 1 source file)
+```
+
+Turn the strictness up as the codebase allows, in `pyproject.toml`:
+
+```toml
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["some_untyped_library.*"]
+ignore_missing_imports = true
+```
+
+<Callout type="ai" title="Why this matters for AI">
+AI pipelines are long chains of transformations where a wrong shape surfaces far from its cause:
+a `None` embedding reaches the index and fails at query time; a chunk that is a `dict` in one
+stage and a `Chunk` in the next; a `float` where the API wanted an `int`. Hints let the checker
+catch that at the boundary. They also pay off directly in LLM work — tool definitions and
+structured-output schemas are usually generated from annotated function signatures, so the hints
+you write become the schema the model sees.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="cp-type-ex1"
+  title="Exercise 1"
+  brief="Annotate <code>summarise</code> fully: it takes a list of strings and an optional integer limit, and returns a string or <code>None</code> when there is nothing to summarise."
+  code={`def summarise(chunks, limit=None):
+    if not chunks:
+        return None
+    text = " ".join(chunks)
+    words = text.split()
+    if limit is not None:
+        words = words[:limit]
+    return " ".join(words)
+
+
+print(summarise(["retrieval augmented", "generation works"], 3))
+print(summarise([]))`}
+  hint="chunks: list[str], limit: int | None = None, and -> str | None after the parameters."
+  solution={`def summarise(chunks: list[str], limit: int | None = None) -> str | None:
+    if not chunks:
+        return None
+    text = " ".join(chunks)
+    words = text.split()
+    if limit is not None:
+        words = words[:limit]
+    return " ".join(words)
+
+
+print(summarise(["retrieval augmented", "generation works"], 3))
+print(summarise([]))`}
+  tests={`from typing import get_type_hints
+
+hints = get_type_hints(summarise)
+
+assert "chunks" in hints, "Annotate the chunks parameter."
+assert hints["chunks"] == list[str], f"chunks should be list[str], got {hints['chunks']!r}."
+
+assert "limit" in hints, "Annotate the limit parameter."
+assert hints["limit"] == (int | None), (
+    f"limit should be int | None — it has a None default. Got {hints['limit']!r}."
+)
+
+assert "return" in hints, "Annotate the return type."
+assert hints["return"] == (str | None), (
+    f"The return type should be str | None, got {hints['return']!r}."
+)
+
+assert summarise(["a b", "c d"], 3) == "a b c", "Behaviour should be unchanged."
+assert summarise([]) is None, "An empty list should still return None."`}
+/>
+
+<Exercise
+  id="cp-type-ex2"
+  title="Exercise 2"
+  brief="Define a <code>Document</code> TypedDict with <code>id: str</code>, <code>text: str</code> and an optional <code>tokens: int</code>, then annotate <code>load</code> to return a list of them."
+  code={`from typing import TypedDict, NotRequired
+
+# Define the Document TypedDict here.
+
+
+def load(rows):
+    return [{"id": row[0], "text": row[1]} for row in rows]
+
+
+print(load([("a", "first"), ("b", "second")]))`}
+  hint="class Document(TypedDict): with three fields, where tokens is NotRequired[int]. Then annotate load as (rows: list[tuple[str, str]]) -> list[Document]."
+  solution={`from typing import TypedDict, NotRequired
+
+class Document(TypedDict):
+    id: str
+    text: str
+    tokens: NotRequired[int]
+
+
+def load(rows: list[tuple[str, str]]) -> list[Document]:
+    return [{"id": row[0], "text": row[1]} for row in rows]
+
+
+print(load([("a", "first"), ("b", "second")]))`}
+  tests={`from typing import get_type_hints, NotRequired
+
+assert "Document" in dir() or "Document" in globals(), "Define a TypedDict called Document."
+
+annotations = Document.__annotations__
+assert set(annotations) == {"id", "text", "tokens"}, (
+    f"Document should declare id, text and tokens — got {sorted(annotations)}."
+)
+assert Document.__required_keys__ == frozenset({"id", "text"}), (
+    f"id and text should be required, got {sorted(Document.__required_keys__)}."
+)
+assert Document.__optional_keys__ == frozenset({"tokens"}), (
+    "tokens should be optional — wrap it in NotRequired[...]."
+)
+
+hints = get_type_hints(load)
+assert hints.get("return") == list[Document], (
+    f"load should return list[Document], got {hints.get('return')!r}."
+)
+assert hints.get("rows") == list[tuple[str, str]], (
+    f"rows should be list[tuple[str, str]], got {hints.get('rows')!r}."
+)
+
+assert load([("a", "first")]) == [{"id": "a", "text": "first"}], "Behaviour should be unchanged."`}
+/>
+
+<Quiz
+  question="What happens at runtime when you call a function annotated -> int with a string argument?"
+  choices={[
+    { text: "It runs normally; annotations are not checked at runtime", correct: true, why: "Python stores annotations and ignores them. Only a checker like mypy, or a library like Pydantic, acts on them." },
+    { text: "A TypeError is raised immediately", why: "That would require runtime enforcement, which Python deliberately does not do." },
+    { text: "The argument is converted to an int", why: "Nothing coerces — the value arrives exactly as passed." },
+    { text: "A warning is printed", why: "Nothing is emitted at all; the annotation is simply metadata on the function object." },
+  ]}
+/>
+
+<Quiz
+  question="Why use Protocol rather than a base class for 'anything that can search'?"
+  choices={[
+    { text: "A class satisfies it by having the right methods, without inheriting anything", correct: true, why: "That is structural typing: third-party and test doubles conform without importing or subclassing your type." },
+    { text: "Protocols are faster at runtime", why: "Neither costs anything at runtime; the difference is entirely about how conformance is decided." },
+    { text: "Base classes cannot define methods", why: "They can — the issue is that they force every implementer to inherit from you." },
+    { text: "Protocol enforces the methods exist when the class is defined", why: "Conformance is checked statically by the type checker, not at class-definition time." },
+  ]}
+/>
+
+## Recap
+
+- Annotate parameters and returns: `def f(text: str, size: int = 20) -> int:`.
+- Built-in generics need no imports: `list[str]`, `dict[str, float]`, `tuple[str, int]`.
+- `X | None` is the optional type, and a `None` default must say so.
+- `Callable`, `Iterable` and `Iterator` describe functions and streams; accept `Iterable`, return
+  `Iterator`.
+- `TypedDict` gives a JSON payload a shape; `Protocol` describes behaviour without inheritance;
+  `Literal` pins a value to a fixed set.
+- Nothing is enforced at runtime — that is what `mypy` is for, and Pydantic when you need real
+  validation.

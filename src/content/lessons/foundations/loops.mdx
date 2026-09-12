@@ -90,7 +90,7 @@ for name, score, ms in zip(names, scores, latency):
 `zip` stops at the shortest sequence, which is usually what you want and occasionally a silent
 bug — pass `strict=True` to make a length mismatch raise instead.
 
-<Run id="f-loop-6" code={`a = [1, 2, 3]
+<Run id="f-loop-6" raises="ValueError" code={`a = [1, 2, 3]
 b = ["x", "y"]
 
 print(list(zip(a, b)))          # silently drops the 3
@@ -153,7 +153,7 @@ print("giving up")`} />
 
 The danger with `while` is forgetting to change the condition:
 
-<Run id="f-loop-11" code={`# This never ends. Press Run, then press Stop.
+<Run id="f-loop-11" endless code={`# This never ends. Press Run, then press Stop.
 n = 0
 while n < 5:
     print(n)

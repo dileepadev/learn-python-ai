@@ -11,6 +11,8 @@ export type RuntimePhase = "idle" | "downloading" | "starting" | "installing" | 
 
 export interface RunHandlers {
   onOutput: (stream: RunStream, text: string) => void;
+  /** A matplotlib figure the program left open, as a PNG data URL. */
+  onFigure?: (src: string) => void;
 }
 
 export interface RunResult {
@@ -62,6 +64,9 @@ function spawn(): Worker {
         break;
       case "out":
         pending.get(msg.id)?.handlers.onOutput(msg.stream, msg.text);
+        break;
+      case "figure":
+        pending.get(msg.id)?.handlers.onFigure?.(msg.src);
         break;
       case "done": {
         const entry = pending.get(msg.id);

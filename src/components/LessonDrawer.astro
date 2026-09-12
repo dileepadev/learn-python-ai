@@ -1,0 +1,131 @@
+---
+/**
+ * The course contents, as a slide-over panel for screens too narrow for the
+ * sidebar. The sidebar itself is unchanged — this wraps the same component,
+ * so there is only one navigation to keep correct.
+ */
+import Sidebar from "./Sidebar.astro";
+import { Menu, Cross } from "./icons";
+
+interface Props {
+  currentId?: string;
+}
+const { currentId } = Astro.props;
+---
+
+<div class="lg:hidden">
+  <button
+    type="button"
+    data-drawer-open
+    class="inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-[13px] font-medium"
+    style="border-color: var(--border-strong); color: var(--text-muted); background: var(--bg-elevated)"
+    aria-controls="lesson-drawer"
+    aria-expanded="false"
+  >
+    <Menu width={15} height={15} />
+    Course contents
+  </button>
+
+  <div id="lesson-drawer" hidden>
+    <div
+      data-drawer-backdrop
+      class="fixed inset-0 z-50"
+      style="background: color-mix(in oklab, #000 55%, transparent)"
+    >
+    </div>
+
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Course contents"
+      class="fixed inset-y-0 left-0 z-50 flex w-[19rem] max-w-[86vw] flex-col border-r shadow-2xl"
+      style="background: var(--bg); border-color: var(--border)"
+    >
+      <div
+        class="flex items-center justify-between border-b px-4 py-3"
+        style="border-color: var(--border)"
+      >
+        <span class="text-[11px] font-bold uppercase tracking-wider" style="color: var(--text-faint)">
+          Course contents
+        </span>
+        <button
+          type="button"
+          data-drawer-close
+          class="rounded-lg border p-1.5"
+          style="border-color: var(--border-strong); color: var(--text-muted)"
+          aria-label="Close the course contents"
+        >
+          <Cross width={14} height={14} />
+        </button>
+      </div>
+
+      <div class="flex-1 overflow-y-auto px-4 py-4">
+        <Sidebar currentId={currentId} />
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // Progressive enhancement: without JavaScript the drawer stays hidden and the
+  // lesson's prev/next links and the curriculum page still navigate the course.
+  const drawer = document.getElementById("lesson-drawer");
+  const trigger = document.querySelector<HTMLButtonElement>("[data-drawer-open]");
+
+  if (drawer && trigger) {
+    let lastFocused: HTMLElement | null = null;
+
+    const focusable = () =>
+      Array.from(
+        drawer.querySelectorAll<HTMLElement>('a[href], button:not([disabled])')
+      ).filter((element) => element.offsetParent !== null);
+
+    const open = () => {
+      lastFocused = document.activeElement as HTMLElement;
+      drawer.hidden = false;
+      trigger.setAttribute("aria-expanded", "true");
+      document.body.style.overflow = "hidden";
+      focusable()[0]?.focus();
+    };
+
+    const close = () => {
+      drawer.hidden = true;
+      trigger.setAttribute("aria-expanded", "false");
+      document.body.style.overflow = "";
+      lastFocused?.focus();
+    };
+
+    trigger.addEventListener("click", open);
+    drawer.querySelector("[data-drawer-close]")?.addEventListener("click", close);
+    drawer.querySelector("[data-drawer-backdrop]")?.addEventListener("click", close);
+
+    // Following a link should close the drawer on the way out, so returning
+    // with the back button does not land on an open panel.
+    drawer.addEventListener("click", (event) => {
+      if ((event.target as HTMLElement).closest("a")) close();
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (drawer.hidden) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        close();
+        return;
+      }
+      // Keep focus inside the panel while it is modal.
+      if (event.key === "Tab") {
+        const items = focusable();
+        if (items.length === 0) return;
+        const first = items[0];
+        const last = items[items.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    });
+  }
+</script>

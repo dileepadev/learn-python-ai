@@ -1,0 +1,497 @@
+---
+title: Re-ranking and context assembly
+description: Retrieve widely, then choose carefully — cross-encoders, maximal marginal relevance, de-duplication, and the context budget that decides what the model actually sees.
+module: rag-and-retrieval
+order: 5
+level: expert
+minutes: 20
+objectives:
+  - Explain why a second ranking stage beats a better first stage
+  - Contrast bi-encoders and cross-encoders
+  - De-duplicate near-identical chunks before they reach the prompt
+  - Select for diversity with maximal marginal relevance
+  - Assemble context within a budget, with citations and deliberate ordering
+---
+
+Retrieval and selection are different jobs. Retrieval should cast a wide net — get the answer
+*somewhere* in the top fifty. Selection then decides which five reach the model. Doing both with
+one ranking function does neither well.
+
+## Two stages
+
+<Run id="rag-rerank-1" code={`STAGES = [
+    ("Retrieve", "fast, approximate, recall-oriented",
+     "One vector per document, compared by dot product. Millions of candidates, "
+     "milliseconds. Optimise for: the answer is in the top 50."),
+    ("Re-rank", "slow, accurate, precision-oriented",
+     "Looks at the query and each candidate together. Tens of candidates, "
+     "not millions. Optimise for: the best 5 are first."),
+]
+
+for name, shape, detail in STAGES:
+    print(f"{name} — {shape}\\n  {detail}\\n")
+
+print("Retrieval sets the ceiling; re-ranking decides how much of it you reach.")`} />
+
+## Bi-encoder and cross-encoder
+
+The distinction is exactly where the query and the document meet:
+
+<Run id="rag-rerank-2" code={`COMPARISON = [
+    ("Bi-encoder (retrieval)",
+     "embed(query) and embed(document) separately, then compare vectors",
+     "Documents are embedded once, at index time. A query costs one embedding "
+     "plus a dot product over the whole index."),
+    ("Cross-encoder (re-ranking)",
+     "score(query, document) — both go through the model together",
+     "Nothing can be precomputed: every (query, document) pair is its own forward "
+     "pass. Far more accurate, and impossible at index scale."),
+]
+
+for name, mechanism, consequence in COMPARISON:
+    print(f"{name}\\n  {mechanism}\\n  {consequence}\\n")
+
+candidates, index_size = 50, 1_000_000
+print(f"cross-encoding the whole index: {index_size:,} forward passes per query")
+print(f"cross-encoding the top {candidates}:      {candidates} forward passes per query")`} />
+
+That ratio is the whole argument. A cross-encoder sees the query and the passage jointly, so it can
+notice that "the overlap should be 10-20%" answers "how much overlap?" in a way no independent pair
+of vectors can. It just cannot look at a million things.
+
+<Callout type="tip">
+A language model makes a perfectly good re-ranker when you have no dedicated cross-encoder: give
+it the query and the numbered candidates and ask for the relevant ids in order. It is slower and
+dearer than a purpose-built re-ranker, and much better than no second stage at all.
+</Callout>
+
+## Duplicates
+
+Overlapping chunks and repeated documents mean your top five are often the same passage five
+times:
+
+<Run id="rag-rerank-3" code={`import hashlib, re
+
+CANDIDATES = [
+    (0.91, "Use 10 to 20 percent chunk overlap so sentences are not cut in half."),
+    (0.90, "Use 10-20% chunk overlap so sentences are not cut in half."),
+    (0.89, "use 10 to 20 percent chunk overlap so sentences are not cut in half"),
+    (0.74, "Store embeddings as float32 to halve the memory they need."),
+    (0.71, "Split on paragraph boundaries before falling back to a character count."),
+]
+
+def normalise(text):
+    return re.sub(r"[^a-z0-9 ]", "", text.lower()).split()
+
+def fingerprint(text):
+    return hashlib.sha256(" ".join(normalise(text)).encode("utf-8")).hexdigest()[:12]
+
+def jaccard(a, b):
+    left, right = set(normalise(a)), set(normalise(b))
+    return len(left & right) / len(left | right) if left | right else 0.0
+
+def deduplicate(candidates, threshold=0.8):
+    kept = []
+    for score, text in candidates:
+        if any(jaccard(text, existing) >= threshold for _, existing in kept):
+            continue
+        kept.append((score, text))
+    return kept
+
+print("before:", len(CANDIDATES))
+for score, text in CANDIDATES:
+    print(f"  {score:.2f} {fingerprint(text)} {text[:52]}")
+
+print()
+kept = deduplicate(CANDIDATES)
+print("after: ", len(kept))
+for score, text in kept:
+    print(f"  {score:.2f} {text[:52]}")`} />
+
+An exact hash catches identical text; a similarity threshold catches the near-identical, which is
+what overlapping chunks actually produce.
+
+## Diversity: maximal marginal relevance
+
+Even after de-duplication, the top results often all say the same thing. MMR trades a little
+relevance for coverage, picking each next result for what it *adds*:
+
+<Run id="rag-rerank-4" code={`import numpy as np
+
+def mmr(query_vector, vectors, k=4, lambda_=0.7):
+    """Pick k items balancing relevance to the query against novelty."""
+    relevance = vectors @ query_vector
+    selected, remaining = [], list(range(len(vectors)))
+
+    while remaining and len(selected) < k:
+        if not selected:
+            best = max(remaining, key=lambda i: relevance[i])
+        else:
+            def marginal(i):
+                redundancy = max(float(vectors[i] @ vectors[j]) for j in selected)
+                return lambda_ * float(relevance[i]) - (1 - lambda_) * redundancy
+            best = max(remaining, key=marginal)
+        selected.append(best)
+        remaining.remove(best)
+    return selected
+
+rng = np.random.default_rng(0)
+# Three tight clusters, deliberately far apart: the naive top-4 comes
+# entirely from the first, because everything in it is nearly the query.
+centres = np.eye(3, 16)
+vectors = np.vstack([c + rng.normal(scale=0.05, size=(4, 16)) for c in centres]).astype(np.float32)
+vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+query = vectors[0]
+
+relevance = vectors @ query
+top_by_score = np.argsort(relevance)[::-1][:4]
+
+print("clusters:", [i // 4 for i in range(len(vectors))])
+print()
+print("plain top-4:      ", top_by_score.tolist(), "clusters", [int(i) // 4 for i in top_by_score])
+for lambda_ in [0.9, 0.7, 0.5]:
+    chosen = mmr(query, vectors, k=4, lambda_=lambda_)
+    print(f"MMR lambda={lambda_}:   {chosen} clusters {[i // 4 for i in chosen]}")`} />
+
+`lambda_ = 1.0` is plain relevance ranking; lowering it buys coverage. For a question with one
+answer you want a high lambda; for "what are the options?" you want a lower one.
+
+## Assembling the context
+
+The retrieved passages are not the prompt. What you build from them is:
+
+<Run id="rag-rerank-5" code={`from dataclasses import dataclass
+
+@dataclass
+class Passage:
+    chunk_id: str
+    doc_id: str
+    heading: str
+    text: str
+    score: float
+
+    @property
+    def tokens(self):
+        return max(1, len(self.text) // 4)
+
+PASSAGES = [
+    Passage("c1", "guide", "Chunking", "Use 10 to 20 percent overlap so sentences survive a boundary.", 0.91),
+    Passage("c2", "guide", "Embeddings", "Store vectors as float32 and normalise them at index time.", 0.78),
+    Passage("c3", "faq", "Errors", "Error E4021 means the embedding dimension did not match the index.", 0.66),
+    Passage("c4", "guide", "Separators", "Split on paragraphs first, then sentences, then characters.", 0.61),
+    Passage("c5", "blog", "Opinion", "We think retrieval is underrated and here is a long digression.", 0.31),
+]
+
+def assemble(passages, budget_tokens=60, minimum_score=0.5):
+    chosen, used = [], 0
+    for passage in sorted(passages, key=lambda p: p.score, reverse=True):
+        if passage.score < minimum_score:
+            continue
+        if used + passage.tokens > budget_tokens:
+            continue                      # skip, do not stop: a later one may fit
+        chosen.append(passage)
+        used += passage.tokens
+    return chosen, used
+
+chosen, used = assemble(PASSAGES)
+print(f"chose {len(chosen)} of {len(PASSAGES)} passages, {used} tokens")
+for passage in chosen:
+    print(f"  [{passage.chunk_id}] {passage.score:.2f} {passage.text[:52]}")
+
+print()
+rendered = "\\n\\n".join(
+    f'<chunk id="{p.chunk_id}" source="{p.doc_id}" section="{p.heading}">\\n{p.text}\\n</chunk>'
+    for p in chosen
+)
+print(rendered)`} />
+
+Four decisions are visible there, and each is a real one:
+
+- **A score floor.** A passage at 0.31 is noise, and noise in the context makes answers worse, not
+  merely longer.
+- **A token budget.** Context is finite and every token is paid for on every turn.
+- **Skip, do not stop.** A long low-ranked passage should not block three short better ones.
+- **Tags carrying the id.** That is what makes a citation checkable in the next lesson.
+
+## Order matters
+
+Models attend unevenly across a long context — the middle gets the least attention. If you have
+ten passages, the best ones should not be in positions five and six:
+
+<Run id="rag-rerank-6" code={`def interleave(passages):
+    """Best first, second-best last, working inwards — so the strongest sit at the edges."""
+    ordered = sorted(passages, key=lambda p: p["score"], reverse=True)
+    front, back = [], []
+    for position, passage in enumerate(ordered):
+        (front if position % 2 == 0 else back).append(passage)
+    return front + back[::-1]
+
+passages = [{"id": f"c{i}", "score": round(1.0 - i * 0.07, 2)} for i in range(9)]
+
+print("by score: ", [p["id"] for p in sorted(passages, key=lambda p: p["score"], reverse=True)])
+print("interleaved:", [p["id"] for p in interleave(passages)])
+print()
+print("scores in position order:", [p["score"] for p in interleave(passages)])`} />
+
+<Callout type="warning">
+Do not over-engineer this. The largest wins are fewer, better passages and a firm score floor;
+ordering is a second-order effect. If you have five good passages, any sensible order works — the
+problem is having twenty mediocre ones.
+</Callout>
+
+<Callout type="ai" title="Why this matters for AI">
+The assembled context *is* the input to the model, and it is the artefact to inspect when an
+answer is wrong. Log it. Most "the model hallucinated" reports turn out to be "the answer was
+never in the context", and the remainder are usually "the context contained three contradictory
+passages and the model picked one". Neither is visible from the answer alone, and both are obvious
+the moment you look at what was actually sent.
+</Callout>
+
+## The full selection stage
+
+<Run id="rag-rerank-7" code={`import numpy as np, re
+
+def normalise(text):
+    return set(re.sub(r"[^a-z0-9 ]", "", text.lower()).split())
+
+def jaccard(a, b):
+    left, right = normalise(a), normalise(b)
+    return len(left & right) / len(left | right) if left | right else 0.0
+
+def select(candidates, k=4, minimum=0.5, duplicate_at=0.8, budget=70):
+    """candidates: (score, tokens, text). Filter, de-duplicate, then fit the budget."""
+    survivors, used, chosen = [], 0, []
+
+    for score, tokens, text in sorted(candidates, key=lambda c: c[0], reverse=True):
+        if score < minimum:
+            continue
+        if any(jaccard(text, existing) >= duplicate_at for _, _, existing in survivors):
+            continue
+        survivors.append((score, tokens, text))
+
+    for score, tokens, text in survivors:
+        if len(chosen) >= k or used + tokens > budget:
+            continue
+        chosen.append((score, tokens, text))
+        used += tokens
+    return chosen, used
+
+candidates = [
+    (0.91, 18, "Use 10 to 20 percent chunk overlap so sentences are not cut in half."),
+    (0.90, 16, "Use 10-20% chunk overlap so sentences are not cut in half."),
+    (0.78, 15, "Store vectors as float32 and normalise them at index time."),
+    (0.66, 40, "Error E4021 means the embedding dimension did not match the index, which "
+               "usually happens after changing model without re-indexing."),
+    (0.61, 14, "Split on paragraphs first, then sentences, then characters."),
+    (0.31, 12, "We think retrieval is underrated and here is a digression."),
+]
+
+chosen, used = select(candidates)
+print(f"{len(candidates)} candidates -> {len(chosen)} passages, {used} tokens")
+for score, tokens, text in chosen:
+    print(f"  {score:.2f} ({tokens:>2}t) {text[:58]}")`} />
+
+Six candidates become three passages: one duplicate removed, one below the floor, one that did not
+fit the budget.
+
+## Try it yourself
+
+<Exercise
+  id="rag-rerank-ex1"
+  title="Exercise 1"
+  brief="Write <code>mmr(query_vector, vectors, k, lambda_)</code>: pick <code>k</code> positions, the first by pure relevance and each later one maximising <code>lambda_ * relevance - (1 - lambda_) * max_similarity_to_already_chosen</code>."
+  code={`import numpy as np
+
+def mmr(query_vector, vectors, k=3, lambda_=0.7):
+    # vectors is (n, d) unit vectors; query_vector is (d,).
+    # Return a list of k chosen positions, in the order they were chosen.
+    ...
+
+
+rng = np.random.default_rng(0)
+centres = np.eye(3, 8)                       # three well-separated clusters
+vectors = np.vstack([c + rng.normal(scale=0.03, size=(3, 8)) for c in centres]).astype(np.float32)
+vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+
+print("plain:", np.argsort(vectors @ vectors[0])[::-1][:3].tolist())
+print("mmr:  ", mmr(vectors[0], vectors, k=3, lambda_=0.3))`}
+  hint="relevance = vectors @ query_vector. Pick the argmax first, then repeatedly pick the remaining index maximising the marginal score, where redundancy is the largest dot product with anything already selected."
+  solution={`import numpy as np
+
+def mmr(query_vector, vectors, k=3, lambda_=0.7):
+    relevance = vectors @ query_vector
+    selected, remaining = [], list(range(len(vectors)))
+
+    while remaining and len(selected) < k:
+        if not selected:
+            best = max(remaining, key=lambda i: relevance[i])
+        else:
+            def marginal(i):
+                redundancy = max(float(vectors[i] @ vectors[j]) for j in selected)
+                return lambda_ * float(relevance[i]) - (1 - lambda_) * redundancy
+            best = max(remaining, key=marginal)
+        selected.append(best)
+        remaining.remove(best)
+    return selected
+
+
+rng = np.random.default_rng(0)
+centres = np.eye(3, 8)                       # three well-separated clusters
+vectors = np.vstack([c + rng.normal(scale=0.03, size=(3, 8)) for c in centres]).astype(np.float32)
+vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+
+print("plain:", np.argsort(vectors @ vectors[0])[::-1][:3].tolist())
+print("mmr:  ", mmr(vectors[0], vectors, k=3, lambda_=0.3))`}
+  tests={`import numpy as np
+
+rng = np.random.default_rng(0)
+centres = np.eye(3, 8)
+vectors = np.vstack([c + rng.normal(scale=0.03, size=(3, 8)) for c in centres]).astype(np.float32)
+vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+query = vectors[0]
+
+chosen = mmr(query, vectors, k=3, lambda_=0.3)
+assert isinstance(chosen, list) and len(chosen) == 3, f"Return k positions, got {chosen!r}."
+assert len(set(chosen)) == 3, f"No position may be chosen twice, got {chosen}."
+assert all(0 <= i < len(vectors) for i in chosen), "Positions must index the array."
+
+assert chosen[0] == int(np.argmax(vectors @ query)), (
+    f"The first pick is pure relevance, so position {int(np.argmax(vectors @ query))}. Got {chosen[0]}."
+)
+
+# With diversity on, the picks should span the three clusters.
+clusters = {i // 3 for i in chosen}
+assert len(clusters) == 3, (
+    f"At lambda_=0.3 the picks should cover all three clusters, got clusters {sorted(clusters)} "
+    f"from positions {chosen}."
+)
+
+# lambda_=1.0 is pure relevance, so it must match the plain ranking.
+pure = mmr(query, vectors, k=3, lambda_=1.0)
+plain = np.argsort(vectors @ query)[::-1][:3].tolist()
+assert pure == plain, f"With lambda_=1.0 expected the plain ranking {plain}, got {pure}."
+
+# k larger than the array should return everything, once each.
+everything = mmr(query, vectors, k=99, lambda_=0.3)
+assert sorted(everything) == list(range(len(vectors))), (
+    f"With a large k, every position should be chosen exactly once. Got {sorted(everything)}."
+)`}
+/>
+
+<Exercise
+  id="rag-rerank-ex2"
+  title="Exercise 2"
+  brief="Write <code>assemble(passages, budget, minimum)</code>: drop anything below <code>minimum</code>, take the rest best first while they fit the token budget, and return <code>(chosen, tokens_used)</code>. Skip an oversized passage rather than stopping."
+  code={`def assemble(passages, budget=60, minimum=0.5):
+    # passages: list of dicts with id, score and tokens.
+    # Sort by score descending, drop anything below minimum, and add each
+    # passage that still fits. A passage that does not fit is skipped, not
+    # a reason to stop.
+    ...
+
+
+PASSAGES = [
+    {"id": "c1", "score": 0.91, "tokens": 20},
+    {"id": "c2", "score": 0.78, "tokens": 15},
+    {"id": "c3", "score": 0.66, "tokens": 40},
+    {"id": "c4", "score": 0.61, "tokens": 14},
+    {"id": "c5", "score": 0.31, "tokens": 12},
+]
+
+chosen, used = assemble(PASSAGES)
+print([p["id"] for p in chosen], used)`}
+  hint="One sorted loop with two conditions: a continue for the score floor and a continue for the budget."
+  solution={`def assemble(passages, budget=60, minimum=0.5):
+    chosen, used = [], 0
+    for passage in sorted(passages, key=lambda p: p["score"], reverse=True):
+        if passage["score"] < minimum:
+            continue
+        if used + passage["tokens"] > budget:
+            continue
+        chosen.append(passage)
+        used += passage["tokens"]
+    return chosen, used
+
+
+PASSAGES = [
+    {"id": "c1", "score": 0.91, "tokens": 20},
+    {"id": "c2", "score": 0.78, "tokens": 15},
+    {"id": "c3", "score": 0.66, "tokens": 40},
+    {"id": "c4", "score": 0.61, "tokens": 14},
+    {"id": "c5", "score": 0.31, "tokens": 12},
+]
+
+chosen, used = assemble(PASSAGES)
+print([p["id"] for p in chosen], used)`}
+  tests={`PASSAGES = [
+    {"id": "c1", "score": 0.91, "tokens": 20},
+    {"id": "c2", "score": 0.78, "tokens": 15},
+    {"id": "c3", "score": 0.66, "tokens": 40},
+    {"id": "c4", "score": 0.61, "tokens": 14},
+    {"id": "c5", "score": 0.31, "tokens": 12},
+]
+
+chosen, used = assemble(PASSAGES, budget=60, minimum=0.5)
+ids = [p["id"] for p in chosen]
+
+assert "c5" not in ids, "c5 scores 0.31, below the 0.5 floor, and must be dropped."
+assert ids == ["c1", "c2", "c4"], (
+    f"c1 (20) and c2 (15) fit; c3 needs 40 and would exceed 60, so it is skipped; c4 (14) "
+    f"still fits. Expected ['c1', 'c2', 'c4'], got {ids}."
+)
+assert used == 49, f"20 + 15 + 14 = 49, got {used}."
+assert used <= 60, "The budget must never be exceeded."
+
+# Skipping, not stopping, is the point of the c3 case.
+assert "c4" in ids, (
+    "c4 comes after the oversized c3 — a passage that does not fit must be skipped, not "
+    "treated as the end of the list."
+)
+
+# A tighter budget takes fewer.
+tight, tight_used = assemble(PASSAGES, budget=20, minimum=0.5)
+assert [p["id"] for p in tight] == ["c1"], f"Only c1 fits in 20 tokens, got {[p['id'] for p in tight]}."
+assert tight_used == 20
+
+# A higher floor drops more.
+strict, _ = assemble(PASSAGES, budget=100, minimum=0.8)
+assert [p["id"] for p in strict] == ["c1"], (
+    f"Only c1 clears a 0.8 floor, got {[p['id'] for p in strict]}."
+)
+
+empty, zero = assemble([], budget=60, minimum=0.5)
+assert empty == [] and zero == 0, "No passages means nothing chosen and nothing used."`}
+/>
+
+<Quiz
+  question="Why retrieve 50 candidates and re-rank to 5, rather than just retrieving 5 with a better embedding model?"
+  choices={[
+    { text: "A cross-encoder reads the query and passage together, which is far more accurate but far too slow to run over the whole index", correct: true, why: "The two stages have different cost profiles: cheap and approximate over millions, expensive and accurate over tens." },
+    { text: "Retrieving more always improves the answer", why: "More candidates without a selection stage puts more noise in the context, which makes answers worse." },
+    { text: "Embedding models cannot return fewer than 50 results", why: "You can ask for any k; the point is what happens to the 50 afterwards." },
+    { text: "It reduces the number of embeddings you must store", why: "The index is unchanged either way." },
+  ]}
+/>
+
+<Quiz
+  question="A passage is too long for the remaining budget. What should the assembler do?"
+  choices={[
+    { text: "Skip it and carry on — a later, shorter passage may still fit", correct: true, why: "Stopping at the first non-fitting passage wastes the remaining budget on nothing, and the skipped space is often filled by two good short passages." },
+    { text: "Stop assembling, since the rest are lower ranked", why: "That leaves budget unused and drops passages that would have fitted comfortably." },
+    { text: "Truncate it to fit", why: "A passage cut mid-sentence is the chunking problem again, reintroduced at assembly time." },
+    { text: "Raise the budget", why: "The budget is a cost and context-window constraint, not a suggestion." },
+  ]}
+/>
+
+## Recap
+
+- Retrieve widely for recall, then select narrowly for precision. One ranking function cannot do
+  both jobs.
+- A bi-encoder embeds query and document separately, so documents are precomputed. A cross-encoder
+  reads them together: much better, much slower, tens of candidates only.
+- De-duplicate before assembly — overlapping chunks produce near-identical passages.
+- MMR trades relevance for coverage; `lambda_ = 1.0` is plain ranking.
+- Assemble with a score floor and a token budget, skipping rather than stopping, and tag each
+  passage with its chunk id so citations are checkable.
+- Log the assembled context. Most "hallucination" reports are really "the answer was not in the
+  context".

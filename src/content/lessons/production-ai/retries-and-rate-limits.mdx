@@ -1,0 +1,483 @@
+---
+title: Retries, timeouts, backoff and rate limits
+description: Retry the right failures, back off with jitter so your clients stop synchronising, respect Retry-After, and shed load before the service does it for you.
+module: production-ai
+order: 2
+level: expert
+minutes: 22
+objectives:
+  - Separate retryable failures from permanent ones
+  - Compute exponential backoff, and explain why jitter is not optional
+  - Respect a Retry-After header over your own schedule
+  - Rate-limit yourself with a token bucket
+  - Break the circuit when a dependency is down
+---
+
+A client that retries everything is as broken as one that retries nothing — it just fails more
+expensively. This lesson is about failing well.
+
+## What to retry
+
+<Run id="prod-retry-1" code={`POLICY = [
+    ("429 rate limited", True,  "The service asked you to wait. Obey Retry-After if present."),
+    ("500-504 server error", True,  "Transient on the other side."),
+    ("529 overloaded", True,  "Capacity, not correctness."),
+    ("Connection reset / timeout", True,  "The network. Usually transient."),
+    ("400 bad request", False, "Your request is wrong. It will be wrong next time too."),
+    ("401 unauthorised", False, "Fix the credentials."),
+    ("404 not found", False, "Wrong model id or endpoint."),
+    ("413 too large", False, "Shrink the request; retrying cannot."),
+]
+
+print(f"{'failure':<28} {'retry':>6}  reason")
+for failure, retry, reason in POLICY:
+    print(f"{failure:<28} {str(retry):>6}  {reason}")
+
+print()
+print("Retrying a 400 costs money and time to receive the same error.")`} />
+
+## Exponential backoff
+
+Each attempt waits longer than the last, so a struggling service gets room to recover:
+
+<Run id="prod-retry-2" code={`def delays(attempts, base=0.5, factor=2.0, cap=30.0):
+    return [min(cap, base * factor ** attempt) for attempt in range(attempts)]
+
+print("attempt  delay")
+for attempt, delay in enumerate(delays(8), start=1):
+    print(f"{attempt:>7}  {delay:>6.2f}s")
+
+print()
+print(f"total wait across 8 attempts: {sum(delays(8)):.1f}s")
+print("The cap matters: without it, attempt 12 would wait over an hour.")`} />
+
+## Jitter
+
+Pure exponential backoff has a failure mode that only appears under load. A hundred clients hit a
+429 at the same moment, all wait exactly 0.5s, and all retry at the same moment — recreating the
+overload they were backing off from:
+
+<Run id="prod-retry-3" code={`import random
+from collections import Counter
+
+def without_jitter(attempt, base=0.5):
+    return base * 2 ** attempt
+
+def with_jitter(attempt, rng, base=0.5):
+    """Full jitter: anywhere between 0 and the exponential delay."""
+    return rng.uniform(0, base * 2 ** attempt)
+
+clients = 100
+rng = random.Random(0)
+
+synchronised = Counter(round(without_jitter(0), 1) for _ in range(clients))
+spread = Counter(round(with_jitter(0, rng), 1) for _ in range(clients))
+
+print("retry times after the first failure, rounded to 100 ms:")
+print(f"  no jitter:   {dict(synchronised)}")
+print(f"  full jitter: {dict(sorted(spread.items()))}")
+print()
+print(f"busiest 100 ms window: no jitter {max(synchronised.values())} clients, "
+      f"with jitter {max(spread.values())}")`} />
+
+Without jitter every client retries in the same instant. With it they spread out, and the service
+sees a trickle rather than a wall.
+
+<Callout type="warning">
+Jitter is not a refinement you add later. Synchronised retries are how a brief blip becomes a
+sustained outage — the retries themselves keep the service saturated. Full jitter (a uniform draw
+between zero and the exponential delay) is simple and works well; there is no need for anything
+cleverer.
+</Callout>
+
+## Retry-After
+
+When the service tells you how long to wait, that beats any schedule you invented:
+
+<Run id="prod-retry-4" code={`import random
+
+def next_delay(attempt, headers, rng, base=0.5, cap=60.0):
+    """Retry-After wins. Otherwise exponential backoff with full jitter."""
+    retry_after = headers.get("retry-after")
+    if retry_after is not None:
+        try:
+            return min(cap, float(retry_after))
+        except ValueError:
+            pass                       # a date form; fall through to backoff
+    return min(cap, rng.uniform(0, base * 2 ** attempt))
+
+rng = random.Random(0)
+cases = [
+    (0, {"retry-after": "12"}, "the service said 12 seconds"),
+    (0, {}, "no header: jittered backoff"),
+    (3, {}, "attempt 4: a larger window to draw from"),
+    (0, {"retry-after": "9999"}, "capped at 60"),
+]
+
+for attempt, headers, note in cases:
+    print(f"{next_delay(attempt, headers, rng):6.2f}s   {note}")`} />
+
+## A complete retry wrapper
+
+<Run id="prod-retry-5" code={`import random, time
+
+class Retryable(Exception):
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+class Permanent(Exception):
+    pass
+
+def call_with_retry(operation, *, attempts=5, base=0.01, cap=1.0,
+                    total_budget=2.0, seed=0, sleep=time.sleep):
+    rng = random.Random(seed)
+    started = time.perf_counter()
+    history = []
+
+    for attempt in range(attempts):
+        try:
+            return operation(attempt), history
+        except Permanent:
+            history.append((attempt, "permanent", 0.0))
+            raise
+        except Retryable as error:
+            if attempt == attempts - 1:
+                history.append((attempt, "gave up", 0.0))
+                raise
+            delay = (min(cap, float(error.retry_after)) if error.retry_after is not None
+                     else min(cap, rng.uniform(0, base * 2 ** attempt)))
+            if time.perf_counter() - started + delay > total_budget:
+                history.append((attempt, "out of budget", delay))
+                raise
+            history.append((attempt, f"retry in {delay:.3f}s", delay))
+            sleep(delay)
+
+    raise RuntimeError("unreachable")
+
+calls = {"n": 0}
+def flaky(attempt):
+    calls["n"] += 1
+    if calls["n"] < 3:
+        raise Retryable("429", retry_after=None)
+    return "succeeded"
+
+result, history = call_with_retry(flaky)
+print(result, "after", calls["n"], "calls")
+for attempt, what, _ in history:
+    print(f"  attempt {attempt}: {what}")
+
+print()
+def always_bad(attempt):
+    raise Permanent("400 bad request")
+
+try:
+    call_with_retry(always_bad)
+except Permanent as error:
+    print("not retried:", error)`} />
+
+Three things there are worth copying: a **total time budget** as well as an attempt count, honouring
+`retry_after` when the service supplies one, and never retrying a `Permanent`.
+
+## Rate-limiting yourself
+
+Waiting for a 429 is reactive. A token bucket keeps you under the limit in the first place:
+
+<Run id="prod-retry-6" code={`class TokenBucket:
+    """Refills at a steady rate; a request must take a token to proceed."""
+
+    def __init__(self, rate_per_second, capacity, now=0.0):
+        self.rate = rate_per_second
+        self.capacity = capacity
+        self.tokens = float(capacity)
+        self.updated = now
+
+    def _refill(self, now):
+        elapsed = max(0.0, now - self.updated)
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+        self.updated = now
+
+    def take(self, now, amount=1.0):
+        """True if the request may go now; False if it must wait."""
+        self._refill(now)
+        if self.tokens >= amount:
+            self.tokens -= amount
+            return True
+        return False
+
+    def wait_for(self, now, amount=1.0):
+        self._refill(now)
+        if self.tokens >= amount:
+            return 0.0
+        return (amount - self.tokens) / self.rate
+
+bucket = TokenBucket(rate_per_second=5, capacity=5)
+
+print(f"{'t':>5} {'allowed':>8} {'tokens left':>12}")
+for tick in range(12):
+    now = tick * 0.1                     # a request every 100 ms
+    allowed = bucket.take(now)
+    print(f"{now:>5.1f} {str(allowed):>8} {bucket.tokens:>12.2f}")
+
+print()
+print(f"wait before the next one: {bucket.wait_for(1.1):.2f}s")`} />
+
+The burst capacity absorbs a spike; the refill rate holds the long-run average. Five per second
+with a capacity of five means "five instantly, then one every 200 ms".
+
+<Callout type="ai" title="Why this matters for AI">
+Model APIs rate limit on two axes at once — requests per minute *and* tokens per minute — and the
+token limit is usually the one you hit first, because one long request can consume a minute's
+budget. Run two buckets, take from both, and estimate the token cost before sending with
+`count_tokens`. A client that stays just under the limit finishes a batch faster than one that
+sprints into a wall of 429s and then backs off, because the retries add latency that the throttled
+client never pays.
+</Callout>
+
+<Run id="prod-retry-7" code={`class TokenBucket:
+    def __init__(self, rate, capacity, now=0.0):
+        self.rate, self.capacity = rate, capacity
+        self.tokens, self.updated = float(capacity), now
+    def take(self, now, amount=1.0):
+        elapsed = max(0.0, now - self.updated)
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+        self.updated = now
+        if self.tokens >= amount:
+            self.tokens -= amount
+            return True
+        return False
+
+requests = TokenBucket(rate=2, capacity=4)          # 2 requests/second
+tokens = TokenBucket(rate=2000, capacity=4000)      # 2000 tokens/second
+
+def may_send(now, estimated_tokens):
+    """Both budgets must allow it."""
+    if not requests.take(now, 1):
+        return False, "request limit"
+    if not tokens.take(now, estimated_tokens):
+        return False, "token limit"
+    return True, "sent"
+
+for tick, size in enumerate([500, 500, 3000, 500, 500]):
+    now = tick * 0.2
+    allowed, why = may_send(now, size)
+    print(f"t={now:.1f}s  {size:>5} tokens  {'sent' if allowed else 'held: ' + why}")`} />
+
+## Circuit breaker
+
+When a dependency is genuinely down, retrying every request wastes time and keeps the pressure on.
+A breaker fails fast until it has reason to think the service is back:
+
+<Run id="prod-retry-8" code={`class CircuitBreaker:
+    """closed -> open after enough failures -> half-open after a cooldown."""
+
+    def __init__(self, threshold=3, cooldown=1.0):
+        self.threshold, self.cooldown = threshold, cooldown
+        self.failures = 0
+        self.state = "closed"
+        self.opened_at = None
+
+    def allows(self, now):
+        if self.state == "open" and now - self.opened_at >= self.cooldown:
+            self.state = "half-open"
+        return self.state in ("closed", "half-open")
+
+    def record(self, ok, now):
+        if ok:
+            self.failures, self.state, self.opened_at = 0, "closed", None
+            return
+        self.failures += 1
+        if self.state == "half-open" or self.failures >= self.threshold:
+            self.state, self.opened_at = "open", now
+
+breaker = CircuitBreaker(threshold=3, cooldown=1.0)
+timeline = [(0.0, False), (0.1, False), (0.2, False), (0.3, None),
+            (1.4, True), (1.5, True)]
+
+for now, outcome in timeline:
+    allowed = breaker.allows(now)
+    if not allowed:
+        print(f"t={now:.1f}  refused immediately  (state {breaker.state})")
+        continue
+    if outcome is None:
+        continue
+    breaker.record(outcome, now)
+    print(f"t={now:.1f}  call {'succeeded' if outcome else 'failed'}  "
+          f"(state {breaker.state}, failures {breaker.failures})")`} />
+
+Three failures open the circuit; further calls are refused without touching the network. After the
+cooldown one probe is allowed through, and its result decides whether the circuit closes again.
+
+<Callout type="tip">
+Layer these deliberately: the token bucket stops you causing the problem, the retry handles a
+blip, and the breaker stops you hammering a genuine outage. Each solves a different failure, and
+a retry loop alone solves only the middle one.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="prod-retry-ex1"
+  title="Exercise 1"
+  brief="Write <code>backoff_delays(attempts, rng, base, cap)</code>: full jitter — each delay is a uniform draw between 0 and <code>min(cap, base * 2 ** attempt)</code>."
+  code={`import random
+
+def backoff_delays(attempts, rng, base=0.5, cap=30.0):
+    # One delay per attempt, attempt numbering from 0.
+    # Each is rng.uniform(0, ceiling) where ceiling = min(cap, base * 2 ** attempt).
+    ...
+
+
+for delay in backoff_delays(6, random.Random(0)):
+    print(round(delay, 4))`}
+  hint="A list comprehension over range(attempts), computing the ceiling first and drawing from it."
+  solution={`import random
+
+def backoff_delays(attempts, rng, base=0.5, cap=30.0):
+    return [rng.uniform(0, min(cap, base * 2 ** attempt)) for attempt in range(attempts)]
+
+
+for delay in backoff_delays(6, random.Random(0)):
+    print(round(delay, 4))`}
+  tests={`import random
+
+delays = backoff_delays(6, random.Random(0), base=0.5, cap=30.0)
+assert len(delays) == 6, f"One delay per attempt, got {len(delays)}."
+assert all(d >= 0 for d in delays), "A delay can never be negative."
+
+for attempt, delay in enumerate(delays):
+    ceiling = min(30.0, 0.5 * 2 ** attempt)
+    assert delay <= ceiling + 1e-9, (
+        f"Attempt {attempt} may wait at most {ceiling}s, got {delay}."
+    )
+
+# Seeded, it must be reproducible; unseeded draws must differ.
+assert backoff_delays(4, random.Random(7)) == backoff_delays(4, random.Random(7)), (
+    "The same seed must give the same delays."
+)
+assert backoff_delays(4, random.Random(7)) != backoff_delays(4, random.Random(8)), (
+    "Different seeds should give different delays."
+)
+
+# The cap must bind.
+capped = backoff_delays(12, random.Random(1), base=1.0, cap=5.0)
+assert all(d <= 5.0 + 1e-9 for d in capped), f"Nothing may exceed the cap, got max {max(capped)}."
+
+# There must be real jitter, not a fixed schedule.
+sample = backoff_delays(20, random.Random(3), base=1.0, cap=1.0)
+assert len(set(round(d, 6) for d in sample)) > 10, (
+    "With a fixed ceiling the delays should still vary — that is what jitter means."
+)
+assert min(sample) < 0.5, "Full jitter should sometimes draw a short delay."
+
+assert backoff_delays(0, random.Random(0)) == [], "Zero attempts means no delays."`}
+/>
+
+<Exercise
+  id="prod-retry-ex2"
+  title="Exercise 2"
+  brief="Complete <code>TokenBucket</code>: refill by elapsed time up to the capacity, and <code>take</code> a request only when enough tokens are available."
+  code={`class TokenBucket:
+    def __init__(self, rate, capacity, now=0.0):
+        self.rate = rate
+        self.capacity = capacity
+        self.tokens = float(capacity)
+        self.updated = now
+
+    def take(self, now, amount=1.0):
+        # Refill first: add (now - self.updated) * rate, never above capacity,
+        # and move self.updated to now. Then spend the amount if it is there,
+        # returning True, or return False without spending.
+        ...
+
+
+bucket = TokenBucket(rate=5, capacity=5)
+for tick in range(8):
+    now = tick * 0.1
+    print(round(now, 1), bucket.take(now), round(bucket.tokens, 2))`}
+  hint="elapsed = max(0.0, now - self.updated); self.tokens = min(self.capacity, self.tokens + elapsed * self.rate); then compare and subtract."
+  solution={`class TokenBucket:
+    def __init__(self, rate, capacity, now=0.0):
+        self.rate = rate
+        self.capacity = capacity
+        self.tokens = float(capacity)
+        self.updated = now
+
+    def take(self, now, amount=1.0):
+        elapsed = max(0.0, now - self.updated)
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+        self.updated = now
+        if self.tokens >= amount:
+            self.tokens -= amount
+            return True
+        return False
+
+
+bucket = TokenBucket(rate=5, capacity=5)
+for tick in range(8):
+    now = tick * 0.1
+    print(round(now, 1), bucket.take(now), round(bucket.tokens, 2))`}
+  tests={`bucket = TokenBucket(rate=5, capacity=5)
+
+# The bucket starts full, so five immediate requests all pass.
+assert all(bucket.take(0.0) for _ in range(5)), "A full bucket should allow a burst of five."
+assert bucket.take(0.0) is False, "The sixth request at t=0 has no token left."
+assert abs(bucket.tokens) < 1e-9, f"Tokens should be exhausted, got {bucket.tokens}."
+
+# Refill is proportional to elapsed time.
+assert bucket.take(0.2) is True, "0.2s at 5/s refills one token."
+assert bucket.take(0.2) is False, "...and only one."
+
+# It must never exceed capacity, however long it idles.
+idle = TokenBucket(rate=5, capacity=5)
+idle.take(100.0)
+assert idle.tokens <= 5.0 + 1e-9, f"Capacity must cap the refill, got {idle.tokens}."
+assert idle.tokens >= 4.0 - 1e-9, "One token was just spent from a full bucket."
+
+# A larger amount must be respected.
+sized = TokenBucket(rate=1000, capacity=2000)
+assert sized.take(0.0, 1500) is True, "1500 of 2000 available."
+assert sized.take(0.0, 1000) is False, "Only 500 remain."
+assert abs(sized.tokens - 500) < 1e-6, f"Expected 500 tokens left, got {sized.tokens}."
+
+# A refused request must not spend anything.
+before = sized.tokens
+sized.take(0.0, 99_999)
+assert abs(sized.tokens - before) < 1e-9, "A refused take must leave the balance untouched."
+
+# Time going backwards must not remove tokens.
+backwards = TokenBucket(rate=5, capacity=5, now=10.0)
+backwards.take(5.0)
+assert backwards.tokens >= 3.9, f"A lower 'now' should not drain the bucket, got {backwards.tokens}."`}
+/>
+
+<Quiz
+  question="A hundred clients hit a 429 at the same moment and all back off by exactly 0.5 seconds. What happens?"
+  choices={[
+    { text: "They all retry in the same instant, recreating the overload they were backing off from", correct: true, why: "Deterministic backoff keeps a fleet synchronised, so each retry wave is as large as the one that triggered the limit. Jitter spreads them out." },
+    { text: "The service recovers, because 0.5 seconds is enough", why: "The pause helps only if the load is spread across it, which is exactly what jitter provides." },
+    { text: "Half succeed and half get another 429", why: "The split is incidental; the problem is that the burst shape is unchanged." },
+    { text: "Nothing — 429s are not counted against you", why: "They cost latency and capacity whether or not they are billed." },
+  ]}
+/>
+
+<Quiz
+  question="Why run a token bucket when you already retry on 429?"
+  choices={[
+    { text: "Staying under the limit is faster than exceeding it and recovering — a retry adds latency a throttled client never pays", correct: true, why: "Reactive handling costs a failed round trip plus a backoff per violation; pacing avoids both, and finishes a batch sooner." },
+    { text: "Retrying 429s is not allowed", why: "It is the correct response to one; the bucket is about not causing them." },
+    { text: "The bucket removes the need for error handling", why: "You still need it — other clients, other processes and estimation error all still produce 429s." },
+    { text: "It reduces the token cost of each request", why: "It changes when requests are sent, not what they cost." },
+  ]}
+/>
+
+## Recap
+
+- Retry 429, 5xx and connection failures. Never retry 400, 401, 404 or 413.
+- Exponential backoff with a cap, and **full jitter** — deterministic backoff keeps a fleet
+  synchronised and prolongs the outage.
+- `Retry-After` beats your own schedule.
+- Budget total time as well as attempts, or five retries with a 60-second cap can block for
+  minutes.
+- A token bucket paces you under the limit; model APIs limit on requests *and* tokens, so run two.
+- A circuit breaker fails fast during a real outage and probes once after a cooldown.

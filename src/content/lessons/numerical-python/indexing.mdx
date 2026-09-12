@@ -1,0 +1,336 @@
+---
+title: Indexing, slicing and boolean masks
+description: Select along several axes at once, filter with boolean masks instead of loops, and find the top-k results the way every retrieval system does.
+module: numerical-python
+order: 2
+level: intermediate
+minutes: 18
+objectives:
+  - Index and slice arrays along more than one axis
+  - Select arbitrary rows with integer-array indexing
+  - Filter with boolean masks, and combine them correctly
+  - Use where, argmax, argsort and argpartition
+  - Assign through a mask to change only the elements you selected
+---
+
+Selecting the right elements is most of what you do with an array. Doing it with indexing rather
+than a loop is both faster and clearer — and it is exactly how a retrieval system finds its top
+results.
+
+## Along one axis
+
+<Run id="np-idx-1" code={`import numpy as np
+
+scores = np.array([0.71, 0.88, 0.93, 0.42, 0.65])
+
+print(scores[0], scores[-1])
+print(scores[1:4])
+print(scores[:3], scores[3:])
+print(scores[::2])        # every second
+print(scores[::-1])       # reversed`} />
+
+## Along several axes
+
+A comma separates the axes. `arr[row, column]` is one element; a slice in either position keeps
+that axis:
+
+<Run id="np-idx-2" code={`import numpy as np
+
+batch = np.arange(12).reshape(3, 4)
+print(batch)
+print()
+
+print("one element:  ", batch[1, 2])
+print("a whole row:  ", batch[1])            # same as batch[1, :]
+print("a whole column:", batch[:, 2])
+print("a sub-block:")
+print(batch[0:2, 1:3])
+print("last column:  ", batch[:, -1])`} />
+
+`...` stands for "all the remaining axes", which keeps high-dimensional indexing readable:
+
+<Run id="np-idx-3" code={`import numpy as np
+
+images = np.arange(2 * 3 * 3 * 3).reshape(2, 3, 3, 3)   # (batch, height, width, channel)
+
+print("first image, red channel:")
+print(images[0, :, :, 0])
+print()
+print("the same thing:")
+print(images[0, ..., 0])
+print()
+print("every image, top-left pixel:", images[..., 0, 0, :].shape)`} />
+
+## Integer-array indexing
+
+Passing a list or array of indices picks exactly those elements, in that order — and repeats are
+allowed:
+
+<Run id="np-idx-4" code={`import numpy as np
+
+scores = np.array([0.71, 0.88, 0.93, 0.42, 0.65])
+
+print(scores[[2, 0, 4]])
+print(scores[[0, 0, 1]])
+
+batch = np.arange(12).reshape(3, 4)
+print()
+print("rows 2 and 0:")
+print(batch[[2, 0]])
+print()
+print("specific (row, column) pairs:", batch[[0, 1, 2], [3, 2, 1]])`} />
+
+Unlike a slice, this **copies**. That is usually what you want when you are gathering the
+documents a search returned.
+
+## Boolean masks
+
+Comparing an array gives an array of booleans, and indexing with it keeps the `True` positions:
+
+<Run id="np-idx-5" code={`import numpy as np
+
+scores = np.array([0.71, 0.88, 0.93, 0.42, 0.65])
+
+mask = scores > 0.7
+print(mask)
+print(scores[mask])
+print("how many:", mask.sum())        # True counts as 1
+print("any above 0.9?", (scores > 0.9).any())
+print("all above 0.3?", (scores > 0.3).all())`} />
+
+Combine masks with `&` (and), `|` (or) and `~` (not) — each condition in its own parentheses:
+
+<Run id="np-idx-6" code={`import numpy as np
+
+scores = np.array([0.71, 0.88, 0.93, 0.42, 0.65])
+lengths = np.array([120, 4300, 980, 75, 300])
+
+good = (scores > 0.6) & (lengths > 100)
+print(good)
+print(scores[good])
+
+print("either:", scores[(scores > 0.9) | (lengths < 100)])
+print("not:   ", scores[~good])`} />
+
+<Callout type="warning">
+`and`, `or` and `not` do not work on arrays — they try to reduce the whole array to one
+truth value and raise `ValueError: The truth value of an array … is ambiguous`. Use `&`, `|`
+and `~`, and parenthesise each comparison, because `&` binds more tightly than `>`.
+</Callout>
+
+<Run id="np-idx-7" raises="ValueError" code={`import numpy as np
+
+scores = np.array([0.71, 0.88, 0.93])
+lengths = np.array([120, 4300, 980])
+
+print(scores[(scores > 0.6) and (lengths > 100)])`} />
+
+## Filtering rows of a batch
+
+A mask over one axis selects along that axis, which is how you keep the rows that matter:
+
+<Run id="np-idx-8" code={`import numpy as np
+
+embeddings = np.arange(20).reshape(5, 4).astype(np.float32)
+quality = np.array([0.9, 0.2, 0.75, 0.4, 0.95])
+
+keep = quality >= 0.7
+print("keeping", keep.sum(), "of", len(quality), "rows")
+print(embeddings[keep])
+print("their scores:", quality[keep])`} />
+
+## where
+
+`np.where(condition, if_true, if_false)` chooses elementwise, with no loop and no mask juggling:
+
+<Run id="np-idx-9" code={`import numpy as np
+
+scores = np.array([0.71, 0.88, 0.93, 0.42, 0.65])
+
+print(np.where(scores > 0.7, "pass", "fail"))
+print(np.where(scores > 0.7, scores, 0.0))         # zero out the failures
+print(np.clip(scores, 0.5, 0.9))                   # squash into a range
+
+# With one argument it returns the indices where the condition holds.
+print(np.where(scores > 0.7))
+print("indices:", np.where(scores > 0.7)[0])`} />
+
+## Finding positions: argmax, argsort, argpartition
+
+The `arg` family returns **indices** rather than values, which is what you need when the array
+you are searching is parallel to another one you want to look things up in:
+
+<Run id="np-idx-10" code={`import numpy as np
+
+documents = np.array(["intro", "guide", "api", "faq", "changelog"])
+similarity = np.array([0.71, 0.88, 0.93, 0.42, 0.65])
+
+print("best index: ", similarity.argmax())
+print("best doc:   ", documents[similarity.argmax()])
+print("worst doc:  ", documents[similarity.argmin()])
+
+order = np.argsort(similarity)              # ascending
+print("ascending:  ", documents[order])
+print("descending: ", documents[order[::-1]])`} />
+
+Top-k retrieval is exactly this, and `argpartition` does it without sorting everything — which
+matters when you are ranking a million candidates and want three:
+
+<Run id="np-idx-11" code={`import numpy as np
+
+documents = np.array(["intro", "guide", "api", "faq", "changelog"])
+similarity = np.array([0.71, 0.88, 0.93, 0.42, 0.65])
+k = 3
+
+# Sort everything, then take k.
+top_sorted = np.argsort(similarity)[::-1][:k]
+print("argsort:     ", documents[top_sorted], similarity[top_sorted])
+
+# Partition so the k largest are at the end, then sort only those k.
+candidates = np.argpartition(similarity, -k)[-k:]
+top_partition = candidates[np.argsort(similarity[candidates])[::-1]]
+print("argpartition:", documents[top_partition], similarity[top_partition])`} />
+
+<Callout type="ai" title="Why this matters for AI">
+This is the last step of every vector search. You compute a similarity for each of N candidates,
+then take the best k. `argsort` costs O(N log N); `argpartition` costs O(N) and then sorts only k
+items. At N = 1,000,000 and k = 10 that is a real saving on every single query — and the pattern
+generalises: `logits.argmax()` picks the next token, `argsort` ranks eval results, and the indices
+you get back are what you use to look up the actual documents.
+</Callout>
+
+## Assigning through a selection
+
+Indexing works on the left of an `=` too, and only the selected elements change:
+
+<Run id="np-idx-12" code={`import numpy as np
+
+scores = np.array([0.71, 0.88, 0.93, 0.42, 0.65])
+
+scores[scores < 0.5] = 0.0           # floor the failures
+print(scores)
+
+scores[[0, 2]] = [0.99, 0.99]        # set specific positions
+print(scores)
+
+batch = np.zeros((3, 4))
+batch[1, :] = 1.0                    # a whole row
+batch[:, 3] = 9.0                    # a whole column
+print(batch)`} />
+
+## Try it yourself
+
+<Exercise
+  id="np-idx-ex1"
+  title="Exercise 1"
+  brief="Set <code>top_docs</code> to the three highest-scoring document names, best first, and <code>top_scores</code> to their scores."
+  code={`import numpy as np
+
+documents = np.array(["intro", "guide", "api", "faq", "changelog", "tutorial"])
+similarity = np.array([0.71, 0.88, 0.93, 0.42, 0.65, 0.81])
+
+top_docs = None
+top_scores = None
+
+print(top_docs)
+print(top_scores)`}
+  hint="np.argsort gives ascending indices; reverse with [::-1] and take the first three, then use those indices on both arrays."
+  solution={`import numpy as np
+
+documents = np.array(["intro", "guide", "api", "faq", "changelog", "tutorial"])
+similarity = np.array([0.71, 0.88, 0.93, 0.42, 0.65, 0.81])
+
+order = np.argsort(similarity)[::-1][:3]
+top_docs = documents[order]
+top_scores = similarity[order]
+
+print(top_docs)
+print(top_scores)`}
+  tests={`import numpy as np
+
+assert isinstance(top_docs, np.ndarray), "top_docs should be a NumPy array of names."
+assert list(top_docs) == ["api", "guide", "tutorial"], (
+    f"Expected the three best documents, best first: api, guide, tutorial. Got {list(top_docs)}."
+)
+assert np.allclose(np.asarray(top_scores), [0.93, 0.88, 0.81]), (
+    f"top_scores should be the matching scores in the same order, got {top_scores!r}."
+)
+assert len(top_docs) == 3, f"Exactly three results, got {len(top_docs)}."`}
+/>
+
+<Exercise
+  id="np-idx-ex2"
+  title="Exercise 2"
+  brief="Keep only the rows of <code>embeddings</code> whose quality is at least 0.7 <em>and</em> whose length is under 2000. Put them in <code>kept</code>, and their ids in <code>kept_ids</code>."
+  code={`import numpy as np
+
+ids = np.array(["a", "b", "c", "d", "e"])
+embeddings = np.arange(20).reshape(5, 4).astype(np.float32)
+quality = np.array([0.9, 0.2, 0.75, 0.4, 0.95])
+length = np.array([120, 4300, 980, 75, 3200])
+
+mask = None
+kept = None
+kept_ids = None
+
+print(kept_ids)
+print(kept)`}
+  hint="Build the mask as (quality >= 0.7) & (length < 2000) — each comparison in its own parentheses — then index all three arrays with it."
+  solution={`import numpy as np
+
+ids = np.array(["a", "b", "c", "d", "e"])
+embeddings = np.arange(20).reshape(5, 4).astype(np.float32)
+quality = np.array([0.9, 0.2, 0.75, 0.4, 0.95])
+length = np.array([120, 4300, 980, 75, 3200])
+
+mask = (quality >= 0.7) & (length < 2000)
+kept = embeddings[mask]
+kept_ids = ids[mask]
+
+print(kept_ids)
+print(kept)`}
+  tests={`import numpy as np
+
+assert isinstance(mask, np.ndarray) and mask.dtype == bool, (
+    f"mask should be a boolean array, got {getattr(mask, 'dtype', type(mask))}."
+)
+assert list(mask) == [True, False, True, False, False], (
+    f"Only a and c satisfy both conditions. Got {list(mask)}."
+)
+assert list(kept_ids) == ["a", "c"], f"Expected ids a and c, got {list(kept_ids)}."
+assert kept.shape == (2, 4), f"Two rows of four columns should survive, got {kept.shape}."
+assert np.array_equal(kept, np.array([[0, 1, 2, 3], [8, 9, 10, 11]], dtype=np.float32)), (
+    f"The kept rows should be rows 0 and 2 of embeddings, got:\\n{kept}"
+)`}
+/>
+
+<Quiz
+  question="Why does (scores > 0.6) and (lengths > 100) raise ValueError, while & works?"
+  choices={[
+    { text: "`and` needs a single True or False, and an array of many values has no single truth value", correct: true, why: "Python's `and` calls bool() on its operand; NumPy refuses to guess for an array of more than one element." },
+    { text: "`and` is not defined for NumPy arrays at all", why: "It is defined — it just demands a scalar truth value, which is what fails." },
+    { text: "& is faster, so `and` was removed", why: "Nothing was removed; the two do genuinely different things." },
+    { text: "The arrays have different dtypes", why: "Both comparisons produce boolean arrays; the dtype is not the problem." },
+  ]}
+/>
+
+<Quiz
+  question="You need the 10 best of a million similarity scores. Why argpartition rather than argsort?"
+  choices={[
+    { text: "argpartition is O(N) and only the 10 you keep need sorting, while argsort orders all million", correct: true, why: "You pay to order 999,990 results you are about to throw away otherwise." },
+    { text: "argsort cannot handle a million elements", why: "It handles it fine — it just does more work than the question requires." },
+    { text: "argpartition returns values, argsort returns indices", why: "Both return indices; that is what the arg prefix means." },
+    { text: "argpartition guarantees the k results come back sorted", why: "It does not — that is why you sort the k you selected afterwards." },
+  ]}
+/>
+
+## Recap
+
+- Separate axes with a comma: `arr[row, column]`, and `...` fills in the axes you did not name.
+- Integer-array indexing picks arbitrary elements in any order, and copies.
+- A comparison gives a boolean mask; index with it to filter. Combine masks with `&`, `|` and
+  `~`, parenthesising each comparison — never `and`/`or`.
+- `np.where` chooses elementwise; with one argument it returns the matching indices.
+- `argmax`, `argsort` and `argpartition` return positions, so you can look them up in a parallel
+  array — the last step of every vector search.
+- Selections work on the left of `=`, changing only what they selected.

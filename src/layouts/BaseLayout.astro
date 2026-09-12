@@ -9,11 +9,18 @@ interface Props {
   description?: string;
   /** Lesson pages manage their own full-width shell. */
   bare?: boolean;
+  /**
+   * Social card, as a site-absolute path. Generated into public/og/ by
+   * scripts/generate-og-images.mjs; falls back to the site-wide card.
+   */
+  image?: string;
 }
 
-const { title, description = SITE.description, bare = false } = Astro.props;
+const { title, description = SITE.description, bare = false, image = "/og/default.png" } = Astro.props;
 const pageTitle = title ? `${title} · ${SITE.title}` : `${SITE.title} — ${SITE.tagline}`;
 const canonical = new URL(Astro.url.pathname, Astro.site);
+// Social clients will not follow a relative og:image, so make it absolute.
+const ogImage = new URL(withBase(image), Astro.site);
 ---
 
 <!doctype html>
@@ -31,10 +38,29 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
     <meta property="og:title" content={pageTitle} />
     <meta property="og:description" content={description} />
     <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:site_name" content={SITE.title} />
     <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content={ogImage} />
 
     <!-- Preconnect to the Pyodide CDN: the runtime download starts early. -->
     <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+
+    {
+      /* Cache the Python runtime so a second visit boots without the download.
+         Production only: a worker in front of the dev server breaks HMR. */
+      import.meta.env.PROD && (
+        <script is:inline define:vars={{ swUrl: withBase("/sw.js"), swScope: withBase("/") }}>
+          {`if ("serviceWorker" in navigator) {
+            addEventListener("load", () => {
+              navigator.serviceWorker.register(swUrl, { scope: swScope }).catch(() => {});
+            });
+          }`}
+        </script>
+      )
+    }
 
     <!-- Resolve the theme before first paint so there is no light-mode flash. -->
     <script is:inline>

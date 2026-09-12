@@ -1,7 +1,11 @@
 ---
 import { SITE, withBase } from "../lib/paths";
+import { searchIndex } from "../lib/search";
 import ThemeToggle from "./ThemeToggle.astro";
+import CommandPalette from "./CommandPalette.tsx";
 import { Github } from "./icons";
+
+const entries = await searchIndex();
 
 const path = Astro.url.pathname.replace(/\/$/, "");
 const links = [
@@ -28,11 +32,12 @@ const isActive = (link: (typeof links)[number]) =>
     </a>
 
     <nav class="ml-auto flex items-center gap-1 text-sm">
+      <CommandPalette client:idle entries={entries} />
       {
         links.map((link) => (
           <a
             href={link.href}
-            class="hover-nav rounded-lg px-2.5 py-1.5 font-medium transition-colors"
+            class="hover-nav hidden rounded-lg px-2.5 py-1.5 font-medium transition-colors sm:inline-block"
             style={`color: ${isActive(link) ? "var(--text)" : "var(--text-muted)"}; background: ${isActive(link) ? "var(--bg-sunken)" : "transparent"}`}
           >
             {link.label}
@@ -43,7 +48,7 @@ const isActive = (link: (typeof links)[number]) =>
         href={SITE.repo}
         target="_blank"
         rel="noopener noreferrer"
-        class="ml-1 rounded-lg p-2 transition-colors"
+        class="ml-1 hidden rounded-lg p-2 transition-colors sm:inline-block"
         style="color: var(--text-muted)"
         aria-label="View this course on GitHub"
       >

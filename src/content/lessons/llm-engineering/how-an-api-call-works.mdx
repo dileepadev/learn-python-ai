@@ -1,0 +1,485 @@
+---
+title: How an LLM API call actually works
+description: The request, the response and the statelessness — what you send, what comes back, and why the model has no memory between calls.
+module: llm-engineering
+order: 1
+level: advanced
+minutes: 18
+objectives:
+  - Describe the shape of a Messages API request and response
+  - Explain why the API is stateless, and what that costs
+  - Read stop_reason and handle each value
+  - Read the usage block and turn it into money
+  - Build a multi-turn conversation correctly
+---
+
+<Callout type="warning" title="How this module runs">
+The browser sandbox has no network access and nowhere safe to keep an API key, so the runnable
+code here calls a **recorded-response client** that mirrors the real SDK's shapes exactly. Every
+request you build and every response you take apart is the real structure; only the transport is
+substituted. The listings marked "on your own machine" are the real thing, after
+`pip install anthropic`.
+</Callout>
+
+## The request
+
+One HTTPS POST to `/v1/messages`, carrying JSON. That is the whole API — tools, streaming,
+caching and structured output are all fields on this one request.
+
+<Run id="llm-api-1" code={`import json
+
+request = {
+    "model": "claude-opus-5",
+    "max_tokens": 16000,
+    "system": "You are a terse assistant. Answer in one sentence.",
+    "messages": [
+        {"role": "user", "content": "What is a token?"},
+    ],
+}
+
+print(json.dumps(request, indent=2))`} />
+
+Four things to notice:
+
+- **`model`** names the exact model. It is not a family or an alias you can leave vague.
+- **`max_tokens`** is a hard ceiling on the *output*. Hit it and the reply stops mid-sentence.
+- **`system`** is its own top-level field, not a message. It carries operator authority.
+- **`messages`** alternates user and assistant turns, and must begin with `user`.
+
+On your own machine that request is:
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()          # reads ANTHROPIC_API_KEY from the environment
+
+response = client.messages.create(
+    model="claude-opus-5",
+    max_tokens=16000,
+    system="You are a terse assistant. Answer in one sentence.",
+    messages=[{"role": "user", "content": "What is a token?"}],
+)
+```
+
+<Callout type="warning">
+Never put the key in the source. `anthropic.Anthropic()` with no arguments reads it from the
+environment, which is what you want everywhere — a laptop, CI, a container. A key in a commit is a
+key you have to rotate.
+</Callout>
+
+## The response
+
+<Run id="llm-api-2" code={`from types import SimpleNamespace
+
+def recorded_response():
+    """The shape the SDK returns, reproduced field for field."""
+    return SimpleNamespace(
+        id="msg_01XcD4p9wQ2",
+        type="message",
+        role="assistant",
+        model="claude-opus-5",
+        content=[SimpleNamespace(type="text", text="A token is a chunk of text the model reads and writes as one unit.")],
+        stop_reason="end_turn",
+        stop_sequence=None,
+        usage=SimpleNamespace(
+            input_tokens=28,
+            output_tokens=17,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+    )
+
+response = recorded_response()
+
+print("id:         ", response.id)
+print("model:      ", response.model)
+print("role:       ", response.role)
+print("stop_reason:", response.stop_reason)
+print()
+print("content blocks:", len(response.content))
+for block in response.content:
+    print(f"  [{block.type}] {block.text}")
+print()
+print("usage:", vars(response.usage))`} />
+
+`content` is a **list of blocks**, not a string. A plain answer is one `text` block; a reply that
+calls a tool has `tool_use` blocks; a reply with thinking enabled has `thinking` blocks first. So
+always iterate and check `block.type` rather than reaching for `content[0].text`:
+
+<Run id="llm-api-3" code={`from types import SimpleNamespace
+
+response = SimpleNamespace(content=[
+    SimpleNamespace(type="thinking", thinking="The user wants a definition..."),
+    SimpleNamespace(type="text", text="A token is a chunk of text."),
+])
+
+# Fragile: assumes the first block is text.
+print("naive:", getattr(response.content[0], "text", "<no text on this block>"))
+
+# Correct:
+text = "".join(block.text for block in response.content if block.type == "text")
+print("correct:", text)`} />
+
+## stop_reason
+
+Always check it before trusting the content:
+
+<Run id="llm-api-4" code={`REASONS = {
+    "end_turn": "Finished naturally. Use the content.",
+    "max_tokens": "Ran out of room. The reply is truncated — raise max_tokens or stream.",
+    "stop_sequence": "Hit one of your stop_sequences.",
+    "tool_use": "Wants to call a tool. Execute it and send the result back.",
+    "pause_turn": "A long server-side tool turn paused. Send it back to continue.",
+    "refusal": "Declined on safety grounds. Check stop_details for the category.",
+}
+
+for reason, meaning in REASONS.items():
+    print(f"{reason:15} {meaning}")`} />
+
+<Run id="llm-api-5" code={`from types import SimpleNamespace
+
+def handle(response):
+    if response.stop_reason == "refusal":
+        category = getattr(response.stop_details, "category", None)
+        return f"declined ({category})"
+    if response.stop_reason == "max_tokens":
+        return "truncated — retry with a larger max_tokens"
+    if response.stop_reason == "tool_use":
+        return "needs a tool result before it can finish"
+    return "".join(b.text for b in response.content if b.type == "text")
+
+cases = [
+    SimpleNamespace(stop_reason="end_turn", stop_details=None,
+                    content=[SimpleNamespace(type="text", text="All done.")]),
+    SimpleNamespace(stop_reason="max_tokens", stop_details=None,
+                    content=[SimpleNamespace(type="text", text="It was the best of ti")]),
+    SimpleNamespace(stop_reason="refusal",
+                    stop_details=SimpleNamespace(type="refusal", category="cyber"),
+                    content=[]),
+]
+
+for case in cases:
+    print(f"{case.stop_reason:12} -> {handle(case)}")`} />
+
+<Callout type="warning">
+`stop_details` is populated **only** when `stop_reason` is `"refusal"`, and is `None` otherwise —
+so guard before reading it. And a truncated `max_tokens` reply is not an error: you get HTTP 200
+and a plausible-looking half-sentence.
+</Callout>
+
+## The API is stateless
+
+The server keeps nothing between calls. Whatever the model appears to "remember" is in the
+`messages` list you resent:
+
+<Run id="llm-api-6" code={`class RecordedClient:
+    """Answers from a fixture, but reads the request exactly as the real API would."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.requests = []
+
+    def create(self, *, model, max_tokens, messages, system=None):
+        self.requests.append({"messages": [dict(m) for m in messages], "system": system})
+        return self.replies.pop(0)
+
+client = RecordedClient([
+    "Hello Dileepa, nice to meet you.",
+    "Your name is Dileepa.",
+])
+
+messages = []
+
+def ask(question):
+    messages.append({"role": "user", "content": question})
+    reply = client.create(model="claude-opus-5", max_tokens=1024, messages=messages)
+    messages.append({"role": "assistant", "content": reply})
+    return reply
+
+print(ask("My name is Dileepa."))
+print(ask("What is my name?"))
+
+print()
+print("what the second request actually carried:")
+for turn in client.requests[1]["messages"]:
+    print(f"  {turn['role']:9} {turn['content']}")`} />
+
+The second request carried three turns. The model did not recall the name — it read it, again.
+
+<Callout type="ai" title="Why this matters for AI">
+Statelessness is the fact that shapes the cost of every conversational system you build. Turn
+twenty resends turns one to nineteen, so input tokens grow quadratically with conversation
+length: a chat that feels cheap at the start is expensive by the end, and eventually hits the
+context window. Every technique later in this module — prompt caching, summarisation,
+compaction, retrieval instead of stuffing — exists to manage that one consequence.
+</Callout>
+
+<Run id="llm-api-7" code={`def tokens_for_turn(turn_number, tokens_per_turn=200):
+    """Input tokens for turn N when the whole history is resent each time."""
+    return turn_number * tokens_per_turn
+
+total = 0
+print(f"{'turn':>5} {'input tokens':>13} {'cumulative':>12}")
+for turn in [1, 5, 10, 20, 50]:
+    running = sum(tokens_for_turn(t) for t in range(1, turn + 1))
+    print(f"{turn:>5} {tokens_for_turn(turn):>13,} {running:>12,}")
+
+fifty_turns = sum(tokens_for_turn(t) for t in range(1, 51))
+print()
+print(f"a 50-turn chat costs {fifty_turns:,} input tokens, not {50 * 200:,}")`} />
+
+## Usage, and what it costs
+
+<Run id="llm-api-8" code={`# Published rates, US dollars per million tokens.
+PRICING = {
+    "claude-opus-5":     {"input": 5.00,  "output": 25.00},
+    "claude-sonnet-5":   {"input": 2.00,  "output": 10.00},
+    "claude-haiku-4-5":  {"input": 1.00,  "output": 5.00},
+}
+
+def cost(model, input_tokens, output_tokens):
+    rates = PRICING[model]
+    return (input_tokens * rates["input"] + output_tokens * rates["output"]) / 1_000_000
+
+usage = {"input_tokens": 12_400, "output_tokens": 850}
+
+print(f"{'model':<18} {'cost':>10}  {'per 10k calls':>15}")
+for model in PRICING:
+    one = cost(model, usage["input_tokens"], usage["output_tokens"])
+    print(f"{model:<18} {one:>10.5f}  {one * 10_000:>14.2f}")`} />
+
+Output tokens cost about five times what input tokens cost, on every model. A prompt that asks
+for a short answer is cheaper twice over — fewer output tokens now, and a shorter history to
+resend later.
+
+## A conversation, properly
+
+<Run id="llm-api-9" code={`from types import SimpleNamespace
+
+class RecordedClient:
+    def __init__(self, replies):
+        self.replies = list(replies)
+
+    def create(self, **request):
+        text = self.replies.pop(0)
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=text)],
+            stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=40 * len(request["messages"]), output_tokens=20),
+        )
+
+class Conversation:
+    def __init__(self, client, system=None, model="claude-opus-5"):
+        self.client = client
+        self.system = system
+        self.model = model
+        self.messages = []
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    def ask(self, question):
+        self.messages.append({"role": "user", "content": question})
+        response = self.client.create(
+            model=self.model,
+            max_tokens=16000,
+            system=self.system,
+            messages=self.messages,
+        )
+        if response.stop_reason == "refusal":
+            self.messages.pop()
+            return "[declined]"
+
+        # Append the content blocks, not the extracted string: a reply may hold
+        # thinking or tool_use blocks the next turn needs to see.
+        self.messages.append({"role": "assistant", "content": response.content})
+        self.input_tokens += response.usage.input_tokens
+        self.output_tokens += response.usage.output_tokens
+        return "".join(b.text for b in response.content if b.type == "text")
+
+chat = Conversation(
+    RecordedClient(["Retrieval augmented generation.", "It grounds answers in your documents."]),
+    system="Answer in one short sentence.",
+)
+
+print(chat.ask("What does RAG stand for?"))
+print(chat.ask("Why use it?"))
+print()
+print("turns stored:", len(chat.messages))
+print(f"tokens: {chat.input_tokens} in, {chat.output_tokens} out")`} />
+
+<Callout type="tip">
+Append `response.content` — the list of blocks — to the history, not the extracted text. Once
+thinking, tool use or compaction are involved, the blocks you dropped are exactly the ones the
+next request needed.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="llm-api-ex1"
+  title="Exercise 1"
+  brief="Write <code>extract_text(response)</code>: join the text of every <code>text</code> block, ignoring all other block types, and return an empty string when there are none."
+  code={`from types import SimpleNamespace
+
+def extract_text(response):
+    # Join the .text of every block whose .type is "text".
+    # Ignore thinking, tool_use and anything else.
+    ...
+
+
+mixed = SimpleNamespace(content=[
+    SimpleNamespace(type="thinking", thinking="considering..."),
+    SimpleNamespace(type="text", text="Hello, "),
+    SimpleNamespace(type="tool_use", name="search", input={"q": "rag"}),
+    SimpleNamespace(type="text", text="world."),
+])
+
+print(repr(extract_text(mixed)))`}
+  hint='"".join(block.text for block in response.content if block.type == "text")'
+  solution={`from types import SimpleNamespace
+
+def extract_text(response):
+    return "".join(block.text for block in response.content if block.type == "text")
+
+
+mixed = SimpleNamespace(content=[
+    SimpleNamespace(type="thinking", thinking="considering..."),
+    SimpleNamespace(type="text", text="Hello, "),
+    SimpleNamespace(type="tool_use", name="search", input={"q": "rag"}),
+    SimpleNamespace(type="text", text="world."),
+])
+
+print(repr(extract_text(mixed)))`}
+  tests={`from types import SimpleNamespace
+
+mixed = SimpleNamespace(content=[
+    SimpleNamespace(type="thinking", thinking="considering..."),
+    SimpleNamespace(type="text", text="Hello, "),
+    SimpleNamespace(type="tool_use", name="search", input={"q": "rag"}),
+    SimpleNamespace(type="text", text="world."),
+])
+assert extract_text(mixed) == "Hello, world.", (
+    f"Expected the two text blocks joined, got {extract_text(mixed)!r}."
+)
+
+only_tool = SimpleNamespace(content=[SimpleNamespace(type="tool_use", name="x", input={})])
+assert extract_text(only_tool) == "", (
+    f"A reply with no text blocks should give an empty string, got {extract_text(only_tool)!r}."
+)
+
+assert extract_text(SimpleNamespace(content=[])) == "", "No blocks at all means no text."
+
+single = SimpleNamespace(content=[SimpleNamespace(type="text", text="just one")])
+assert extract_text(single) == "just one", "A single text block should come back unchanged."
+
+# It must not crash on a block that has no .text attribute.
+odd = SimpleNamespace(content=[
+    SimpleNamespace(type="thinking", thinking="no text attribute here"),
+    SimpleNamespace(type="text", text="fine"),
+])
+assert extract_text(odd) == "fine", (
+    "Check block.type before reading block.text — a thinking block has no .text."
+)`}
+/>
+
+<Exercise
+  id="llm-api-ex2"
+  title="Exercise 2"
+  brief="Write <code>call_cost(model, usage)</code> returning the dollar cost of one call, and <code>monthly(model, usage, calls)</code> for that many calls a month."
+  code={`PRICING = {
+    "claude-opus-5":    {"input": 5.00,  "output": 25.00},
+    "claude-sonnet-5":  {"input": 2.00,  "output": 10.00},
+    "claude-haiku-4-5": {"input": 1.00,  "output": 5.00},
+}
+
+def call_cost(model, usage):
+    # usage is a dict with input_tokens and output_tokens.
+    # Rates are dollars per million tokens.
+    ...
+
+
+def monthly(model, usage, calls):
+    ...
+
+
+usage = {"input_tokens": 12_400, "output_tokens": 850}
+for model in PRICING:
+    print(f"{model:<18} {call_cost(model, usage):.5f}  {monthly(model, usage, 100_000):.2f}")`}
+  hint="(input_tokens * rate_in + output_tokens * rate_out) / 1_000_000, and monthly is that times the number of calls."
+  solution={`PRICING = {
+    "claude-opus-5":    {"input": 5.00,  "output": 25.00},
+    "claude-sonnet-5":  {"input": 2.00,  "output": 10.00},
+    "claude-haiku-4-5": {"input": 1.00,  "output": 5.00},
+}
+
+def call_cost(model, usage):
+    rates = PRICING[model]
+    return (usage["input_tokens"] * rates["input"]
+            + usage["output_tokens"] * rates["output"]) / 1_000_000
+
+
+def monthly(model, usage, calls):
+    return call_cost(model, usage) * calls
+
+
+usage = {"input_tokens": 12_400, "output_tokens": 850}
+for model in PRICING:
+    print(f"{model:<18} {call_cost(model, usage):.5f}  {monthly(model, usage, 100_000):.2f}")`}
+  tests={`usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
+
+assert abs(call_cost("claude-opus-5", usage) - 30.0) < 1e-9, (
+    f"A million in and a million out on Opus 5 is $5 + $25 = $30, got "
+    f"{call_cost('claude-opus-5', usage)}."
+)
+assert abs(call_cost("claude-haiku-4-5", usage) - 6.0) < 1e-9, (
+    f"Haiku 4.5 is $1 + $5 = $6, got {call_cost('claude-haiku-4-5', usage)}."
+)
+
+small = {"input_tokens": 12_400, "output_tokens": 850}
+expected = (12_400 * 5.00 + 850 * 25.00) / 1_000_000
+assert abs(call_cost("claude-opus-5", small) - expected) < 1e-12, (
+    f"Expected {expected:.6f}, got {call_cost('claude-opus-5', small)}."
+)
+
+assert abs(monthly("claude-opus-5", small, 100_000) - expected * 100_000) < 1e-6, (
+    "monthly should be the per-call cost times the number of calls."
+)
+assert abs(monthly("claude-sonnet-5", small, 0)) < 1e-12, "Zero calls cost nothing."
+
+# Output tokens must be the expensive ones.
+in_heavy = {"input_tokens": 1000, "output_tokens": 0}
+out_heavy = {"input_tokens": 0, "output_tokens": 1000}
+assert call_cost("claude-opus-5", out_heavy) > call_cost("claude-opus-5", in_heavy), (
+    "Output tokens cost five times what input tokens do — check which rate goes where."
+)`}
+/>
+
+<Quiz
+  question="Why does the input token count grow with every turn of a conversation?"
+  choices={[
+    { text: "The API is stateless, so the whole history is resent on each request", correct: true, why: "The server keeps nothing between calls; every apparent memory is text you sent again, and you pay for it again." },
+    { text: "The model stores the conversation and charges rent on it", why: "Nothing is stored server-side — that is exactly what statelessness means." },
+    { text: "Because max_tokens accumulates across turns", why: "max_tokens caps a single response's output and resets every call." },
+    { text: "It does not — only output tokens grow", why: "Output stays roughly constant per turn; it is the resent input that grows." },
+  ]}
+/>
+
+<Quiz
+  question="A reply comes back with stop_reason 'max_tokens'. What happened, and what should your code do?"
+  choices={[
+    { text: "The output hit its ceiling and is truncated mid-thought — retry with a larger max_tokens or stream", correct: true, why: "It is a successful HTTP 200 with an incomplete answer, so nothing raises; only stop_reason tells you." },
+    { text: "The request was too long for the context window", why: "That is a 400 on the request, not a stop_reason on a successful response." },
+    { text: "The model refused", why: "That is stop_reason 'refusal', with a stop_details category." },
+    { text: "Nothing — the reply is complete", why: "It is complete only in the sense that generation stopped; the sentence is cut off." },
+  ]}
+/>
+
+## Recap
+
+- Everything is one POST to `/v1/messages`: `model`, `max_tokens`, `system` and `messages`.
+- `content` is a list of typed blocks — iterate and check `block.type` rather than indexing.
+- Check `stop_reason` before trusting the content; `stop_details` exists only for `"refusal"`.
+- The API is stateless, so a conversation resends its whole history and input tokens grow
+  quadratically with its length.
+- Output tokens cost about five times input tokens.
+- Append `response.content` to the history, not the extracted string.

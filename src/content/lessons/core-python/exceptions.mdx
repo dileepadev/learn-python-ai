@@ -1,0 +1,424 @@
+---
+title: Exceptions and defensive code
+description: try, except, else and finally — plus custom exception classes, chaining with raise from, and the retry loop every API client eventually needs.
+module: core-python
+order: 6
+level: intermediate
+minutes: 18
+objectives:
+  - Catch specific exceptions and explain why a bare except is a bug
+  - Use else and finally correctly
+  - Raise your own exceptions, including custom classes
+  - Preserve the original cause with raise ... from
+  - Write a retry loop that distinguishes retryable failures from permanent ones
+---
+
+Code that talks to the outside world fails. Files go missing, JSON arrives malformed, an API
+returns 429. Exceptions are how Python reports that, and handling them precisely is the
+difference between a pipeline that recovers and one that hides a bug for a week.
+
+## try and except
+
+<Run id="cp-exc-1" code={`raw = ["412", "not-a-number", "980"]
+
+for value in raw:
+    try:
+        print(int(value))
+    except ValueError:
+        print(f"  could not parse {value!r}")
+
+print("still running")`} />
+
+Catch the exception you expect, by name. Which name? Let the failure tell you:
+
+<Run id="cp-exc-2" code={`attempts = [
+    lambda: int("abc"),
+    lambda: {"a": 1}["b"],
+    lambda: [1, 2][9],
+    lambda: 1 / 0,
+    lambda: None.upper(),
+]
+
+for attempt in attempts:
+    try:
+        attempt()
+    except Exception as error:
+        print(f"{type(error).__name__:18} {error}")`} />
+
+## Never catch everything
+
+<Run id="cp-exc-3" code={`def parse(value):
+    try:
+        return int(value)
+    except Exception:          # too broad
+        return 0
+
+print(parse("412"))
+print(parse("oops"))
+print(parse(None))             # a TypeError, silently turned into 0`} />
+
+`except Exception` swallows the typo in your own code just as happily as the malformed input it
+was meant for. Name what you expect:
+
+<Run id="cp-exc-4" code={`def parse(value, default=0):
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+print(parse("412"), parse("oops"), parse(None), parse("7", default=-1))`} />
+
+<Callout type="warning">
+A bare `except:` is worse still — it also catches `KeyboardInterrupt` and `SystemExit`, so
+Ctrl+C stops working and a long job becomes unkillable. If you genuinely need a catch-all, write
+`except Exception:` and re-raise after logging.
+</Callout>
+
+## else and finally
+
+`else` runs when nothing was raised. `finally` runs either way, and is where cleanup goes:
+
+<Run id="cp-exc-5" code={`def load(value):
+    print(f"load({value!r})")
+    try:
+        number = int(value)
+    except ValueError:
+        print("  except: could not parse")
+        return None
+    else:
+        print("  else:   parsed cleanly")
+        return number
+    finally:
+        print("  finally: runs no matter what")
+
+print("->", load("412"))
+print()
+print("->", load("oops"))`} />
+
+Keeping the risky line alone in the `try` and the rest in `else` is what stops you catching an
+exception you never meant to:
+
+<Run id="cp-exc-6" code={`records = {"a": "412"}
+
+# Too much inside try: a typo in the second line would look like a KeyError.
+try:
+    raw = records["a"]
+    doubled = int(raw) * 2
+except KeyError:
+    doubled = 0
+
+print(doubled)
+
+# Precise: only the lookup is guarded.
+try:
+    raw = records["missing"]
+except KeyError:
+    doubled = 0
+else:
+    doubled = int(raw) * 2
+
+print(doubled)`} />
+
+## Raising
+
+Raise when a caller has given you something you cannot work with:
+
+<Run id="cp-exc-7" code={`def chunk(text, size):
+    if size <= 0:
+        raise ValueError(f"size must be positive, got {size}")
+    words = text.split()
+    return [" ".join(words[i:i + size]) for i in range(0, len(words), size)]
+
+print(chunk("one two three four", 2))
+
+try:
+    chunk("one two", 0)
+except ValueError as error:
+    print("refused:", error)`} />
+
+Pick the exception that already means what you mean: `ValueError` for a bad value,
+`TypeError` for a bad type, `KeyError` for a missing key, `FileNotFoundError` for a missing file.
+
+## Your own exception classes
+
+When callers need to handle *your* failure specifically, give it a class. A shared base class
+lets them catch the whole family at once:
+
+<Run id="cp-exc-8" code={`class RetrievalError(Exception):
+    """Anything that went wrong while retrieving context."""
+
+class IndexMissing(RetrievalError):
+    pass
+
+class NoResults(RetrievalError):
+    def __init__(self, query, searched):
+        super().__init__(f"no results for {query!r} across {searched} documents")
+        self.query = query
+        self.searched = searched
+
+def search(query, index=None):
+    if index is None:
+        raise IndexMissing("build the index before searching")
+    if query not in index:
+        raise NoResults(query, len(index))
+    return index[query]
+
+for call in [lambda: search("rag"), lambda: search("rag", {"llm": 1})]:
+    try:
+        call()
+    except NoResults as error:
+        print(f"NoResults: {error} (query={error.query!r})")
+    except RetrievalError as error:
+        print(f"{type(error).__name__}: {error}")`} />
+
+## raise ... from
+
+When you catch one failure and raise another, `from` keeps the original attached, so the
+traceback shows both. Without it, the real cause is guesswork:
+
+<Run id="cp-exc-9" code={`import json
+
+class MalformedResponse(Exception):
+    pass
+
+def parse_reply(text):
+    try:
+        return json.loads(text)["content"]
+    except json.JSONDecodeError as error:
+        raise MalformedResponse("the model did not return JSON") from error
+    except KeyError as error:
+        raise MalformedResponse("the reply has no content field") from error
+
+for reply in ['{"content": "hello"}', 'not json at all', '{"usage": {}}']:
+    try:
+        print("ok:", parse_reply(reply))
+    except MalformedResponse as error:
+        print(f"failed: {error}  <- caused by {type(error.__cause__).__name__}")`} />
+
+## Ask forgiveness, not permission
+
+Python prefers trying the operation to checking first. Checking first is both slower and racy —
+the file can vanish between the check and the open:
+
+<Run id="cp-exc-10" code={`from pathlib import Path
+
+Path("config.json").write_text('{"model": "claude-opus-5"}')
+
+# Look before you leap: two operations, and a gap between them.
+if Path("config.json").exists():
+    print("LBYL:", Path("config.json").read_text())
+
+# Easier to ask forgiveness: one operation, no gap.
+try:
+    print("EAFP:", Path("missing.json").read_text())
+except FileNotFoundError:
+    print("EAFP: no config, using defaults")`} />
+
+## A retry loop
+
+The pattern you will write for every API client. The point is that only *some* failures are
+worth retrying:
+
+<Run id="cp-exc-11" code={`import time
+
+class RateLimited(Exception):
+    pass
+
+class Overloaded(Exception):
+    pass
+
+class InvalidRequest(Exception):
+    pass
+
+RETRYABLE = (RateLimited, Overloaded)
+
+# A stand-in for the API: fails twice, then succeeds.
+calls = {"n": 0}
+def fake_api(prompt):
+    calls["n"] += 1
+    if calls["n"] == 1:
+        raise RateLimited("429")
+    if calls["n"] == 2:
+        raise Overloaded("529")
+    return f"reply to {prompt!r}"
+
+def call_with_retry(prompt, attempts=4, base_delay=0.01):
+    for attempt in range(1, attempts + 1):
+        try:
+            return fake_api(prompt)
+        except RETRYABLE as error:
+            if attempt == attempts:
+                raise
+            delay = base_delay * 2 ** (attempt - 1)
+            print(f"  attempt {attempt} hit {type(error).__name__}, waiting {delay:.3f}s")
+            time.sleep(delay)
+        except InvalidRequest:
+            raise           # never retry a request that is simply wrong
+
+print(call_with_retry("Summarise this"))
+print("total calls:", calls["n"])`} />
+
+<Callout type="ai" title="Why this matters for AI">
+Model APIs fail in two completely different ways. A 429 or 529 is the service saying "later" —
+retry with exponential backoff and it usually succeeds. A 400 is the service saying "never" —
+your prompt is too long or your tool schema is invalid, and retrying burns money and time to get
+the same answer. Splitting failures into retryable and permanent, as `RETRYABLE` does above, is
+the single most valuable thing you can do to a production LLM client.
+</Callout>
+
+## Reading a traceback
+
+Read it bottom-up: the last line is what went wrong, and the frame above it is where:
+
+<Run id="cp-exc-12" code={`import traceback
+
+def load_config(path):
+    return parse(open_file(path))
+
+def open_file(path):
+    return "{ not json"
+
+def parse(text):
+    import json
+    return json.loads(text)
+
+try:
+    load_config("config.json")
+except Exception:
+    print(traceback.format_exc())`} />
+
+## Try it yourself
+
+<Exercise
+  id="cp-exc-ex1"
+  title="Exercise 1"
+  brief="Write <code>to_float(value, default=0.0)</code>: return the value as a float, or <code>default</code> when it cannot be converted. Catch only the exceptions that conversion actually raises."
+  code={`def to_float(value, default=0.0):
+    # Convert value to a float. If it cannot be converted, return default.
+    # Catch only ValueError and TypeError — nothing broader.
+    ...
+
+
+for value in ["0.88", "n/a", None, 7, "", "1e-3"]:
+    print(repr(value), "->", to_float(value))`}
+  hint="try: return float(value) / except (ValueError, TypeError): return default"
+  solution={`def to_float(value, default=0.0):
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+for value in ["0.88", "n/a", None, 7, "", "1e-3"]:
+    print(repr(value), "->", to_float(value))`}
+  tests={`assert to_float("0.88") == 0.88, "A numeric string should convert."
+assert to_float("1e-3") == 0.001, "Scientific notation is valid for float()."
+assert to_float(7) == 7.0, "An int should convert to a float."
+assert to_float("n/a") == 0.0, f"An unparsable string should give the default, got {to_float('n/a')!r}."
+assert to_float(None) == 0.0, "None raises TypeError, which should also fall back to the default."
+assert to_float("") == 0.0, "An empty string raises ValueError."
+assert to_float("x", default=-1.0) == -1.0, "The default should be respected."
+
+# The catch must be specific: a KeyboardInterrupt should still get through.
+class Odd:
+    def __float__(self):
+        raise KeyboardInterrupt
+try:
+    to_float(Odd())
+except KeyboardInterrupt:
+    pass
+else:
+    raise AssertionError(
+        "Catch only ValueError and TypeError — a broad except swallows things it should not."
+    )`}
+/>
+
+<Exercise
+  id="cp-exc-ex2"
+  title="Exercise 2"
+  brief="Complete <code>extract_text</code>: raise <code>MalformedResponse</code> for a reply that is not JSON or has no <code>content</code> key, keeping the original exception as the cause."
+  code={`import json
+
+class MalformedResponse(Exception):
+    pass
+
+def extract_text(raw):
+    # Parse raw as JSON and return its "content" value.
+    # On a JSONDecodeError or a KeyError, raise MalformedResponse
+    # with the original error attached using "from".
+    ...
+
+
+print(extract_text('{"content": "hello"}'))`}
+  hint="Two except clauses, each ending in: raise MalformedResponse(...) from error"
+  solution={`import json
+
+class MalformedResponse(Exception):
+    pass
+
+def extract_text(raw):
+    try:
+        return json.loads(raw)["content"]
+    except json.JSONDecodeError as error:
+        raise MalformedResponse("not JSON") from error
+    except KeyError as error:
+        raise MalformedResponse("no content field") from error
+
+
+print(extract_text('{"content": "hello"}'))`}
+  tests={`import json
+
+assert extract_text('{"content": "hi"}') == "hi", "A well-formed reply should return its content."
+
+try:
+    extract_text("not json")
+except MalformedResponse as error:
+    assert isinstance(error.__cause__, json.JSONDecodeError), (
+        "Use 'raise MalformedResponse(...) from error' so the JSONDecodeError stays attached "
+        f"as __cause__. Got {type(error.__cause__).__name__}."
+    )
+else:
+    raise AssertionError("Invalid JSON should raise MalformedResponse.")
+
+try:
+    extract_text('{"usage": {}}')
+except MalformedResponse as error:
+    assert isinstance(error.__cause__, KeyError), (
+        "A missing content key should raise MalformedResponse from the KeyError. "
+        f"Got {type(error.__cause__).__name__}."
+    )
+else:
+    raise AssertionError("A reply with no content field should raise MalformedResponse.")`}
+/>
+
+<Quiz
+  question="An API client retries every exception it sees, up to five times. What is the cost of that?"
+  choices={[
+    { text: "Nothing — retrying is always safe", why: "Retrying a permanent failure cannot succeed, and for a paid API it is charged each time." },
+    { text: "Permanent failures like an invalid request are retried pointlessly, costing time and money", correct: true, why: "A 400 will fail identically every time; only transient failures such as 429 and 529 are worth repeating." },
+    { text: "It makes rate limiting worse but is otherwise harmless", why: "It also hides real bugs: a TypeError in your own code gets retried and then reported as a network problem." },
+    { text: "Python forbids retrying more than three times", why: "There is no such limit; the discipline has to come from your code." },
+  ]}
+/>
+
+<Quiz
+  question="What does the `from error` in `raise MalformedResponse('bad') from error` do?"
+  choices={[
+    { text: "Re-raises the original error instead", why: "The new exception is what propagates; the original is attached to it, not substituted for it." },
+    { text: "Sets __cause__ so the traceback shows both what failed and what caused it", correct: true, why: "Without it the traceback says 'During handling of the above exception, another occurred' and the link is only implicit." },
+    { text: "Suppresses the original traceback", why: "That is `from None`, which deliberately hides the cause — the opposite of this." },
+    { text: "Converts the original exception's type", why: "Types are unchanged; you simply get a new exception that remembers its cause." },
+  ]}
+/>
+
+## Recap
+
+- Catch the specific exception you expect. `except Exception` hides your own bugs; a bare
+  `except:` also breaks Ctrl+C.
+- Keep the risky line alone in `try`, put the follow-on work in `else`, and put cleanup in
+  `finally`.
+- Raise the built-in that already means what you mean; define a class when callers need to
+  handle your failure specifically, with a shared base for the family.
+- `raise X from error` keeps the original cause in the traceback.
+- Python prefers trying over checking — one operation, no race.
+- Split API failures into retryable and permanent, and back off exponentially between attempts.

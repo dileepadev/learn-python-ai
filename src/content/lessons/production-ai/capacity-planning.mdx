@@ -1,0 +1,431 @@
+---
+title: Cost, latency and capacity planning
+description: Turn a product requirement into concurrency, a rate-limit headroom figure and a monthly bill — before you build it, and in numbers you can defend.
+module: production-ai
+order: 9
+level: expert
+minutes: 22
+objectives:
+  - Report latency as percentiles, and separate time-to-first-token from total
+  - Size concurrency from throughput and latency with Little's law
+  - Build a cost model per request, per user and per month
+  - Check the plan against the rate limits you actually have
+  - Show what caching and model choice do to the total
+---
+
+The last lesson of the course is the one that decides whether a system ships. Everything before it
+makes an AI system work; this makes it affordable and fast enough to matter.
+
+## Latency is a distribution
+
+<Run id="prod-cap-1" code={`import numpy as np
+
+rng = np.random.default_rng(0)
+# A realistic mixture: cached, ordinary, and a slow tail.
+latency = np.concatenate([
+    rng.normal(400, 80, 200),        # cache hits
+    rng.normal(2200, 500, 700),      # ordinary
+    rng.normal(7000, 1500, 100),     # long prompts, retries, slow tool calls
+]).clip(50, None)
+
+for label, value in [
+    ("mean", latency.mean()),
+    ("p50", np.quantile(latency, 0.50)),
+    ("p90", np.quantile(latency, 0.90)),
+    ("p95", np.quantile(latency, 0.95)),
+    ("p99", np.quantile(latency, 0.99)),
+    ("max", latency.max()),
+]:
+    print(f"{label:>5} {value / 1000:8.2f} s")
+
+print()
+print(f"users slower than the mean: {(latency > latency.mean()).mean():.1%}")`} />
+
+A third of users are slower than the "average", and the p99 is fifteen times the p50. Report
+percentiles; a mean of an AI workload describes nobody.
+
+<Run id="prod-cap-2" code={`import matplotlib.pyplot as plt
+import numpy as np
+
+rng = np.random.default_rng(0)
+latency = np.concatenate([
+    rng.normal(400, 80, 200), rng.normal(2200, 500, 700), rng.normal(7000, 1500, 100),
+]).clip(50, None) / 1000
+
+fig, ax = plt.subplots(figsize=(7, 3.4))
+ax.hist(latency, bins=60)
+for quantile, colour in [(0.5, "#22c55e"), (0.95, "#f59e0b"), (0.99, "#ef4444")]:
+    value = np.quantile(latency, quantile)
+    ax.axvline(value, color=colour, linewidth=2, label=f"p{int(quantile * 100)} = {value:.1f}s")
+ax.set_xlabel("seconds")
+ax.set_ylabel("requests")
+ax.set_title("Request latency")
+ax.legend()`} />
+
+## Two latencies, not one
+
+<Run id="prod-cap-3" code={`SCENARIOS = [
+    ("Non-streaming", 0, 6.2, "The user sees nothing for 6.2 seconds. It feels broken."),
+    ("Streaming", 0.7, 6.2, "First words at 0.7s. The same total, a completely different feel."),
+]
+
+print(f"{'mode':<15} {'first token':>12} {'complete':>10}  experience")
+for mode, first, total, note in SCENARIOS:
+    shown = f"{first:.1f}s" if first else "-"
+    print(f"{mode:<15} {shown:>12} {total:>9.1f}s  {note}")
+
+print()
+print("Budget them separately. Time-to-first-token is a UX number;")
+print("total time is a throughput and cost number.")`} />
+
+## Little's law
+
+The one piece of queueing theory worth memorising: **concurrency = throughput × latency**.
+
+<Run id="prod-cap-4" code={`def concurrency_needed(requests_per_second, seconds_per_request):
+    return requests_per_second * seconds_per_request
+
+print(f"{'req/s':>7} {'latency':>9} {'in flight':>11}")
+for rate, latency in [(1, 2.0), (5, 2.0), (5, 8.0), (20, 2.0), (50, 3.5)]:
+    print(f"{rate:>7} {latency:>8.1f}s {concurrency_needed(rate, latency):>11.0f}")
+
+print()
+peak_rate, p95 = 12, 4.0
+needed = concurrency_needed(peak_rate, p95)
+print(f"At {peak_rate} requests/second with a p95 of {p95}s you need {needed:.0f} in flight.")
+print("Size for the p95, not the median — the slow requests are the ones occupying slots.")`} />
+
+It runs backwards too, which is usually the more useful direction:
+
+<Run id="prod-cap-5" code={`def throughput(concurrency, seconds_per_request):
+    return concurrency / seconds_per_request
+
+limit = 20            # concurrency your rate limit allows
+print(f"with a concurrency limit of {limit}:")
+for latency in [0.5, 2.0, 4.0, 10.0]:
+    rate = throughput(limit, latency)
+    print(f"  latency {latency:>5.1f}s -> {rate:>6.1f} req/s  ({rate * 3600:>8,.0f} per hour)")
+
+print()
+print("Latency and throughput are the same constraint seen twice. Halving latency")
+print("doubles throughput at the same concurrency — and costs nothing extra.")`} />
+
+<Callout type="warning">
+A queue in front of a saturated service does not add capacity; it converts rejection into
+latency. If arrivals exceed `concurrency / latency` for any sustained period the queue grows
+without bound, and users wait longer and longer for a request that will eventually time out
+anyway. Shed load, or add concurrency.
+</Callout>
+
+## A cost model
+
+<Run id="prod-cap-6" code={`PRICING = {
+    "claude-opus-5":    {"input": 5.00,  "output": 25.00},
+    "claude-sonnet-5":  {"input": 2.00,  "output": 10.00},
+    "claude-haiku-4-5": {"input": 1.00,  "output": 5.00},
+}
+CACHE_WRITE, CACHE_READ = 1.25, 0.10
+
+def request_cost(model, *, fresh_input, cached_input, output, cache_writes=0):
+    rates = PRICING[model]
+    return (
+        fresh_input * rates["input"]
+        + cached_input * rates["input"] * CACHE_READ
+        + cache_writes * rates["input"] * CACHE_WRITE
+        + output * rates["output"]
+    ) / 1_000_000
+
+# One RAG answer: a big stable system prompt, retrieved context, a short reply.
+shape = {"fresh_input": 1_200, "cached_input": 6_000, "output": 180}
+
+print(f"{'model':<18} {'per request':>12} {'per 1k users/day':>18} {'per month':>12}")
+for model in PRICING:
+    one = request_cost(model, **shape)
+    daily = one * 1_000 * 8          # 1000 users, 8 requests a day each
+    print(f"{model:<18} {one:>12.5f} {daily:>18.2f} {daily * 30:>12.2f}")`} />
+
+<Run id="prod-cap-7" code={`PRICING = {"claude-opus-5": {"input": 5.00, "output": 25.00}}
+
+def cost(fresh, cached, output, writes=0):
+    r = PRICING["claude-opus-5"]
+    return (fresh * r["input"] + cached * r["input"] * 0.10
+            + writes * r["input"] * 1.25 + output * r["output"]) / 1_000_000
+
+monthly_requests = 1_000 * 8 * 30
+
+scenarios = [
+    ("no caching", cost(7_200, 0, 180)),
+    ("caching, 90% hit rate", 0.9 * cost(1_200, 6_000, 180) + 0.1 * cost(1_200, 0, 180, writes=6_000)),
+    ("caching + shorter answers", 0.9 * cost(1_200, 6_000, 90) + 0.1 * cost(1_200, 0, 90, writes=6_000)),
+    ("...and half the retrieved context", 0.9 * cost(1_200, 3_000, 90) + 0.1 * cost(1_200, 0, 90, writes=3_000)),
+]
+
+baseline = scenarios[0][1] * monthly_requests
+print(f"{'scenario':<34} {'per request':>12} {'per month':>11} {'saving':>8}")
+for name, per_request in scenarios:
+    monthly = per_request * monthly_requests
+    print(f"{name:<34} {per_request:>12.5f} {monthly:>10.2f} {1 - monthly / baseline:>8.0%}")`} />
+
+Three changes, none of which alters the answer: cache the stable prefix, ask for a shorter reply,
+and stop sending context the model did not use. Together they take roughly two thirds off the
+bill.
+
+<Callout type="ai" title="Why this matters for AI">
+Do this arithmetic *before* building. A per-request cost of half a cent is invisible in
+development and is $120,000 a year at a million requests a month — and the levers that fix it,
+from module 6, are structural: what sits in the cacheable prefix, how much context you retrieve,
+how long the answer is. Retrofitting them means changing the prompt, which means re-running every
+evaluation. Ten minutes with this spreadsheet at design time is worth a quarter of engineering
+later.
+</Callout>
+
+## Check it against the limits
+
+<Run id="prod-cap-8" code={`def plan(*, peak_requests_per_second, p95_seconds,
+         input_tokens, output_tokens,
+         request_limit_per_minute, token_limit_per_minute, headroom=0.7):
+    concurrency = peak_requests_per_second * p95_seconds
+    requests_per_minute = peak_requests_per_second * 60
+    tokens_per_minute = requests_per_minute * (input_tokens + output_tokens)
+
+    return {
+        "concurrency": round(concurrency),
+        "requests_per_minute": round(requests_per_minute),
+        "tokens_per_minute": round(tokens_per_minute),
+        "request_headroom": requests_per_minute / (request_limit_per_minute * headroom),
+        "token_headroom": tokens_per_minute / (token_limit_per_minute * headroom),
+    }
+
+result = plan(
+    peak_requests_per_second=12, p95_seconds=4.0,
+    input_tokens=7_200, output_tokens=180,
+    request_limit_per_minute=4_000, token_limit_per_minute=400_000,
+)
+
+print(f"concurrency needed:   {result['concurrency']}")
+print(f"requests per minute:  {result['requests_per_minute']:,}")
+print(f"tokens per minute:    {result['tokens_per_minute']:,}")
+print()
+for name in ["request_headroom", "token_headroom"]:
+    usage = result[name]
+    verdict = "fits" if usage <= 1.0 else f"OVER by {usage - 1:.0%}"
+    print(f"{name:<20} {usage:>6.2f} of the usable budget   {verdict}")
+
+print()
+print("The token limit binds first, as it usually does — one long request can")
+print("consume a minute's request budget many times over in tokens.")`} />
+
+<Callout type="tip">
+Plan against 70% of your published limit, not 100%. Traffic is bursty, retries add load exactly
+when you are already at the limit, and a deploy briefly doubles your client count. A plan that
+fits at 100% does not fit.
+</Callout>
+
+## The whole plan on one page
+
+<Run id="prod-cap-9" code={`def capacity_plan(*, daily_active_users, requests_per_user_per_day, peak_multiplier,
+                  p95_seconds, input_tokens, output_tokens, cache_hit_rate,
+                  input_rate, output_rate):
+    daily_requests = daily_active_users * requests_per_user_per_day
+    average_rate = daily_requests / 86_400
+    peak_rate = average_rate * peak_multiplier
+
+    cached = input_tokens * cache_hit_rate
+    fresh = input_tokens - cached
+    per_request = (fresh * input_rate + cached * input_rate * 0.10
+                   + output_tokens * output_rate) / 1_000_000
+
+    return {
+        "daily requests": f"{daily_requests:,.0f}",
+        "average rate": f"{average_rate:.2f}/s",
+        "peak rate": f"{peak_rate:.2f}/s",
+        "concurrency at peak": f"{peak_rate * p95_seconds:.0f}",
+        "tokens per minute at peak": f"{peak_rate * 60 * (input_tokens + output_tokens):,.0f}",
+        "cost per request": f"\\u0024{per_request:.5f}",
+        "cost per user per month": f"\\u0024{per_request * requests_per_user_per_day * 30:.2f}",
+        "cost per month": f"\\u0024{per_request * daily_requests * 30:,.2f}",
+    }
+
+for label, users in [("pilot", 200), ("launch", 5_000), ("a good year", 100_000)]:
+    print(f"--- {label}: {users:,} daily active users")
+    for key, value in capacity_plan(
+        daily_active_users=users, requests_per_user_per_day=8, peak_multiplier=4,
+        p95_seconds=4.0, input_tokens=7_200, output_tokens=180, cache_hit_rate=0.85,
+        input_rate=5.00, output_rate=25.00,
+    ).items():
+        print(f"    {key:<28} {value}")
+    print()`} />
+
+Three numbers change the shape of the whole plan: the peak multiplier (traffic is never flat), the
+cache hit rate (from module 6), and the p95 (which sets concurrency). Everything else follows.
+
+## Try it yourself
+
+<Exercise
+  id="prod-cap-ex1"
+  title="Exercise 1"
+  brief="Write <code>concurrency(rate, latency)</code> and <code>max_rate(concurrency, latency)</code> from Little's law, plus <code>fits(rate, latency, limit)</code> returning whether that rate is servable."
+  code={`def concurrency(rate, latency):
+    # Requests in flight to sustain 'rate' per second at 'latency' seconds each.
+    ...
+
+
+def max_rate(concurrency_limit, latency):
+    # The highest sustainable rate at that concurrency. Zero latency is
+    # not meaningful — return float("inf").
+    ...
+
+
+def fits(rate, latency, concurrency_limit):
+    # True when the required concurrency is within the limit.
+    ...
+
+
+print(concurrency(12, 4.0))
+print(max_rate(20, 2.0))
+print(fits(12, 4.0, 40), fits(12, 4.0, 20))`}
+  hint="concurrency = rate * latency; max_rate = concurrency / latency; fits compares the two."
+  solution={`def concurrency(rate, latency):
+    return rate * latency
+
+
+def max_rate(concurrency_limit, latency):
+    if latency <= 0:
+        return float("inf")
+    return concurrency_limit / latency
+
+
+def fits(rate, latency, concurrency_limit):
+    return concurrency(rate, latency) <= concurrency_limit
+
+
+print(concurrency(12, 4.0))
+print(max_rate(20, 2.0))
+print(fits(12, 4.0, 40), fits(12, 4.0, 20))`}
+  tests={`assert concurrency(12, 4.0) == 48, f"12/s at 4s each needs 48 in flight, got {concurrency(12, 4.0)}."
+assert concurrency(1, 2.0) == 2
+assert concurrency(0, 5.0) == 0, "No traffic needs no concurrency."
+
+assert max_rate(20, 2.0) == 10, f"20 in flight at 2s each is 10/s, got {max_rate(20, 2.0)}."
+assert max_rate(48, 4.0) == 12, "The inverse of the first case."
+assert max_rate(10, 0) == float("inf"), (
+    "Zero latency is not meaningful — return infinity rather than dividing by zero."
+)
+
+assert fits(12, 4.0, 48) is True, "Exactly at the limit still fits."
+assert fits(12, 4.0, 40) is False, "48 needed against a limit of 40 does not fit."
+assert fits(12, 4.0, 100) is True
+
+# The two functions must agree.
+for rate, latency in [(5, 2.0), (12, 4.0), (50, 0.5)]:
+    needed = concurrency(rate, latency)
+    assert abs(max_rate(needed, latency) - rate) < 1e-9, (
+        f"max_rate(concurrency(r, l), l) should return r. Broke at {rate}/s, {latency}s."
+    )
+
+# Halving latency doubles the achievable rate at the same concurrency.
+assert max_rate(20, 1.0) == 2 * max_rate(20, 2.0), (
+    "Latency and throughput are the same constraint seen twice."
+)`}
+/>
+
+<Exercise
+  id="prod-cap-ex2"
+  title="Exercise 2"
+  brief="Write <code>monthly_cost(...)</code>: the cost of a month of traffic, with a cache hit rate applied to the input tokens at one tenth the input rate."
+  code={`def monthly_cost(*, daily_users, requests_per_user, input_tokens, output_tokens,
+                 cache_hit_rate, input_rate, output_rate, days=30):
+    # cached = input_tokens * cache_hit_rate, billed at 10% of input_rate.
+    # fresh  = the rest, billed in full. Output is billed at output_rate.
+    # Rates are dollars per million tokens.
+    # Return the total for 'days' days.
+    ...
+
+
+print(round(monthly_cost(daily_users=1000, requests_per_user=8,
+                         input_tokens=7200, output_tokens=180, cache_hit_rate=0.0,
+                         input_rate=5.0, output_rate=25.0), 2))
+print(round(monthly_cost(daily_users=1000, requests_per_user=8,
+                         input_tokens=7200, output_tokens=180, cache_hit_rate=0.9,
+                         input_rate=5.0, output_rate=25.0), 2))`}
+  hint="Compute the per-request cost first, then multiply by daily_users * requests_per_user * days."
+  solution={`def monthly_cost(*, daily_users, requests_per_user, input_tokens, output_tokens,
+                 cache_hit_rate, input_rate, output_rate, days=30):
+    cached = input_tokens * cache_hit_rate
+    fresh = input_tokens - cached
+    per_request = (
+        fresh * input_rate
+        + cached * input_rate * 0.10
+        + output_tokens * output_rate
+    ) / 1_000_000
+    return per_request * daily_users * requests_per_user * days
+
+
+print(round(monthly_cost(daily_users=1000, requests_per_user=8,
+                         input_tokens=7200, output_tokens=180, cache_hit_rate=0.0,
+                         input_rate=5.0, output_rate=25.0), 2))
+print(round(monthly_cost(daily_users=1000, requests_per_user=8,
+                         input_tokens=7200, output_tokens=180, cache_hit_rate=0.9,
+                         input_rate=5.0, output_rate=25.0), 2))`}
+  tests={`base = dict(daily_users=1000, requests_per_user=8, input_tokens=7200, output_tokens=180,
+            input_rate=5.0, output_rate=25.0)
+
+uncached = monthly_cost(**base, cache_hit_rate=0.0)
+expected_per_request = (7200 * 5.0 + 180 * 25.0) / 1_000_000
+assert abs(uncached - expected_per_request * 1000 * 8 * 30) < 1e-6, (
+    f"With no caching expect {expected_per_request * 1000 * 8 * 30:.4f}, got {uncached:.4f}."
+)
+
+cached = monthly_cost(**base, cache_hit_rate=0.9)
+assert cached < uncached, "Caching must reduce the total."
+assert cached > 0, "It does not make it free."
+
+# 90% of the input at a tenth of the rate.
+per_request = ((720 * 5.0) + (6480 * 5.0 * 0.10) + (180 * 25.0)) / 1_000_000
+assert abs(cached - per_request * 1000 * 8 * 30) < 1e-6, (
+    f"Expected {per_request * 1000 * 8 * 30:.4f}, got {cached:.4f}. Cached input is billed "
+    "at 10% of the input rate."
+)
+
+# A full hit rate still bills output in full.
+full = monthly_cost(**base, cache_hit_rate=1.0)
+assert full > 0, "Output tokens are never cached."
+assert full < cached, "A higher hit rate costs less."
+
+# Scaling is linear in users, requests and days.
+assert abs(monthly_cost(**{**base, "daily_users": 2000}, cache_hit_rate=0.9) - 2 * cached) < 1e-6
+assert abs(monthly_cost(**base, cache_hit_rate=0.9, days=60) - 2 * cached) < 1e-6
+assert monthly_cost(**{**base, "daily_users": 0}, cache_hit_rate=0.9) == 0, "No users, no cost."`}
+/>
+
+<Quiz
+  question="You must serve 12 requests per second, and the p95 latency is 4 seconds. How many requests are in flight at peak?"
+  choices={[
+    { text: "About 48 — concurrency is throughput times latency", correct: true, why: "Little's law. Size for the p95 rather than the median, because the slow requests are the ones holding slots." },
+    { text: "12, one per request per second", why: "That would hold only if each request finished within its second." },
+    { text: "3, the rate divided by the latency", why: "Dividing gives a rate from a concurrency; here you need the product." },
+    { text: "It cannot be worked out without the token counts", why: "Tokens drive cost and the rate limit; concurrency follows from rate and latency alone." },
+  ]}
+/>
+
+<Quiz
+  question="Your plan fits inside the published rate limit exactly, at 100%. Why is that not enough?"
+  choices={[
+    { text: "Traffic is bursty and retries add load precisely when you are already at the limit", correct: true, why: "A deploy doubles clients briefly, a spike exceeds the average, and every 429 produces a retry — so plan against about 70% of the limit." },
+    { text: "Published limits are approximate", why: "They are enforced fairly precisely; the problem is the variance in your own traffic." },
+    { text: "The limit applies per region", why: "It may, but that is a detail of your account, not the reason for headroom." },
+    { text: "Because caching changes the token count", why: "Caching reduces cost; cached reads still count towards the limits." },
+  ]}
+/>
+
+## Recap
+
+- Report latency as percentiles and split time-to-first-token from total; the mean of an AI
+  workload describes nobody.
+- **Concurrency = throughput × latency.** Size for the p95, and read it backwards to get the rate
+  a concurrency limit allows.
+- A queue does not add capacity; it converts rejection into unbounded latency.
+- Build the cost model before building the system: caching, answer length and retrieved context
+  are structural levers, and retrofitting them means re-running every evaluation.
+- Check requests per minute *and* tokens per minute against your limits, at about 70% of them.
+- Three numbers shape the plan: the peak multiplier, the cache hit rate and the p95.

@@ -1,0 +1,349 @@
+---
+title: Missing data and type coercion
+description: Find what is missing, decide honestly what to do about it, and fix the column that arrived as text — the two problems that quietly poison a model downstream.
+module: data-wrangling
+order: 3
+level: intermediate
+minutes: 18
+objectives:
+  - Find missing values and quantify them per column
+  - Choose between dropping, filling and leaving values missing
+  - Fill forward and backward, and know when that is wrong
+  - Coerce a text column into numbers or dates without losing the bad rows silently
+  - Use categorical and nullable-integer dtypes deliberately
+  - Find and remove duplicate rows
+---
+
+Real datasets are incomplete and badly typed. Neither problem announces itself: a model trains
+happily on a column of strings that should have been numbers, and a mean-filled column looks
+perfectly reasonable right up until you notice the test scores were leaked into it.
+
+## Finding what is missing
+
+<Run id="dw-na-1" code={`import pandas as pd
+import numpy as np
+
+documents = pd.DataFrame({
+    "id": ["a", "b", "c", "d", "e"],
+    "tokens": [412, np.nan, 980, 120, np.nan],
+    "language": ["en", "si", None, "en", "en"],
+    "score": [0.9, 0.4, 0.7, np.nan, 0.6],
+})
+
+print(documents)
+print()
+print("missing per column:")
+print(documents.isna().sum())
+print()
+print("missing overall:", documents.isna().sum().sum(), "of", documents.size, "cells")
+print("rows with any gap:", documents.isna().any(axis=1).sum())
+print()
+print("percentage missing:")
+print((documents.isna().mean() * 100).round(1))`} />
+
+<Callout type="tip">
+`df.isna().mean()` gives the *proportion* missing per column, which is the number worth looking
+at. A column that is 2% missing and one that is 80% missing call for completely different
+decisions, and the raw count hides that when tables differ in size.
+</Callout>
+
+## Dropping
+
+<Run id="dw-na-2" code={`import pandas as pd
+import numpy as np
+
+documents = pd.DataFrame({
+    "id": ["a", "b", "c", "d", "e"],
+    "tokens": [412, np.nan, 980, 120, np.nan],
+    "language": ["en", "si", None, "en", "en"],
+    "score": [0.9, 0.4, 0.7, np.nan, 0.6],
+})
+
+print("any gap at all:", len(documents.dropna()), "rows left")
+print("only where tokens is missing:", len(documents.dropna(subset=["tokens"])), "rows left")
+print()
+print(documents.dropna(subset=["tokens", "score"]))
+print()
+print("drop columns that are missing anything:")
+print(documents.dropna(axis=1).columns.tolist())`} />
+
+`dropna()` with no arguments removes a row if *anything* in it is missing, which on a wide table
+can delete most of your data. Almost always you want `subset=` — the columns that actually
+matter for what you are about to do.
+
+## Filling
+
+<Run id="dw-na-3" code={`import pandas as pd
+import numpy as np
+
+documents = pd.DataFrame({
+    "id": ["a", "b", "c", "d", "e"],
+    "tokens": [412, np.nan, 980, 120, np.nan],
+    "language": ["en", "si", None, "en", "en"],
+})
+
+print("a constant:")
+print(documents.fillna({"tokens": 0, "language": "unknown"}))
+print()
+print("the column's median:")
+print(documents["tokens"].fillna(documents["tokens"].median()))
+print()
+print("the most common value:")
+print(documents["language"].fillna(documents["language"].mode()[0]).tolist())`} />
+
+For ordered data — a time series, a log — carrying the last known value forward is often the
+honest choice:
+
+<Run id="dw-na-4" code={`import pandas as pd
+import numpy as np
+
+readings = pd.DataFrame({
+    "minute": [1, 2, 3, 4, 5, 6],
+    "latency_ms": [120, np.nan, np.nan, 180, np.nan, 200],
+})
+
+print(readings.assign(
+    forward=readings["latency_ms"].ffill(),
+    backward=readings["latency_ms"].bfill(),
+    interpolated=readings["latency_ms"].interpolate(),
+))`} />
+
+<Callout type="warning">
+Filling backwards on a time series leaks the future into the past — the value at minute 2 comes
+from minute 4, which had not happened yet. For anything you will train or backtest on, `ffill` is
+safe and `bfill` is not.
+</Callout>
+
+<Callout type="ai" title="Why this matters for AI">
+Imputation is part of the model, not part of the data. If you fill missing values with the mean
+of the *whole* dataset and then split into train and test, the test set's values have influenced
+the training data — the score you measure will be better than the one you get in production.
+Compute the fill value on the training set alone and apply it to both, which is precisely what a
+scikit-learn `Pipeline` with a `SimpleImputer` exists to enforce. Module 5 builds that pipeline.
+</Callout>
+
+## Type coercion
+
+A single stray value turns a whole numeric column into text, and arithmetic then either fails or
+does something absurd:
+
+<Run id="dw-na-5" code={`import pandas as pd
+
+raw = pd.DataFrame({
+    "id": ["a", "b", "c", "d"],
+    "tokens": ["412", "980", "n/a", "120"],
+})
+
+print(raw.dtypes)
+print()
+print("string concatenation, not addition:")
+print(raw["tokens"] + raw["tokens"])`} />
+
+`pd.to_numeric` with `errors="coerce"` converts what it can and marks the rest as missing, so the
+bad rows become visible instead of invisible:
+
+<Run id="dw-na-6" code={`import pandas as pd
+
+raw = pd.DataFrame({
+    "id": ["a", "b", "c", "d"],
+    "tokens": ["412", "980", "n/a", "120"],
+})
+
+raw["tokens"] = pd.to_numeric(raw["tokens"], errors="coerce")
+print(raw)
+print(raw.dtypes)
+print()
+print("rows that failed to parse:", raw.loc[raw["tokens"].isna(), "id"].tolist())
+print("total tokens:", raw["tokens"].sum())`} />
+
+The same applies to dates:
+
+<Run id="dw-na-7" code={`import pandas as pd
+
+logs = pd.DataFrame({
+    "run": ["a", "b", "c"],
+    "started": ["2026-03-01T09:30:00", "2026-03-02T11:00:00", "not a date"],
+})
+
+logs["started"] = pd.to_datetime(logs["started"], errors="coerce", format="ISO8601")
+print(logs)
+print(logs.dtypes)
+print()
+print("parsed:", logs["started"].notna().sum(), "of", len(logs))`} />
+
+## Dtypes that save memory and mistakes
+
+A column with few distinct values should be `category`; a column of counts with gaps should be a
+nullable integer:
+
+<Run id="dw-na-8" code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+evaluations = pd.DataFrame({
+    "model": rng.choice(["claude-opus-5", "claude-haiku-4-5"], size=10_000),
+    "tokens": rng.integers(100, 5000, size=10_000).astype(float),
+})
+evaluations.loc[rng.random(10_000) < 0.05, "tokens"] = np.nan
+
+before = evaluations.memory_usage(deep=True).sum()
+evaluations["model"] = evaluations["model"].astype("category")
+after = evaluations.memory_usage(deep=True).sum()
+
+print(f"model as text:     {before / 1024:8.1f} KB")
+print(f"model as category: {after / 1024:8.1f} KB")
+print("categories:", list(evaluations["model"].cat.categories))
+print()
+
+# float64 is how a numeric column with gaps is usually stored; Int64 keeps it
+# an integer and still allows missing values.
+print("as float:", evaluations["tokens"].dtype)
+print("as Int64:", evaluations["tokens"].astype("Int64").dtype)
+print(evaluations["tokens"].astype("Int64").head(3).tolist())`} />
+
+## Duplicates
+
+<Run id="dw-na-9" code={`import pandas as pd
+
+documents = pd.DataFrame({
+    "id": ["a", "b", "c", "b", "d", "a"],
+    "text": ["one", "two", "three", "two", "four", "one"],
+    "source": ["x", "x", "y", "z", "y", "x"],
+})
+
+print("duplicated rows:", documents.duplicated().sum())
+print(documents[documents.duplicated(keep=False)])
+print()
+
+print("dropping exact duplicates:")
+print(documents.drop_duplicates())
+print()
+print("de-duplicating by id, keeping the first seen:")
+print(documents.drop_duplicates(subset=["id"], keep="first"))`} />
+
+<Callout type="ai" title="Why this matters for AI">
+Duplicates between a training set and a test set are the most common way an evaluation lies to
+you: the model has already seen the answer, so the score measures memorisation. Before splitting,
+de-duplicate on content — a hash of the normalised text, not the id, because the same document
+often arrives twice under different ids.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="dw-na-ex1"
+  title="Exercise 1"
+  brief="Coerce <code>tokens</code> to numbers, put the failures' ids in <code>failed</code>, and fill the resulting gaps with the column's median into a new <code>tokens_filled</code> column."
+  code={`import pandas as pd
+
+raw = pd.DataFrame({
+    "id": ["a", "b", "c", "d", "e"],
+    "tokens": ["412", "980", "n/a", "120", ""],
+})
+
+failed = None    # a list of ids that could not be parsed
+
+print(raw)
+print("failed:", failed)`}
+  hint="pd.to_numeric(raw['tokens'], errors='coerce') converts and marks failures as NaN. Then use .isna() to find the ids, and .median() to fill."
+  solution={`import pandas as pd
+
+raw = pd.DataFrame({
+    "id": ["a", "b", "c", "d", "e"],
+    "tokens": ["412", "980", "n/a", "120", ""],
+})
+
+raw["tokens"] = pd.to_numeric(raw["tokens"], errors="coerce")
+failed = raw.loc[raw["tokens"].isna(), "id"].tolist()
+raw["tokens_filled"] = raw["tokens"].fillna(raw["tokens"].median())
+
+print(raw)
+print("failed:", failed)`}
+  tests={`import pandas as pd
+
+assert pd.api.types.is_numeric_dtype(raw["tokens"]), (
+    f"tokens should be numeric after coercion, got {raw['tokens'].dtype}."
+)
+assert failed == ["c", "e"], f"Rows c and e cannot be parsed. Got {failed!r}."
+assert "tokens_filled" in raw.columns, "Add a tokens_filled column."
+
+median = raw["tokens"].median()
+assert median == 412.0, f"The median of 412, 980 and 120 is 412, got {median}."
+assert list(raw["tokens_filled"]) == [412.0, 980.0, 412.0, 120.0, 412.0], (
+    f"Expected the gaps filled with 412, got {list(raw['tokens_filled'])}."
+)
+assert raw["tokens"].isna().sum() == 2, (
+    "Leave the original tokens column with its gaps intact — fill into the new column."
+)`}
+/>
+
+<Exercise
+  id="dw-na-ex2"
+  title="Exercise 2"
+  brief="Remove documents whose <code>text</code> has already been seen, keeping the first occurrence, into <code>unique_docs</code>. Then set <code>removed</code> to how many rows went."
+  code={`import pandas as pd
+
+documents = pd.DataFrame({
+    "id": ["d1", "d2", "d3", "d4", "d5"],
+    "text": ["alpha", "beta", "alpha", "gamma", "beta"],
+})
+
+unique_docs = None
+removed = None
+
+print(unique_docs)
+print("removed:", removed)`}
+  hint="drop_duplicates(subset=['text'], keep='first'), then compare the lengths."
+  solution={`import pandas as pd
+
+documents = pd.DataFrame({
+    "id": ["d1", "d2", "d3", "d4", "d5"],
+    "text": ["alpha", "beta", "alpha", "gamma", "beta"],
+})
+
+unique_docs = documents.drop_duplicates(subset=["text"], keep="first")
+removed = len(documents) - len(unique_docs)
+
+print(unique_docs)
+print("removed:", removed)`}
+  tests={`import pandas as pd
+
+assert isinstance(unique_docs, pd.DataFrame), "unique_docs should be a DataFrame."
+assert list(unique_docs["id"]) == ["d1", "d2", "d4"], (
+    f"Keep the first of each text: d1, d2 and d4. Got {list(unique_docs['id'])}."
+)
+assert removed == 2, f"Two duplicate rows should have gone, got {removed!r}."
+assert len(documents) == 5, "Leave the original frame unchanged — drop_duplicates returns a new one."`}
+/>
+
+<Quiz
+  question="You fill a column's missing values with its mean, then split into train and test. What is wrong?"
+  choices={[
+    { text: "The mean was computed over the test set too, so test information leaked into training", correct: true, why: "The imputed training values depend on data the model is supposed to have never seen, and the measured score is optimistic." },
+    { text: "Nothing — the mean is a neutral choice", why: "The choice of statistic is not the problem; the data it was computed over is." },
+    { text: "The mean is always the wrong statistic; use the median", why: "The median has the identical leakage problem when computed over everything." },
+    { text: "Filling with the mean changes the column's dtype", why: "The dtype is unaffected, and would not be the serious issue if it were." },
+  ]}
+/>
+
+<Quiz
+  question="Why does pd.to_numeric(col, errors='coerce') beat quietly skipping the bad rows?"
+  choices={[
+    { text: "The failures become NaN, so you can count them and decide — rather than losing them silently", correct: true, why: "Coercion makes the problem visible and countable; the decision about what to do is then yours to make deliberately." },
+    { text: "It is faster than filtering first", why: "Speed is not the point; visibility is." },
+    { text: "It converts the bad values to zero, which is safer", why: "It converts them to NaN, not zero — zero would be a silent and often damaging guess." },
+    { text: "It raises an exception on the first bad value", why: "That is errors='raise', the default. 'coerce' is the opposite." },
+  ]}
+/>
+
+## Recap
+
+- `df.isna().sum()` counts gaps; `df.isna().mean()` gives the proportion, which is what to judge.
+- `dropna()` with no `subset` deletes a row for any gap anywhere — nearly always pass `subset=`.
+- `fillna` takes a constant or a per-column dict; `ffill` carries the last value forward,
+  `bfill` carries the future backwards and leaks it.
+- Compute imputation statistics on the training set only.
+- `pd.to_numeric(..., errors="coerce")` and `pd.to_datetime(..., errors="coerce")` make bad rows
+  visible as `NaN` instead of losing them.
+- `category` shrinks a low-cardinality text column; `Int64` keeps integers that have gaps.
+- De-duplicate on content before splitting, or your evaluation measures memorisation.

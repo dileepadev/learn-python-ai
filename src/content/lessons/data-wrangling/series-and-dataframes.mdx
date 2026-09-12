@@ -1,0 +1,374 @@
+---
+title: Series and DataFrames
+description: The two pandas objects everything else is built on — a labelled array and a labelled table — and the five commands you run on every dataset you meet.
+module: data-wrangling
+order: 1
+level: intermediate
+minutes: 18
+objectives:
+  - Build Series and DataFrames from lists, dicts and records
+  - Read shape, columns, dtypes and summary statistics
+  - Understand what the index is and when to set or reset it
+  - Add and drop columns
+  - Round-trip a table through CSV and JSONL
+---
+
+pandas gives you a table with named columns, a labelled index, and a column-at-a-time way of
+working that keeps loops out of your data code. Most of an AI project is spent here: loading a
+dataset, finding out what is wrong with it, and reshaping it into what the model needs.
+
+## A Series
+
+A Series is a 1-D array with an index attached:
+
+<Run id="dw-df-1" code={`import pandas as pd
+
+scores = pd.Series([0.71, 0.88, 0.93, 0.42])
+print(scores)
+print()
+print("values:", scores.values)
+print("index: ", list(scores.index))
+print("dtype: ", scores.dtype)`} />
+
+The index does not have to be numbers, and that is the point — it lets you look things up by
+name:
+
+<Run id="dw-df-2" code={`import pandas as pd
+
+scores = pd.Series(
+    [0.71, 0.88, 0.93],
+    index=["baseline", "tuned", "ensemble"],
+    name="accuracy",
+)
+
+print(scores)
+print()
+print("one value: ", scores["tuned"])
+print("best run:  ", scores.idxmax())
+print("mean:      ", round(scores.mean(), 4))
+print("above 0.8:", list(scores[scores > 0.8].index))`} />
+
+## A DataFrame
+
+A DataFrame is a dict of Series that share one index — a table:
+
+<Run id="dw-df-3" code={`import pandas as pd
+
+runs = pd.DataFrame({
+    "run": ["baseline", "tuned", "ensemble", "distilled"],
+    "accuracy": [0.71, 0.88, 0.93, 0.84],
+    "latency_ms": [120, 340, 980, 95],
+    "tokens": [412, 980, 2100, 380],
+})
+
+print(runs)
+print()
+print("shape:  ", runs.shape)
+print("columns:", list(runs.columns))`} />
+
+Real data usually arrives as a list of records — a JSON array, or the rows of a JSONL file — and
+pandas takes that directly:
+
+<Run id="dw-df-4" code={`import pandas as pd
+
+records = [
+    {"run": "baseline", "accuracy": 0.71, "model": "haiku"},
+    {"run": "tuned", "accuracy": 0.88, "model": "opus"},
+    {"run": "ensemble", "accuracy": 0.93, "model": "opus"},
+]
+
+runs = pd.DataFrame(records)
+print(runs)
+print()
+print(runs.dtypes)`} />
+
+## The five commands you always run
+
+Before anything else, find out what you have:
+
+<Run id="dw-df-5" code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+evaluations = pd.DataFrame({
+    "question_id": range(1, 21),
+    "model": rng.choice(["opus", "haiku"], size=20),
+    "score": rng.random(20).round(3),
+    "latency_ms": rng.integers(80, 900, size=20),
+})
+
+print("1. head -------------------------------")
+print(evaluations.head(3))
+print()
+print("2. shape ------------------------------", evaluations.shape)
+print()
+print("3. dtypes -----------------------------")
+print(evaluations.dtypes)
+print()
+print("4. describe ---------------------------")
+print(evaluations.describe().round(3))
+print()
+print("5. value_counts -----------------------")
+print(evaluations["model"].value_counts())`} />
+
+<Callout type="tip">
+`describe()` only summarises numeric columns by default. `describe(include="all")` adds the
+others, and `info()` tells you the row count, the dtypes and how many values are non-null — the
+fastest way to spot a column that is half empty.
+</Callout>
+
+<Run id="dw-df-6" code={`import pandas as pd
+
+runs = pd.DataFrame({
+    "run": ["baseline", "tuned", "ensemble"],
+    "accuracy": [0.71, 0.88, None],
+    "model": ["haiku", "opus", "opus"],
+})
+
+runs.info()`} />
+
+## Columns
+
+Selecting one column gives a Series; selecting a list of them gives a DataFrame:
+
+<Run id="dw-df-7" code={`import pandas as pd
+
+runs = pd.DataFrame({
+    "run": ["baseline", "tuned", "ensemble"],
+    "accuracy": [0.71, 0.88, 0.93],
+    "latency_ms": [120, 340, 980],
+})
+
+print(type(runs["accuracy"]).__name__)
+print(runs["accuracy"])
+print()
+print(type(runs[["run", "accuracy"]]).__name__)
+print(runs[["run", "accuracy"]])`} />
+
+New columns are computed from existing ones, a whole column at a time:
+
+<Run id="dw-df-8" code={`import pandas as pd
+
+runs = pd.DataFrame({
+    "run": ["baseline", "tuned", "ensemble"],
+    "accuracy": [0.71, 0.88, 0.93],
+    "latency_ms": [120, 340, 980],
+    "tokens": [412, 980, 2100],
+})
+
+runs["tokens_per_second"] = runs["tokens"] / (runs["latency_ms"] / 1000)
+runs["grade"] = (runs["accuracy"] >= 0.85).map({True: "pass", False: "fail"})
+
+print(runs.round(1))
+print()
+print(runs.drop(columns=["tokens_per_second"]).columns.tolist())`} />
+
+Note that no loop appeared. `runs["tokens"] / (runs["latency_ms"] / 1000)` is a vectorised
+operation over the whole column, exactly like NumPy.
+
+## The index
+
+The index labels the rows. Setting a meaningful one makes lookups and joins natural:
+
+<Run id="dw-df-9" code={`import pandas as pd
+
+runs = pd.DataFrame({
+    "run": ["baseline", "tuned", "ensemble"],
+    "accuracy": [0.71, 0.88, 0.93],
+})
+
+print(runs.index)
+print()
+
+indexed = runs.set_index("run")
+print(indexed)
+print()
+print("look up a row:", indexed.loc["tuned", "accuracy"])
+print()
+print("and back again:")
+print(indexed.reset_index())`} />
+
+<Callout type="warning">
+After filtering or sorting, the index keeps the *original* row labels — so a filtered frame can
+start at row 7. That is usually helpful, because it tells you where a row came from. When it
+is not, `reset_index(drop=True)` renumbers from zero and throws the old labels away.
+</Callout>
+
+<Run id="dw-df-10" code={`import pandas as pd
+
+runs = pd.DataFrame({
+    "run": ["a", "b", "c", "d", "e"],
+    "accuracy": [0.3, 0.9, 0.5, 0.95, 0.6],
+})
+
+good = runs[runs["accuracy"] > 0.5]
+print(good)
+print()
+print(good.reset_index(drop=True))`} />
+
+## Sorting
+
+<Run id="dw-df-11" code={`import pandas as pd
+
+runs = pd.DataFrame({
+    "run": ["baseline", "tuned", "ensemble", "distilled"],
+    "model": ["haiku", "opus", "opus", "haiku"],
+    "accuracy": [0.71, 0.88, 0.93, 0.84],
+})
+
+print(runs.sort_values("accuracy", ascending=False))
+print()
+print(runs.sort_values(["model", "accuracy"], ascending=[True, False]))
+print()
+print("top 2:")
+print(runs.nlargest(2, "accuracy"))`} />
+
+## Reading and writing
+
+<Run id="dw-df-12" code={`import pandas as pd
+from pathlib import Path
+
+runs = pd.DataFrame({
+    "run": ["baseline", "tuned"],
+    "accuracy": [0.71, 0.88],
+})
+
+runs.to_csv("runs.csv", index=False)      # index=False: do not write the row numbers
+print(Path("runs.csv").read_text())
+
+loaded = pd.read_csv("runs.csv")
+print(loaded)
+print()
+
+runs.to_json("runs.jsonl", orient="records", lines=True)
+print(Path("runs.jsonl").read_text())
+print(pd.read_json("runs.jsonl", lines=True))`} />
+
+<Callout type="ai" title="Why this matters for AI">
+An evaluation run produces one row per example: the question, the model's answer, whether it was
+right, how long it took and what it cost. Kept as JSONL and loaded into a DataFrame, every
+question you have about the run becomes one line — accuracy by model, the slowest 1%, whether
+long prompts fail more often. Writing that analysis as loops over dictionaries is how eval
+harnesses become unmaintainable.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="dw-df-ex1"
+  title="Exercise 1"
+  brief="Build the DataFrame <code>runs</code> from the records, add a <code>cost_per_token</code> column, and print the run name with the lowest cost per token."
+  code={`import pandas as pd
+
+records = [
+    {"run": "baseline", "tokens": 400, "cost_usd": 0.012},
+    {"run": "tuned", "tokens": 1000, "cost_usd": 0.020},
+    {"run": "ensemble", "tokens": 2000, "cost_usd": 0.090},
+]
+
+runs = None
+# Add a cost_per_token column, then print the cheapest run's name.
+
+print(runs)
+print("cheapest:", None)`}
+  hint="pd.DataFrame(records) builds it. cost_usd / tokens gives the per-token cost, and idxmin on that column gives the row label — use .loc to read the run name."
+  solution={`import pandas as pd
+
+records = [
+    {"run": "baseline", "tokens": 400, "cost_usd": 0.012},
+    {"run": "tuned", "tokens": 1000, "cost_usd": 0.020},
+    {"run": "ensemble", "tokens": 2000, "cost_usd": 0.090},
+]
+
+runs = pd.DataFrame(records)
+runs["cost_per_token"] = runs["cost_usd"] / runs["tokens"]
+
+cheapest = runs.loc[runs["cost_per_token"].idxmin(), "run"]
+
+print(runs)
+print("cheapest:", cheapest)`}
+  tests={`import pandas as pd
+
+assert isinstance(runs, pd.DataFrame), f"runs should be a DataFrame, got {type(runs).__name__}."
+assert runs.shape[0] == 3, f"Expected 3 rows, got {runs.shape[0]}."
+assert "cost_per_token" in runs.columns, "Add a cost_per_token column."
+
+expected = [0.012 / 400, 0.020 / 1000, 0.090 / 2000]
+assert all(abs(a - b) < 1e-12 for a, b in zip(runs["cost_per_token"], expected)), (
+    f"cost_per_token should be cost_usd / tokens, got {list(runs['cost_per_token'])}."
+)
+assert _lines[-1] == "cheapest: tuned", (
+    f"tuned is cheapest at 0.00002 per token. Last line was: {_lines[-1] if _lines else '(nothing)'}."
+)`}
+/>
+
+<Exercise
+  id="dw-df-ex2"
+  title="Exercise 2"
+  brief="Set <code>top</code> to the two highest-scoring rows, sorted best first, with the index renumbered from 0."
+  code={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "question": ["q1", "q2", "q3", "q4", "q5"],
+    "score": [0.42, 0.91, 0.68, 0.99, 0.55],
+})
+
+top = None
+
+print(top)`}
+  hint="sort_values with ascending=False, then .head(2), then reset_index(drop=True)."
+  solution={`import pandas as pd
+
+evaluations = pd.DataFrame({
+    "question": ["q1", "q2", "q3", "q4", "q5"],
+    "score": [0.42, 0.91, 0.68, 0.99, 0.55],
+})
+
+top = evaluations.sort_values("score", ascending=False).head(2).reset_index(drop=True)
+
+print(top)`}
+  tests={`import pandas as pd
+
+assert isinstance(top, pd.DataFrame), f"top should be a DataFrame, got {type(top).__name__}."
+assert len(top) == 2, f"Expected 2 rows, got {len(top)}."
+assert list(top["question"]) == ["q4", "q2"], (
+    f"Expected q4 then q2 — the two highest scores, best first. Got {list(top['question'])}."
+)
+assert list(top.index) == [0, 1], (
+    f"The index should be renumbered from 0 — use reset_index(drop=True). Got {list(top.index)}."
+)
+assert list(top.columns) == ["question", "score"], (
+    f"Both columns should survive, and no index column should be added. Got {list(top.columns)}."
+)`}
+/>
+
+<Quiz
+  question="What is the difference between df['score'] and df[['score']]?"
+  choices={[
+    { text: "The first gives a Series; the second gives a one-column DataFrame", correct: true, why: "A list of column names always returns a DataFrame, even when the list has one entry." },
+    { text: "They are identical", why: "They hold the same data but are different types, which matters the moment you call a DataFrame-only method." },
+    { text: "The second selects the row labelled 'score'", why: "Square brackets on a DataFrame select columns; row selection goes through .loc or .iloc." },
+    { text: "The first raises an error for a string column", why: "Selecting by name works for any dtype." },
+  ]}
+/>
+
+<Quiz
+  question="You filter a DataFrame and the result's index starts at 3. Why, and when does it matter?"
+  choices={[
+    { text: "Filtering keeps the original row labels; it matters when you later align or concatenate by index", correct: true, why: "The labels are a feature — they say which original rows survived — but they surprise you when you assume a 0-based range." },
+    { text: "It is a bug; the index should always start at 0", why: "It is deliberate: preserving the labels is how pandas keeps rows traceable back to the source." },
+    { text: "The first three rows were deleted from the original", why: "The original is untouched; filtering returns a new frame." },
+    { text: "It only happens with a non-numeric index", why: "It happens with any index, including the default integer one." },
+  ]}
+/>
+
+## Recap
+
+- A Series is a labelled 1-D array; a DataFrame is a set of Series sharing one index.
+- `pd.DataFrame(records)` turns a list of dicts — the shape JSONL arrives in — into a table.
+- Always run `head`, `shape`, `dtypes`, `describe` and `value_counts` before anything else;
+  `info()` shows where values are missing.
+- `df["col"]` is a Series, `df[["col"]]` is a DataFrame.
+- Build new columns from whole columns, never in a loop.
+- Filtering preserves the original index; `reset_index(drop=True)` renumbers when you want that.
+- `to_csv(..., index=False)` and `to_json(..., orient="records", lines=True)` round-trip cleanly.

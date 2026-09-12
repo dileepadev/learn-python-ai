@@ -1,0 +1,421 @@
+---
+title: Pipelines and preprocessing
+description: Bind preprocessing to the model so it cannot leak, cannot be forgotten at prediction time, and travels as one object you can save.
+module: ml-foundations
+order: 3
+level: advanced
+minutes: 18
+objectives:
+  - Chain transformers and an estimator into a Pipeline
+  - Explain how a Pipeline prevents preprocessing leakage
+  - Handle numeric and categorical columns together with ColumnTransformer
+  - Impute missing values and encode categories safely
+  - Reach into a fitted pipeline's steps, and save the whole thing
+---
+
+The last lesson ended with a rule: fit transformers on the training data only. A `Pipeline`
+turns that rule into something the library enforces for you — and solves a second problem at the
+same time, because the preprocessing then travels with the model instead of living in a script
+somebody forgets to run.
+
+## A pipeline is an estimator
+
+<Run id="ml-pipe-1" code={`from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=600, n_features=6, n_informative=4, random_state=0)
+X[:, 0] *= 1000                                   # one feature on a wild scale
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=0)
+
+model = Pipeline([
+    ("scale", StandardScaler()),
+    ("classify", LogisticRegression(max_iter=1000)),
+])
+
+model.fit(X_train, y_train)                       # fits every step, in order
+print("accuracy:", round(model.score(X_test, y_test), 4))
+print("predictions:", model.predict(X_test[:5]))
+print()
+print("steps:", [name for name, _ in model.steps])`} />
+
+`fit` calls `fit_transform` on every step but the last, then `fit` on the last. `predict` calls
+`transform` on every step but the last, then `predict`. That asymmetry is the whole trick: the
+scaler learns from the training rows only, and the test rows are merely transformed.
+
+<Run id="ml-pipe-2" code={`import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(400, 3)) * 10 + 50
+y = (X[:, 0] + X[:, 1] > 100).astype(int)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=0)
+
+model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
+model.fit(X_train, y_train)
+
+learned = model.named_steps["standardscaler"].mean_
+print("scaler learned means:  ", learned.round(3))
+print("training set means:    ", X_train.mean(axis=0).round(3))
+print("means over everything: ", X.mean(axis=0).round(3))
+print()
+print("fitted on the training set only:", np.allclose(learned, X_train.mean(axis=0)))`} />
+
+`make_pipeline` names the steps for you from the class names, which is convenient when you do not
+need to refer to them.
+
+<Callout type="ai" title="Why this matters for AI">
+The second benefit matters more in production than the first. A model without its preprocessing
+is a trap: six months later a service loads the classifier, feeds it raw features, and gets
+confident nonsense because nobody knew a scaler had been applied during training. A pipeline is
+one object that takes raw input and returns a prediction — save it, load it, call it. That is the
+difference between a notebook result and a deployable artefact.
+</Callout>
+
+## Mixed column types
+
+Real tables have numbers, categories and gaps, each needing different treatment.
+`ColumnTransformer` routes each group of columns to its own transformer:
+
+<Run id="ml-pipe-3" code={`import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 500
+
+requests = pd.DataFrame({
+    "prompt_tokens": rng.integers(100, 8000, n).astype(float),
+    "latency_ms": rng.integers(50, 2000, n).astype(float),
+    "model": rng.choice(["opus", "haiku", "sonnet"], n),
+    "language": rng.choice(["en", "si", "ta"], n, p=[0.7, 0.2, 0.1]),
+})
+# Some prompt_tokens are missing, as they always are.
+requests.loc[rng.random(n) < 0.08, "prompt_tokens"] = np.nan
+
+refused = (
+    (requests["prompt_tokens"].fillna(3000) > 6000).astype(int)
+    | (rng.random(n) < 0.05).astype(int)
+)
+
+print(requests.head())
+print()
+print(requests.dtypes)
+print("missing prompt_tokens:", int(requests["prompt_tokens"].isna().sum()))
+print("refusal rate:", round(refused.mean(), 3))`} />
+
+<Run id="ml-pipe-4" code={`import pandas as pd
+import numpy as np
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(0)
+n = 500
+requests = pd.DataFrame({
+    "prompt_tokens": rng.integers(100, 8000, n).astype(float),
+    "latency_ms": rng.integers(50, 2000, n).astype(float),
+    "model": rng.choice(["opus", "haiku", "sonnet"], n),
+    "language": rng.choice(["en", "si", "ta"], n, p=[0.7, 0.2, 0.1]),
+})
+requests.loc[rng.random(n) < 0.08, "prompt_tokens"] = np.nan
+refused = ((requests["prompt_tokens"].fillna(3000) > 6000) | (rng.random(n) < 0.05)).astype(int)
+
+numeric = ["prompt_tokens", "latency_ms"]
+categorical = ["model", "language"]
+
+preprocess = ColumnTransformer([
+    ("numeric", Pipeline([
+        ("impute", SimpleImputer(strategy="median")),
+        ("scale", StandardScaler()),
+    ]), numeric),
+    ("categorical", OneHotEncoder(handle_unknown="ignore"), categorical),
+])
+
+model = Pipeline([("prepare", preprocess), ("classify", LogisticRegression(max_iter=1000))])
+
+X_train, X_test, y_train, y_test = train_test_split(
+    requests, refused, test_size=0.25, random_state=0, stratify=refused
+)
+
+model.fit(X_train, y_train)
+print("accuracy:", round(model.score(X_test, y_test), 4))
+print()
+print("features after preprocessing:")
+print(list(model.named_steps["prepare"].get_feature_names_out()))`} />
+
+Two numeric columns became two; two categorical columns with three values each became six. The
+pipeline knows how to redo all of it for a single new row.
+
+<Run id="ml-pipe-5" code={`import pandas as pd
+import numpy as np
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(0)
+n = 500
+requests = pd.DataFrame({
+    "prompt_tokens": rng.integers(100, 8000, n).astype(float),
+    "latency_ms": rng.integers(50, 2000, n).astype(float),
+    "model": rng.choice(["opus", "haiku", "sonnet"], n),
+    "language": rng.choice(["en", "si", "ta"], n, p=[0.7, 0.2, 0.1]),
+})
+requests.loc[rng.random(n) < 0.08, "prompt_tokens"] = np.nan
+refused = ((requests["prompt_tokens"].fillna(3000) > 6000) | (rng.random(n) < 0.05)).astype(int)
+
+preprocess = ColumnTransformer([
+    ("numeric", Pipeline([("impute", SimpleImputer(strategy="median")), ("scale", StandardScaler())]),
+     ["prompt_tokens", "latency_ms"]),
+    ("categorical", OneHotEncoder(handle_unknown="ignore"), ["model", "language"]),
+])
+model = Pipeline([("prepare", preprocess), ("classify", LogisticRegression(max_iter=1000))]).fit(
+    requests, refused
+)
+
+# One raw row, with a gap and a category the model has never seen.
+incoming = pd.DataFrame([{
+    "prompt_tokens": np.nan,
+    "latency_ms": 850.0,
+    "model": "opus-5-experimental",     # unseen
+    "language": "en",
+}])
+
+print("prediction:", model.predict(incoming))
+print("probability:", model.predict_proba(incoming).round(3))`} />
+
+<Callout type="warning">
+`OneHotEncoder(handle_unknown="ignore")` is not optional in production. Without it, the first
+request naming a model released after you trained raises `ValueError` and takes the service down.
+With it, every column for that feature is zero — which is the honest representation of "I have
+never seen this".
+</Callout>
+
+## Seeing what a step produced
+
+<Run id="ml-pipe-6" code={`import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+
+frame = pd.DataFrame({
+    "tokens": [100.0, 500.0, 2000.0, 800.0],
+    "model": ["opus", "haiku", "opus", "sonnet"],
+})
+
+preprocess = ColumnTransformer([
+    ("numeric", StandardScaler(), ["tokens"]),
+    # sparse_output=False, because a DataFrame cannot hold a sparse matrix.
+    ("categorical", OneHotEncoder(handle_unknown="ignore", sparse_output=False), ["model"]),
+]).set_output(transform="pandas")
+
+print(preprocess.fit_transform(frame).round(3))`} />
+
+`set_output(transform="pandas")` makes every step return a labelled DataFrame instead of a bare
+array, which turns debugging a preprocessing chain from guesswork into reading a table.
+
+## Saving the whole thing
+
+```python
+import joblib
+
+joblib.dump(model, "refusal-classifier.joblib")
+
+# ...in the service, months later:
+model = joblib.load("refusal-classifier.joblib")
+prediction = model.predict(incoming_dataframe)
+```
+
+One file holds the imputer's medians, the scaler's statistics, the encoder's categories and the
+classifier's coefficients. Pin the scikit-learn version alongside it — a pickle is not portable
+across major versions.
+
+## Try it yourself
+
+<Exercise
+  id="ml-pipe-ex1"
+  title="Exercise 1"
+  brief="Build <code>model</code> as a pipeline of a <code>StandardScaler</code> then a <code>LogisticRegression</code>, fit it on the training split, and put its held-out accuracy in <code>accuracy</code>."
+  code={`from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=600, n_features=6, n_informative=4,
+                           n_clusters_per_class=1, random_state=0)
+X[:, 0] *= 500
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=0)
+
+model = None
+accuracy = None
+
+print("accuracy:", accuracy)`}
+  hint="Pipeline([('scale', StandardScaler()), ('classify', LogisticRegression(max_iter=1000))]) then .fit(X_train, y_train) and .score(X_test, y_test)."
+  solution={`from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=600, n_features=6, n_informative=4,
+                           n_clusters_per_class=1, random_state=0)
+X[:, 0] *= 500
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=0)
+
+model = Pipeline([
+    ("scale", StandardScaler()),
+    ("classify", LogisticRegression(max_iter=1000)),
+])
+model.fit(X_train, y_train)
+accuracy = round(model.score(X_test, y_test), 4)
+
+print("accuracy:", accuracy)`}
+  tests={`import numpy as np
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+assert isinstance(model, Pipeline), f"model should be a Pipeline, got {type(model).__name__}."
+
+steps = [type(step).__name__ for _, step in model.steps]
+assert steps == ["StandardScaler", "LogisticRegression"], (
+    f"Expected a StandardScaler then a LogisticRegression, got {steps}."
+)
+
+scaler = model.steps[0][1]
+assert hasattr(scaler, "mean_"), "The pipeline has not been fitted."
+assert np.allclose(scaler.mean_, X_train.mean(axis=0)), (
+    "The scaler should have learned the training set's statistics. Fit the pipeline on "
+    "X_train, not on all of X — that is what a pipeline is for."
+)
+
+expected = round(model.score(X_test, y_test), 4)
+assert abs(float(accuracy) - expected) < 1e-6, (
+    f"accuracy should be the held-out score ({expected}), got {accuracy!r}."
+)
+assert expected > 0.8, f"Expected a comfortably learnable problem, scored {expected}."`}
+/>
+
+<Exercise
+  id="ml-pipe-ex2"
+  title="Exercise 2"
+  brief="Build <code>preprocess</code>: a <code>ColumnTransformer</code> that median-imputes then scales <code>tokens</code> and <code>latency</code>, and one-hot encodes <code>model</code> while ignoring unknown categories."
+  code={`import pandas as pd
+import numpy as np
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+
+frame = pd.DataFrame({
+    "tokens": [100.0, np.nan, 2000.0, 800.0],
+    "latency": [50.0, 120.0, 900.0, 300.0],
+    "model": ["opus", "haiku", "opus", "sonnet"],
+})
+
+preprocess = None
+
+out = preprocess.fit_transform(frame)
+print(out.shape)
+print(list(preprocess.get_feature_names_out()))`}
+  hint="ColumnTransformer with two entries: a nested Pipeline of SimpleImputer(strategy='median') and StandardScaler over the two numeric columns, and OneHotEncoder(handle_unknown='ignore') over ['model']."
+  solution={`import pandas as pd
+import numpy as np
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+
+frame = pd.DataFrame({
+    "tokens": [100.0, np.nan, 2000.0, 800.0],
+    "latency": [50.0, 120.0, 900.0, 300.0],
+    "model": ["opus", "haiku", "opus", "sonnet"],
+})
+
+preprocess = ColumnTransformer([
+    ("numeric", Pipeline([
+        ("impute", SimpleImputer(strategy="median")),
+        ("scale", StandardScaler()),
+    ]), ["tokens", "latency"]),
+    ("categorical", OneHotEncoder(handle_unknown="ignore"), ["model"]),
+])
+
+out = preprocess.fit_transform(frame)
+print(out.shape)
+print(list(preprocess.get_feature_names_out()))`}
+  tests={`import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+
+assert isinstance(preprocess, ColumnTransformer), (
+    f"preprocess should be a ColumnTransformer, got {type(preprocess).__name__}."
+)
+
+result = np.asarray(preprocess.fit_transform(frame))
+assert result.shape == (4, 5), (
+    f"Two scaled numeric columns plus three one-hot model columns is 5 — got shape {result.shape}."
+)
+assert not np.isnan(result).any(), (
+    "The missing token count should have been imputed, but a NaN survived."
+)
+
+# The median of 100, 2000 and 800 is 800, and scaling centres the column on 0.
+assert abs(result[:, 0].mean()) < 1e-9, (
+    f"The tokens column should be centred after scaling, mean is {result[:, 0].mean()}."
+)
+
+names = list(preprocess.get_feature_names_out())
+assert any("opus" in name for name in names), (
+    f"The model column should be one-hot encoded, got feature names {names}."
+)
+
+# An unseen category must not raise.
+unseen = pd.DataFrame([{"tokens": 500.0, "latency": 100.0, "model": "brand-new"}])
+row = np.asarray(preprocess.transform(unseen))
+assert row.shape == (1, 5), f"A single new row should transform to shape (1, 5), got {row.shape}."
+assert row[0, 2:].sum() == 0, (
+    "An unseen category should encode as all zeros — pass handle_unknown='ignore'."
+)`}
+/>
+
+<Quiz
+  question="How does a Pipeline prevent preprocessing leakage?"
+  choices={[
+    { text: "During fit the transformers see only the training rows; at predict time they merely transform", correct: true, why: "fit_transform runs on training data alone, and every later call is transform, so held-out statistics can never reach a fitted transformer." },
+    { text: "It shuffles the data before fitting", why: "Shuffling is unrelated; the protection is in which rows each step is fitted on." },
+    { text: "It refuses to accept a test set", why: "It accepts one happily — it just never fits on it." },
+    { text: "It re-fits the transformers on each new batch", why: "That would be far worse: predictions would depend on whatever else happened to be in the batch." },
+  ]}
+/>
+
+<Quiz
+  question="A request names a model released after training, and the service returns 500. What was missing?"
+  choices={[
+    { text: "handle_unknown='ignore' on the OneHotEncoder", correct: true, why: "By default an unseen category raises; ignoring it encodes all zeros, which is the honest 'never seen this' representation." },
+    { text: "A larger training set", why: "No amount of past data contains a category that did not exist yet." },
+    { text: "A SimpleImputer on the categorical column", why: "Imputing fills missing values; this value is present, just unfamiliar." },
+    { text: "Retraining the model nightly", why: "Useful hygiene, but it does not stop the first request naming something new from failing." },
+  ]}
+/>
+
+## Recap
+
+- A `Pipeline` is an estimator: `fit`, `predict` and `score` work on the whole chain.
+- It fits transformers on training rows only, which makes preprocessing leakage structurally
+  impossible.
+- It keeps preprocessing bound to the model, so a service cannot forget a step.
+- `ColumnTransformer` routes numeric and categorical columns to different treatment; nest a
+  `Pipeline` inside a branch to impute and then scale.
+- `OneHotEncoder(handle_unknown="ignore")` is required for anything that will meet new
+  categories.
+- `set_output(transform="pandas")` makes intermediate output readable; `joblib` saves the whole
+  fitted object.

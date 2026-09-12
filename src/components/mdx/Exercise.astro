@@ -12,9 +12,16 @@ interface Props {
   title?: string;
   /** The task, in one or two sentences. */
   brief?: string;
+  /**
+   * The task is to restructure code that already works, so the starter is
+   * *expected* to pass the checks — they exist to prove the rewrite did not
+   * change behaviour. scripts/verify-exercises.mjs inverts its starter check
+   * for these; every other exercise must fail from its starting point.
+   */
+  refactor?: boolean;
 }
 
-const { id, title = "Exercise", brief, ...rest } = Astro.props;
+const { id, title = "Exercise", brief, refactor: _refactor, ...rest } = Astro.props;
 ---
 
 <section class="my-8" data-exercise={id}>

@@ -1,0 +1,383 @@
+---
+title: Linear algebra you actually need
+description: Dot products, matrix multiplication, norms and cosine similarity — the handful of operations that every embedding, attention head and linear layer is built from.
+module: numerical-python
+order: 5
+level: intermediate
+minutes: 20
+objectives:
+  - Compute dot products and read what they mean geometrically
+  - Multiply matrices with @, and check the shapes line up
+  - Measure length with a norm, and normalise to unit vectors
+  - Implement cosine similarity for one query and for a whole batch
+  - Recognise a linear layer, and solve a least-squares fit
+---
+
+You do not need a linear algebra course to do AI engineering. You need four operations, and a
+firm grip on what the shapes mean.
+
+## The dot product
+
+Multiply matching elements, add the results:
+
+<Run id="np-la-1" code={`import numpy as np
+
+a = np.array([1.0, 2.0, 3.0])
+b = np.array([4.0, 5.0, 6.0])
+
+print("by hand:  ", 1 * 4 + 2 * 5 + 3 * 6)
+print("np.dot:   ", np.dot(a, b))
+print("@ operator:", a @ b)
+print("elementwise then sum:", (a * b).sum())`} />
+
+Geometrically it measures agreement: large and positive when two vectors point the same way, zero
+when they are perpendicular, negative when they oppose:
+
+<Run id="np-la-2" code={`import numpy as np
+
+same = np.array([1.0, 0.0])
+also_same = np.array([3.0, 0.0])
+perpendicular = np.array([0.0, 1.0])
+opposite = np.array([-1.0, 0.0])
+
+for name, other in [("same direction", also_same), ("perpendicular", perpendicular), ("opposite", opposite)]:
+    print(f"{name:16} {same @ other:6.1f}")`} />
+
+Note that `also_same` scores 3, not 1, purely because it is longer. That is why raw dot products
+are a poor similarity measure, and why cosine similarity divides the length out.
+
+## Norms
+
+The norm is a vector's length:
+
+<Run id="np-la-3" code={`import numpy as np
+
+vector = np.array([3.0, 4.0])
+
+print("by hand:", (3 ** 2 + 4 ** 2) ** 0.5)
+print("norm:   ", np.linalg.norm(vector))
+print("also:   ", np.sqrt(vector @ vector))
+
+unit = vector / np.linalg.norm(vector)
+print("unit vector:", unit, "length", np.linalg.norm(unit))
+
+# Per-row norms of a batch:
+batch = np.array([[3.0, 4.0], [1.0, 0.0], [1.0, 1.0]])
+print("row norms:", np.linalg.norm(batch, axis=1).round(3))`} />
+
+## Cosine similarity
+
+Dot product divided by both lengths — equivalently, the dot product of the unit vectors. It
+ranges from -1 to 1 and ignores magnitude entirely:
+
+<Run id="np-la-4" code={`import numpy as np
+
+def cosine(a, b):
+    return (a @ b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+query = np.array([1.0, 0.0])
+print("identical:    ", cosine(query, np.array([1.0, 0.0])))
+print("same, longer: ", cosine(query, np.array([5.0, 0.0])))
+print("45 degrees:   ", round(cosine(query, np.array([1.0, 1.0])), 4))
+print("perpendicular:", cosine(query, np.array([0.0, 1.0])))
+print("opposite:     ", cosine(query, np.array([-1.0, 0.0])))`} />
+
+For a whole corpus, normalise once and the similarity is a single matrix-vector product:
+
+<Run id="np-la-5" code={`import numpy as np
+
+documents = np.array([
+    [1.0, 0.0, 0.0],
+    [0.8, 0.6, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+])
+names = np.array(["exact", "close", "different", "orthogonal"])
+query = np.array([1.0, 0.2, 0.0])
+
+docs_unit = documents / np.linalg.norm(documents, axis=1, keepdims=True)
+query_unit = query / np.linalg.norm(query)
+
+similarity = docs_unit @ query_unit
+for name, score in zip(names, similarity):
+    print(f"{name:12} {score: .4f}")
+
+print()
+print("ranked:", names[np.argsort(similarity)[::-1]])`} />
+
+<Callout type="ai" title="Why this matters for AI">
+This is a vector database, minus the storage engine. Embed the corpus once, normalise it once,
+and every query is one matrix-vector product followed by an `argpartition`. Because the documents
+are pre-normalised, the dot product *is* the cosine similarity — which is why real vector indexes
+store unit vectors and use plain inner product at query time.
+</Callout>
+
+## Matrix multiplication
+
+`A @ B` requires the inner dimensions to match: `(n, k) @ (k, m)` gives `(n, m)`. Reading the
+shapes is most of the skill:
+
+<Run id="np-la-6" code={`import numpy as np
+
+A = np.arange(6).reshape(2, 3)     # (2, 3)
+B = np.arange(12).reshape(3, 4)    # (3, 4)
+
+print("A:", A.shape)
+print(A)
+print("B:", B.shape)
+print(B)
+print()
+print("A @ B ->", (A @ B).shape)
+print(A @ B)`} />
+
+<Run id="np-la-7" raises="ValueError" code={`import numpy as np
+
+A = np.arange(6).reshape(2, 3)
+C = np.arange(6).reshape(2, 3)
+
+print(A @ C)     # (2, 3) @ (2, 3): 3 does not match 2`} />
+
+The fix is nearly always a transpose. `A @ C.T` turns `(2, 3) @ (3, 2)` into `(2, 2)`:
+
+<Run id="np-la-8" code={`import numpy as np
+
+A = np.arange(6).reshape(2, 3)
+C = np.arange(6).reshape(2, 3)
+
+print("A @ C.T ->", (A @ C.T).shape)
+print(A @ C.T)
+print()
+print("A.T @ C ->", (A.T @ C).shape)`} />
+
+<Callout type="warning">
+`*` is elementwise, `@` is matrix multiplication. `A * B` on two `(2, 3)` arrays multiplies
+position by position; `A @ B` would fail. Mixing them up produces a plausible-looking array of
+the wrong numbers, which is far worse than an error.
+</Callout>
+
+## A linear layer
+
+A neural network layer is one matrix multiplication and one broadcast addition:
+
+<Run id="np-la-9" code={`import numpy as np
+
+rng = np.random.default_rng(0)
+
+batch_size, in_features, out_features = 4, 5, 3
+
+inputs = rng.normal(size=(batch_size, in_features))
+weights = rng.normal(size=(in_features, out_features)) * 0.1
+bias = np.zeros(out_features)
+
+outputs = inputs @ weights + bias        # (4, 5) @ (5, 3) -> (4, 3), then + (3,)
+
+print("inputs: ", inputs.shape)
+print("weights:", weights.shape)
+print("outputs:", outputs.shape)
+print(outputs.round(3))
+
+def relu(x):
+    return np.maximum(x, 0.0)
+
+print()
+print("after ReLU:")
+print(relu(outputs).round(3))`} />
+
+Stack two of those with an activation between them and you have a neural network — which is
+exactly what you will build by hand in module 5.
+
+## Other operations worth knowing
+
+<Run id="np-la-10" code={`import numpy as np
+
+M = np.array([[4.0, 1.0], [2.0, 3.0]])
+
+print("transpose:")
+print(M.T)
+print()
+print("determinant:", round(np.linalg.det(M), 4))
+print("inverse:")
+print(np.linalg.inv(M).round(4))
+print()
+print("M @ inverse (should be the identity):")
+print((M @ np.linalg.inv(M)).round(10))
+print()
+print("trace:", np.trace(M))
+
+eigenvalues, eigenvectors = np.linalg.eig(M)
+print("eigenvalues:", eigenvalues.round(4))`} />
+
+## Least squares
+
+Fitting a straight line is solving an overdetermined system, and NumPy does it directly. This is
+linear regression, before scikit-learn ever gets involved:
+
+<Run id="np-la-11" code={`import numpy as np
+
+# Latency against prompt length, with noise.
+lengths = np.array([100.0, 200.0, 300.0, 400.0, 500.0])
+latency = np.array([135.0, 168.0, 210.0, 238.0, 275.0])
+
+# Design matrix: one column of lengths, one of ones for the intercept.
+X = np.column_stack([lengths, np.ones_like(lengths)])
+print("X:")
+print(X)
+
+solution, residuals, rank, singular = np.linalg.lstsq(X, latency, rcond=None)
+slope, intercept = solution
+
+print()
+print(f"latency ≈ {slope:.4f} * length + {intercept:.2f}")
+print("prediction for 350 tokens:", round(slope * 350 + intercept, 1))
+print("residual sum of squares:", residuals.round(3))`} />
+
+<Callout type="tip">
+Never compute `np.linalg.inv(A) @ b` to solve a system. `np.linalg.solve(A, b)` is both faster
+and numerically better behaved, and `np.linalg.lstsq` handles the case where there is no exact
+solution — which is every real dataset.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="np-la-ex1"
+  title="Exercise 1"
+  brief="Write <code>cosine_similarity(query, documents)</code> returning one score per document row, then set <code>best</code> to the index of the closest document."
+  code={`import numpy as np
+
+documents = np.array([
+    [1.0, 0.0, 0.0],
+    [0.8, 0.6, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 2.0],
+])
+query = np.array([1.0, 0.2, 0.0])
+
+def cosine_similarity(query, documents):
+    # Return an array with one cosine similarity per row of documents.
+    ...
+
+
+scores = cosine_similarity(query, documents)
+best = None
+
+print(scores.round(4))
+print("best:", best)`}
+  hint="Normalise the documents with np.linalg.norm(documents, axis=1, keepdims=True), normalise the query, then take documents_unit @ query_unit."
+  solution={`import numpy as np
+
+documents = np.array([
+    [1.0, 0.0, 0.0],
+    [0.8, 0.6, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 2.0],
+])
+query = np.array([1.0, 0.2, 0.0])
+
+def cosine_similarity(query, documents):
+    docs_unit = documents / np.linalg.norm(documents, axis=1, keepdims=True)
+    query_unit = query / np.linalg.norm(query)
+    return docs_unit @ query_unit
+
+
+scores = cosine_similarity(query, documents)
+best = int(scores.argmax())
+
+print(scores.round(4))
+print("best:", best)`}
+  tests={`import numpy as np
+
+expected = np.array([
+    (documents[i] @ query) / (np.linalg.norm(documents[i]) * np.linalg.norm(query))
+    for i in range(len(documents))
+])
+
+result = cosine_similarity(query, documents)
+assert isinstance(result, np.ndarray), "Return a NumPy array of scores."
+assert result.shape == (4,), f"Expected one score per document — shape (4,), got {result.shape}."
+assert np.allclose(result, expected), f"Expected {expected.round(4)}, got {np.asarray(result).round(4)}."
+assert best == 0, f"The first document is the closest match, so best should be 0 — got {best!r}."
+
+# Length must not matter: scaling a document should not change its score.
+scaled = documents.copy()
+scaled[1] *= 7.0
+assert np.allclose(cosine_similarity(query, scaled), expected), (
+    "Cosine similarity ignores magnitude — scaling a row should leave its score unchanged."
+)`}
+/>
+
+<Exercise
+  id="np-la-ex2"
+  title="Exercise 2"
+  brief="Complete the linear layer: compute <code>outputs</code> as inputs times weights plus bias, then apply ReLU into <code>activated</code>."
+  code={`import numpy as np
+
+rng = np.random.default_rng(0)
+inputs = rng.normal(size=(4, 5))
+weights = rng.normal(size=(5, 3)) * 0.1
+bias = np.array([0.1, -0.2, 0.3])
+
+outputs = None       # shape (4, 3)
+activated = None     # ReLU applied to outputs
+
+print(outputs.shape)
+print(activated.round(3))`}
+  hint="inputs @ weights + bias, then np.maximum(outputs, 0.0)."
+  solution={`import numpy as np
+
+rng = np.random.default_rng(0)
+inputs = rng.normal(size=(4, 5))
+weights = rng.normal(size=(5, 3)) * 0.1
+bias = np.array([0.1, -0.2, 0.3])
+
+outputs = inputs @ weights + bias
+activated = np.maximum(outputs, 0.0)
+
+print(outputs.shape)
+print(activated.round(3))`}
+  tests={`import numpy as np
+
+assert isinstance(outputs, np.ndarray), "outputs should be a NumPy array."
+assert outputs.shape == (4, 3), (
+    f"(4, 5) @ (5, 3) gives (4, 3), and the bias broadcasts across the rows. Got {outputs.shape}."
+)
+assert np.allclose(outputs, inputs @ weights + bias), (
+    "outputs should be inputs @ weights + bias."
+)
+assert np.allclose(activated, np.maximum(outputs, 0.0)), (
+    "activated should be ReLU — every negative value replaced by 0."
+)
+assert (activated >= 0).all(), "ReLU output can never be negative."
+assert activated.shape == outputs.shape, "ReLU is elementwise, so the shape is unchanged."`}
+/>
+
+<Quiz
+  question="A is (32, 768) and B is (768, 4). What is A @ B, and what would A * B do?"
+  choices={[
+    { text: "A @ B is (32, 4); A * B raises an error because the shapes do not broadcast", correct: true, why: "Matrix multiplication needs the inner dimensions to match; elementwise multiplication needs compatible shapes, and (32, 768) against (768, 4) is neither." },
+    { text: "Both give (32, 4)", why: "* never performs matrix multiplication; it is elementwise and would need broadcastable shapes." },
+    { text: "A @ B is (768, 768)", why: "The outer dimensions survive: 32 rows and 4 columns." },
+    { text: "A @ B raises an error; A * B is (32, 4)", why: "It is the other way round — 768 matches 768, so the matrix product is well defined." },
+  ]}
+/>
+
+<Quiz
+  question="Why do vector databases store normalised embeddings and then use a plain dot product?"
+  choices={[
+    { text: "For unit vectors the dot product equals the cosine similarity, so the division is done once instead of per query", correct: true, why: "Normalising at index time turns every later search into a single matrix product with no per-query rescaling." },
+    { text: "Because dot products are the only operation the hardware supports", why: "Norms and divisions are equally supported; the point is doing them once rather than per query." },
+    { text: "Because unnormalised embeddings cannot be compared at all", why: "They can — raw dot products just conflate similarity with magnitude." },
+    { text: "To reduce the storage size of each vector", why: "Normalising changes the values, not the number of bytes." },
+  ]}
+/>
+
+## Recap
+
+- The dot product measures agreement, but it grows with length — which is why raw dot products
+  make a poor similarity.
+- `np.linalg.norm(x, axis=1, keepdims=True)` gives per-row lengths ready to divide by.
+- Cosine similarity is the dot product of unit vectors, from -1 to 1, independent of magnitude.
+- `@` is matrix multiplication and needs the inner dimensions to match; `*` is elementwise. A
+  transpose is usually the fix.
+- A linear layer is `inputs @ weights + bias`, with the bias broadcast across the batch.
+- Solve systems with `np.linalg.solve` or `np.linalg.lstsq`, never by inverting a matrix.

@@ -1,0 +1,446 @@
+---
+title: Token accounting, caching and cost control
+description: Count tokens properly, cache the stable prefix, find the one-character change that silently destroys your hit rate, and know which levers are free before you trade quality for money.
+module: llm-engineering
+order: 8
+level: advanced
+minutes: 22
+objectives:
+  - Count tokens with the API rather than guessing
+  - Read every field of the usage block, including the cache ones
+  - Structure a request so its prefix is cacheable
+  - Find the silent invalidators that take a hit rate to zero
+  - "Order the cost levers: free wins before quality trades"
+---
+
+Everything in this module has a price, and almost all of it is input tokens you sent more than
+once. This lesson is about measuring that and then reducing it — in the order that costs you
+nothing first.
+
+## Counting tokens
+
+Ask the API. Token counts are model-specific, and the endpoint is free:
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+count = client.messages.count_tokens(
+    model="claude-opus-5",
+    system=SYSTEM_PROMPT,
+    messages=[{"role": "user", "content": document}],
+)
+print(count.input_tokens)
+```
+
+<Callout type="warning">
+Do not use `tiktoken`. It is OpenAI's tokeniser and it undercounts Claude tokens by roughly
+15-20% on ordinary prose, and by considerably more on code or non-English text. An estimate from
+the wrong tokeniser is not a rough estimate, it is a wrong one — and it is wrong in the direction
+that makes you overrun a context window in production.
+</Callout>
+
+A rough local estimate is fine for a sanity check, as long as you know it is rough:
+
+<Run id="llm-cost-1" code={`def rough_tokens(text):
+    """About four characters per token for English prose. A sanity check, not a budget."""
+    return max(1, len(text) // 4)
+
+samples = {
+    "short question": "What overlap should I use when chunking?",
+    "a paragraph": "Retrieval augmented generation grounds an answer in documents you control. "
+                   "The retrieval step finds passages, and the generation step is told to answer "
+                   "only from them.",
+    "some code": "def chunk(text, size=200):\\n    words = text.split()\\n    return [words[i:i+size] for i in range(0, len(words), size)]",
+}
+
+for name, text in samples.items():
+    print(f"{name:16} {len(text):>5} chars  ~{rough_tokens(text):>4} tokens")
+
+print()
+print("Code and non-English text tokenise far less evenly — count them properly.")`} />
+
+## The usage block
+
+<Run id="llm-cost-2" code={`from types import SimpleNamespace
+
+FIELDS = [
+    ("input_tokens", "Uncached input. Full price."),
+    ("output_tokens", "What the model produced. About five times the input rate."),
+    ("cache_creation_input_tokens", "Written to the cache this call. About 1.25x the input rate."),
+    ("cache_read_input_tokens", "Served from the cache. About 0.1x the input rate."),
+]
+
+for field, meaning in FIELDS:
+    print(f"{field:30} {meaning}")
+
+print()
+
+RATES = {"input": 5.00, "output": 25.00}
+
+def cost(usage):
+    return (
+        usage.input_tokens * RATES["input"]
+        + usage.output_tokens * RATES["output"]
+        + usage.cache_creation_input_tokens * RATES["input"] * 1.25
+        + usage.cache_read_input_tokens * RATES["input"] * 0.10
+    ) / 1_000_000
+
+first = SimpleNamespace(input_tokens=200, output_tokens=300,
+                        cache_creation_input_tokens=20_000, cache_read_input_tokens=0)
+later = SimpleNamespace(input_tokens=200, output_tokens=300,
+                        cache_creation_input_tokens=0, cache_read_input_tokens=20_000)
+uncached = SimpleNamespace(input_tokens=20_200, output_tokens=300,
+                           cache_creation_input_tokens=0, cache_read_input_tokens=0)
+
+print(f"first call, writing the cache: {cost(first):.5f}")
+print(f"every later call, reading it:  {cost(later):.5f}")
+print(f"the same call with no caching: {cost(uncached):.5f}")
+print()
+print(f"saving per cached call: {(cost(uncached) - cost(later)) / cost(uncached):.1%}")`} />
+
+## How caching works
+
+The cache is a **prefix match**. The request is rendered in a fixed order, and a breakpoint says
+"everything up to here is cacheable":
+
+```text
+tools  ->  system  ->  messages
+```
+
+Any byte that changes anywhere in that prefix invalidates the cache from that point on. So the
+architecture is simple to state and easy to get wrong: **stable content first, volatile content
+last.**
+
+<Run id="llm-cost-3" code={`import hashlib
+
+def prefix_key(*parts):
+    """The cache is keyed on the exact bytes of the prefix."""
+    return hashlib.sha256("\\u0000".join(parts).encode("utf-8")).hexdigest()[:12]
+
+TOOLS = "[search_docs, read_doc]"
+SYSTEM = "You are a documentation assistant. Answer only from the provided context."
+
+cache = {}
+
+def call(tools, system, question):
+    key = prefix_key(tools, system)
+    hit = key in cache
+    cache[key] = True
+    return "HIT " if hit else "MISS"
+
+print(call(TOOLS, SYSTEM, "What is chunking?"), "first call")
+print(call(TOOLS, SYSTEM, "What about overlap?"), "same prefix, different question")
+print(call(TOOLS, SYSTEM, "And embeddings?"), "same prefix again")
+print()
+print(call(TOOLS, SYSTEM + " Today is 2026-03-01.", "What is chunking?"), "<- system prompt changed")
+print(call("[search_docs, read_doc, delete_doc]", SYSTEM, "What is chunking?"), "<- tool list changed")`} />
+
+On your own machine, the simplest form caches the last cacheable block automatically:
+
+```python
+response = client.messages.create(
+    model="claude-opus-5",
+    max_tokens=16000,
+    cache_control={"type": "ephemeral"},        # cache the last cacheable block
+    system=LARGE_STABLE_SYSTEM_PROMPT,
+    messages=[{"role": "user", "content": question}],
+)
+```
+
+Or place breakpoints yourself, when you want the boundary in a specific spot:
+
+```python
+response = client.messages.create(
+    model="claude-opus-5",
+    max_tokens=16000,
+    system=[
+        {"type": "text", "text": STABLE_INSTRUCTIONS},
+        {"type": "text", "text": THE_WHOLE_HANDBOOK,
+         "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+    ],
+    messages=[{"role": "user", "content": question}],
+)
+```
+
+At most four breakpoints per request. The default time to live is five minutes, refreshed on each
+hit; `"1h"` is available when your traffic is spikier than that.
+
+<Callout type="warning">
+There is a minimum cacheable prefix — between about 512 and 4,096 tokens depending on the model.
+Below it, nothing is cached and nothing tells you so: `cache_read_input_tokens` simply stays at
+zero. Caching a 200-token system prompt does nothing at all.
+</Callout>
+
+## Silent invalidators
+
+This is where hit rates actually go to die:
+
+<Run id="llm-cost-4" code={`import json
+from datetime import datetime
+
+INVALIDATORS = [
+    ("A timestamp in the system prompt",
+     'f"Today is {datetime.now()}"  ->  every request is a fresh prefix',
+     'Put the date in the *user* message, after the last breakpoint.'),
+    ("A request id or UUID in the prefix",
+     "Same problem, once per request.",
+     "Move it after the cached prefix, or into metadata."),
+    ("Unsorted json.dumps of a dict",
+     "Key order can vary, so identical data serialises differently.",
+     "json.dumps(..., sort_keys=True)."),
+    ("A tool list built from a set or dict iteration",
+     "Tools render before system, so a reordered tool list invalidates everything.",
+     "Build the list in a fixed, sorted order."),
+    ("Changing effort or model mid-conversation",
+     "Caches are per model, and a top-level effort change resets the messages cache.",
+     "Keep a route on one model and one effort."),
+]
+
+for problem, why, fix in INVALIDATORS:
+    print(f"- {problem}\\n    {why}\\n    fix: {fix}")`} />
+
+<Run id="llm-cost-5" code={`import json, hashlib
+
+def render_prefix(tools, system):
+    return json.dumps({"tools": tools, "system": system}, sort_keys=True)
+
+def fingerprint(prefix):
+    return hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:10]
+
+tools_a = [{"name": "search"}, {"name": "read"}]
+tools_b = [{"name": "read"}, {"name": "search"}]        # same set, different order
+
+print("sorted by name:")
+for tools in (tools_a, tools_b):
+    ordered = sorted(tools, key=lambda t: t["name"])
+    print("  ", fingerprint(render_prefix(ordered, "stable system prompt")))
+
+print("as given:")
+for tools in (tools_a, tools_b):
+    print("  ", fingerprint(render_prefix(tools, "stable system prompt")))`} />
+
+Two identical tool sets, two different cache keys — unless you sort them. Verify in production
+rather than assuming:
+
+<Run id="llm-cost-6" code={`from types import SimpleNamespace
+
+def cache_health(usages):
+    reads = sum(u.cache_read_input_tokens for u in usages)
+    writes = sum(u.cache_creation_input_tokens for u in usages)
+    fresh = sum(u.input_tokens for u in usages)
+    total = reads + writes + fresh
+    return {
+        "hit_rate": round(reads / total, 3) if total else 0.0,
+        "read": reads, "written": writes, "uncached": fresh,
+    }
+
+healthy = [SimpleNamespace(input_tokens=150, output_tokens=200,
+                           cache_creation_input_tokens=18_000 if i == 0 else 0,
+                           cache_read_input_tokens=0 if i == 0 else 18_000)
+           for i in range(10)]
+
+broken = [SimpleNamespace(input_tokens=150, output_tokens=200,
+                          cache_creation_input_tokens=18_000,
+                          cache_read_input_tokens=0)
+          for _ in range(10)]
+
+print("healthy:", cache_health(healthy))
+print("broken: ", cache_health(broken))
+print()
+print("A hit rate near zero with repeated writes means the prefix changes every request.")`} />
+
+That second pattern — writing the cache on every single call and never reading it — costs you
+*more* than not caching at all, because writes are 1.25x.
+
+<Callout type="ai" title="Why this matters for AI">
+Caching is the one lever that is genuinely free: the answer does not change, only the bill. A RAG
+system with a large stable system prompt, or an agent resending a growing history, is exactly the
+shape that benefits most — and those are the systems where the prefix is easiest to break by
+accident. Check `cache_read_input_tokens` on real traffic. If it is zero, something in your
+prefix moves, and finding it is usually worth more than every other optimisation combined.
+</Callout>
+
+## The order of the levers
+
+<Run id="llm-cost-7" code={`LEVERS = [
+    ("free", "Prompt caching", "Stable prefix, volatile content last. No quality change."),
+    ("free", "Input hygiene", "Stop resending what the model does not need. No quality change."),
+    ("free", "Output hygiene", "Ask for shorter answers. Output is ~5x the input rate."),
+    ("free", "Batch API", "50% off for anything not latency-sensitive."),
+    ("trade", "Lower effort", "Measurably cheaper; measure whether quality holds on your traffic."),
+    ("trade", "A smaller model", "Much cheaper; needs an eval to justify per route."),
+    ("trade", "Fewer agent rounds", "Cheaper, and sometimes worse. Bound it either way."),
+]
+
+print(f"{'kind':>6}  {'lever':<18} {'note'}")
+for kind, lever, note in LEVERS:
+    print(f"{kind:>6}  {lever:<18} {note}")
+
+print()
+print("Do every free lever before trading any quality — and judge cost per completed task,")
+print("not per request. A cheaper call that needs three attempts is not cheaper.")`} />
+
+The batch path is worth knowing, because half price for no quality change is unusual:
+
+```python
+batch = client.messages.batches.create(requests=[
+    {"custom_id": "q-1", "params": {"model": "claude-opus-5", "max_tokens": 1024,
+                                    "messages": [{"role": "user", "content": "..."}]}},
+    {"custom_id": "q-2", "params": {...}},
+])
+
+while client.messages.batches.retrieve(batch.id).processing_status != "ended":
+    time.sleep(30)
+
+for entry in client.messages.batches.results(batch.id):
+    if entry.result.type == "succeeded":
+        store(entry.custom_id, entry.result.message)
+```
+
+<Callout type="warning">
+Batch results arrive in **any order**. Key them by `custom_id` — never by position. Nightly
+evaluations, backfills and bulk classification are all natural batch workloads.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="llm-cost-ex1"
+  title="Exercise 1"
+  brief="Write <code>break_even(prefix_tokens)</code>: how many requests before caching a prefix of that size is cheaper than not caching, given a write of 1.25x and a read of 0.1x."
+  code={`def break_even(prefix_tokens, write_multiplier=1.25, read_multiplier=0.10):
+    # Uncached: n requests each pay 1.0x for the prefix.
+    # Cached:   the first pays write_multiplier, the rest pay read_multiplier.
+    # Return the smallest n where cached total < uncached total.
+    # Return None if caching never wins.
+    ...
+
+
+for size in [1_000, 20_000]:
+    print(size, "->", break_even(size))`}
+  hint="Compare n * 1.0 against write_multiplier + (n - 1) * read_multiplier, increasing n from 1. The prefix size cancels out — which is itself worth noticing."
+  solution={`def break_even(prefix_tokens, write_multiplier=1.25, read_multiplier=0.10):
+    n = 1
+    while n < 10_000:
+        uncached = n * 1.0
+        cached = write_multiplier + (n - 1) * read_multiplier
+        if cached < uncached:
+            return n
+        n += 1
+    return None
+
+
+for size in [1_000, 20_000]:
+    print(size, "->", break_even(size))`}
+  tests={`result = break_even(20_000)
+assert result == 2, (
+    f"At 1.25x to write and 0.1x to read, two requests already beat two uncached ones "
+    f"(1.35 against 2.0). Got {result!r}."
+)
+assert break_even(1_000) == 2, "The prefix size cancels out, so the answer is the same."
+
+# A punitive write cost should push the break-even point out.
+expensive = break_even(20_000, write_multiplier=5.0, read_multiplier=0.5)
+assert expensive is not None and expensive > 2, (
+    f"A 5x write should take longer to pay back, got {expensive!r}."
+)
+assert 5.0 + (expensive - 1) * 0.5 < expensive * 1.0, "The returned n must actually be cheaper."
+assert 5.0 + (expensive - 2) * 0.5 >= (expensive - 1) * 1.0, (
+    f"n should be the *smallest* number of requests that wins, got {expensive}."
+)
+
+# If a read costs as much as a fresh request, caching can never pay for itself.
+assert break_even(20_000, write_multiplier=1.25, read_multiplier=1.0) is None, (
+    "With reads at full price the cache never wins — return None."
+)`}
+/>
+
+<Exercise
+  id="llm-cost-ex2"
+  title="Exercise 2"
+  brief="Write <code>first_difference(a, b)</code>: the index of the first character where two rendered prefixes diverge, or <code>None</code> when they are identical — the fastest way to find a cache invalidator."
+  code={`def first_difference(a, b):
+    # Return the index of the first differing character.
+    # If one is a prefix of the other, return the length of the shorter.
+    # Return None when they are identical.
+    ...
+
+
+stable = "SYSTEM: You are a docs assistant."
+drifting = "SYSTEM: You are a docs assistant. Today is 2026-03-01."
+
+index = first_difference(stable, drifting)
+print("diverges at", index)
+print("from:", repr(drifting[index:index + 20]))`}
+  hint="zip(a, b) walks both together; enumerate gives the index. After the loop, compare the lengths."
+  solution={`def first_difference(a, b):
+    for index, (left, right) in enumerate(zip(a, b)):
+        if left != right:
+            return index
+    if len(a) != len(b):
+        return min(len(a), len(b))
+    return None
+
+
+stable = "SYSTEM: You are a docs assistant."
+drifting = "SYSTEM: You are a docs assistant. Today is 2026-03-01."
+
+index = first_difference(stable, drifting)
+print("diverges at", index)
+print("from:", repr(drifting[index:index + 20]))`}
+  tests={`assert first_difference("abc", "abc") is None, "Identical strings do not diverge."
+assert first_difference("abc", "abd") == 2, (
+    f"The third character differs, so index 2. Got {first_difference('abc', 'abd')!r}."
+)
+assert first_difference("abc", "abcdef") == 3, (
+    f"When one is a prefix of the other, the divergence is at the shorter length. "
+    f"Got {first_difference('abc', 'abcdef')!r}."
+)
+assert first_difference("abcdef", "abc") == 3, "It must work whichever argument is longer."
+assert first_difference("", "") is None, "Two empty strings are identical."
+assert first_difference("", "x") == 0, "An empty string diverges from a non-empty one at 0."
+assert first_difference("xyz", "abc") == 0, "A difference at the very start is index 0."
+
+# The realistic case: a timestamp appended to a stable system prompt.
+stable = "SYSTEM: You are a docs assistant."
+drifting = "SYSTEM: You are a docs assistant. Today is 2026-03-01."
+index = first_difference(stable, drifting)
+assert index == len(stable), (
+    f"The prefixes match until the timestamp, so the answer is {len(stable)}. Got {index}."
+)
+assert drifting[index:].startswith(" Today is"), "The divergence should point at the timestamp."`}
+/>
+
+<Quiz
+  question="Your cache_read_input_tokens is zero across thousands of requests with the same system prompt. What is happening?"
+  choices={[
+    { text: "Something in the prefix changes every request — or the prefix is below the minimum cacheable size", correct: true, why: "A timestamp, a UUID, an unsorted dict or a reordered tool list all produce a fresh key each time; and below the minimum nothing caches, silently." },
+    { text: "The cache expired, because the TTL is only five minutes", why: "The TTL refreshes on every hit, and steady traffic keeps it warm — zero reads across thousands of requests is not expiry." },
+    { text: "Caching has to be enabled per account", why: "It is a per-request parameter, not an account setting." },
+    { text: "The model does not support caching", why: "Current models do; the symptom points at the prefix." },
+  ]}
+/>
+
+<Quiz
+  question="Which cost lever should you exhaust before trading any quality?"
+  choices={[
+    { text: "Prompt caching, input and output hygiene, and the Batch API — none of which change the answer", correct: true, why: "They reduce what you pay for identical output, so there is nothing to measure but the bill. Effort and model choice come after, with an eval." },
+    { text: "Switching to the smallest model immediately", why: "That is the biggest quality trade available, and it belongs last, behind a measurement." },
+    { text: "Lowering effort everywhere", why: "Often right per route, but it is a trade and needs evidence — do the free levers first." },
+    { text: "Reducing the number of agent rounds", why: "Sometimes correct, but fewer rounds can mean unfinished work, so it is a trade too." },
+  ]}
+/>
+
+## Recap
+
+- Count tokens with `client.messages.count_tokens`, never with `tiktoken`.
+- `usage` has four fields: uncached input, output, cache writes (~1.25x) and cache reads (~0.1x).
+- The cache is a prefix match over `tools -> system -> messages`. Stable content first, volatile
+  content after the last breakpoint. At most four breakpoints, and a minimum prefix size below
+  which nothing caches silently.
+- Timestamps, UUIDs, unsorted JSON and reordered tool lists are the invalidators to hunt for; a
+  hit rate near zero with repeated writes costs more than no cache at all.
+- Do the free levers — caching, input and output hygiene, batch — before trading any quality, and
+  judge cost per completed task.

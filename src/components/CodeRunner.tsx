@@ -52,6 +52,7 @@ export default function CodeRunner({
   const source = useRef(code);
 
   const [lines, setLines] = useState<Line[]>([]);
+  const [figures, setFigures] = useState<string[]>([]);
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<RunResult | null>(null);
   const [phase, setPhase] = useState<RuntimePhase>("idle");
@@ -129,6 +130,7 @@ export default function CodeRunner({
     setRunning(true);
     setResult(null);
     setLines([]);
+    setFigures([]);
 
     const buffer: Line[] = [];
     let frame = 0;
@@ -145,6 +147,7 @@ export default function CodeRunner({
           // Batch repaints: a tight print loop can emit thousands of lines.
           if (!frame) frame = requestAnimationFrame(flush);
         },
+        onFigure: (src) => setFigures((previous) => [...previous, src]),
       }
     );
 
@@ -178,6 +181,7 @@ export default function CodeRunner({
       // Nothing stored to clear.
     }
     setLines([]);
+    setFigures([]);
     setResult(null);
     setShowSolution(false);
   };
@@ -281,7 +285,7 @@ export default function CodeRunner({
       )}
 
       {/* Output */}
-      {(lines.length > 0 || result) && (
+      {(lines.length > 0 || figures.length > 0 || result) && (
         <div className="border-t" style={{ borderColor: "var(--border)", background: "var(--code-bg)" }}>
           <div className="flex items-center justify-between px-3 pt-2 text-[11px] font-medium uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>
             <span>Output</span>
@@ -302,12 +306,24 @@ export default function CodeRunner({
             {result?.ok === false && result.error && (
               <span style={{ color: "#f87171" }}>{result.error}</span>
             )}
-            {lines.length === 0 && result?.ok && !result.error && (
+            {lines.length === 0 && figures.length === 0 && result?.ok && !result.error && (
               <span style={{ color: "var(--text-faint)" }}>
                 Ran cleanly with no output. Add a <code>print(...)</code> to see a value.
               </span>
             )}
           </pre>
+
+          {/* matplotlib figures, drawn transparent so the page shows through */}
+          {figures.map((src, i) => (
+            <figure key={src.slice(-24) + i} className="border-t px-3 py-3" style={{ borderColor: "var(--border)" }}>
+              <img
+                src={src}
+                alt={figures.length > 1 ? `Figure ${i + 1}` : "Figure"}
+                className="mx-auto block h-auto max-w-full"
+                loading="lazy"
+              />
+            </figure>
+          ))}
         </div>
       )}
 

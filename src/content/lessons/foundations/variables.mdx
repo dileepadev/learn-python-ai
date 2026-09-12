@@ -114,7 +114,7 @@ for value in (message, age, score, active, nothing):
 
 Many languages quietly convert a number to text when you add it to a string. Python refuses:
 
-<Run id="f-var-9" code={`age = 28
+<Run id="f-var-9" raises="TypeError" code={`age = 28
 print("I am " + age + " years old")`} />
 
 `TypeError: can only concatenate str (not "int") to str`. The fix is to convert explicitly:
@@ -130,7 +130,7 @@ and inserted. It is the clearest of the three and the one you should reach for b
 
 Conversion works in both directions, and fails loudly when it can't:
 
-<Run id="f-var-11" code={`print(int("42") + 1)
+<Run id="f-var-11" raises="ValueError" code={`print(int("42") + 1)
 print(float("3.14") * 2)
 print(str(99) + "!")
 print(int(9.99))        # truncates toward zero, does not round

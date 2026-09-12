@@ -7,7 +7,7 @@
  *
  * Protocol
  *   in : {type:"boot"} | {type:"run", id, code, stdin?, tests?}
- *   out: {type:"status"|"ready"|"out"|"done"|"fatal", ...}
+ *   out: {type:"status"|"ready"|"out"|"figure"|"done"|"fatal", ...}
  */
 
 const PYODIDE_VERSION = "314.0.6";
@@ -77,6 +77,87 @@ function wireStdin(raw) {
 }
 
 /**
+ * Point matplotlib at a headless backend and a palette that survives both
+ * themes.
+ *
+ * There is no DOM in a worker, so the interactive backends cannot draw; AGG
+ * renders to a buffer instead, which we then hand to the page as a PNG. The
+ * chrome — axes, ticks, labels, grid — is drawn in a mid grey that stays
+ * legible against the light and the dark background, and the figure itself is
+ * saved transparent so the page shows through rather than a white slab.
+ */
+const MATPLOTLIB_SETUP = `
+import matplotlib
+matplotlib.use("AGG")
+import matplotlib.pyplot as _plt
+
+_chrome = "#8a8f98"
+_plt.rcParams.update({
+    "figure.figsize": (7.0, 4.0),
+    "figure.dpi": 110,
+    "figure.constrained_layout.use": True,
+    "figure.facecolor": "none",
+    "axes.facecolor": "none",
+    "savefig.facecolor": "none",
+    "savefig.transparent": True,
+    "text.color": _chrome,
+    "axes.labelcolor": _chrome,
+    "axes.edgecolor": _chrome,
+    "axes.titlecolor": _chrome,
+    "xtick.color": _chrome,
+    "ytick.color": _chrome,
+    "grid.color": _chrome,
+    "grid.alpha": 0.25,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "legend.frameon": False,
+    "font.size": 11,
+})
+`;
+
+/** True once MATPLOTLIB_SETUP has run for this interpreter. */
+let plotsReady = false;
+
+/**
+ * Renders every figure the program left open to a PNG data URL, then closes
+ * them so the next run starts with a clean canvas.
+ */
+const COLLECT_FIGURES = `
+def _collect_figures():
+    import base64, io, warnings
+    import matplotlib.pyplot as plt
+
+    images = []
+    for number in plt.get_fignums():
+        figure = plt.figure(number)
+        buffer = io.BytesIO()
+        # Rendering is ours, not the reader's: a deprecation warning from
+        # inside savefig would otherwise surface as red text under their code.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            figure.savefig(buffer, format="png", transparent=True)
+        images.append(base64.b64encode(buffer.getvalue()).decode("ascii"))
+    plt.close("all")
+    return images
+
+_collect_figures()
+`;
+
+async function emitFigures() {
+  if (!plotsReady) return;
+  try {
+    const images = await pyodide.runPythonAsync(COLLECT_FIGURES);
+    const list = images?.toJs ? images.toJs() : images;
+    images?.destroy?.();
+    for (const base64 of list ?? []) {
+      post({ type: "figure", id: activeId, src: `data:image/png;base64,${base64}` });
+    }
+  } catch {
+    // A figure that will not render should never fail the learner's run.
+  }
+}
+
+/**
  * Strip the interpreter's own frames so a NameError points at line 3 of the
  * learner's file, not line 3 of Pyodide's internals.
  */
@@ -108,11 +189,19 @@ async function run({ id, code, stdin, tests }) {
       // ImportError below, not as a runner failure.
     }
 
+    // Configure plotting the first time a program pulls matplotlib in, so the
+    // cost falls only on lessons that actually draw.
+    if (!plotsReady && pyodide.loadedPackages?.matplotlib) {
+      await pyodide.runPythonAsync(MATPLOTLIB_SETUP);
+      plotsReady = true;
+    }
+
     // Fresh namespace per run: no leakage between attempts.
     const globals = pyodide.globals.get("dict")();
     globals.set("__name__", "__main__");
 
     await pyodide.runPythonAsync(code, { globals, filename: "<your code>" });
+    await emitFigures();
 
     let testsPassed = null;
     if (tests) {
@@ -139,6 +228,9 @@ async function run({ id, code, stdin, tests }) {
       elapsed: Math.round(performance.now() - started),
     });
   } catch (err) {
+    // Show — and crucially, close — whatever was drawn before the failure, so
+    // a half-built figure does not reappear in the next run's output.
+    await emitFigures();
     post({
       type: "done",
       id,

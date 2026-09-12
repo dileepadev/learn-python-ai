@@ -1,0 +1,446 @@
+---
+title: Gradient descent from scratch
+description: Build the optimiser every model is trained with — full-batch, stochastic and mini-batch — and see exactly what the learning rate does when you get it wrong.
+module: ml-foundations
+order: 7
+level: advanced
+minutes: 20
+objectives:
+  - Implement full-batch gradient descent for linear regression
+  - Diagnose a learning rate that is too small, too large or divergent
+  - Explain why feature scaling changes how fast descent converges
+  - Implement stochastic and mini-batch gradient descent
+  - Add momentum, and see why it helps
+---
+
+Module 3 established what a gradient is. This lesson turns it into the optimiser that trains
+every model you will ever use, in about fifteen lines.
+
+## Full-batch gradient descent
+
+Compute the gradient over all the data, take one step against it, repeat:
+
+<Run id="ml-gd-1" code={`import numpy as np
+
+rng = np.random.default_rng(0)
+n, features = 200, 3
+X = rng.normal(size=(n, features))
+true_w = np.array([2.0, -1.0, 0.5])
+y = X @ true_w + rng.normal(0, 0.1, n)
+
+def loss(w):
+    return np.mean((X @ w - y) ** 2)
+
+def gradient(w):
+    return X.T @ (2 * (X @ w - y) / n)
+
+w = np.zeros(features)
+learning_rate = 0.1
+
+for step in range(1, 101):
+    w = w - learning_rate * gradient(w)
+    if step % 20 == 0:
+        print(f"step {step:3}  loss {loss(w):.6f}  w {w.round(4)}")
+
+print()
+print("recovered:", w.round(3))
+print("true:     ", true_w)`} />
+
+Three lines do the work: predict, measure the error, step against the gradient. Everything else
+in deep learning is elaboration on those three.
+
+## The learning rate
+
+It is the one hyperparameter you cannot avoid tuning, and all three failure modes are worth
+seeing:
+
+<Run id="ml-gd-2" code={`import numpy as np
+
+rng = np.random.default_rng(0)
+n = 200
+X = rng.normal(size=(n, 3))
+true_w = np.array([2.0, -1.0, 0.5])
+y = X @ true_w + rng.normal(0, 0.1, n)
+
+def run(learning_rate, steps=60):
+    w = np.zeros(3)
+    history = []
+    for _ in range(steps):
+        w = w - learning_rate * (X.T @ (2 * (X @ w - y) / n))
+        history.append(np.mean((X @ w - y) ** 2))
+        if not np.isfinite(history[-1]):
+            break
+    return history
+
+for learning_rate in [0.001, 0.05, 0.4, 1.1]:
+    history = run(learning_rate)
+    final = history[-1]
+    verdict = "diverged" if not np.isfinite(final) else f"loss {final:.6f}"
+    print(f"lr {learning_rate:<6} after {len(history):2} steps: {verdict}")`} />
+
+<Run id="ml-gd-3" code={`import matplotlib.pyplot as plt
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 200
+X = rng.normal(size=(n, 3))
+y = X @ np.array([2.0, -1.0, 0.5]) + rng.normal(0, 0.1, n)
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+for learning_rate in [0.001, 0.01, 0.05, 0.3]:
+    w = np.zeros(3)
+    history = []
+    for _ in range(80):
+        w = w - learning_rate * (X.T @ (2 * (X @ w - y) / n))
+        history.append(np.mean((X @ w - y) ** 2))
+    ax.plot(history, label=f"lr={learning_rate}")
+
+ax.set_yscale("log")
+ax.set_xlabel("step")
+ax.set_ylabel("loss (log scale)")
+ax.set_title("Learning rate")
+ax.legend()
+ax.grid(True, alpha=0.3)`} />
+
+- **Too small** — it converges, eventually, but you will run out of patience first.
+- **About right** — a smooth drop that flattens out.
+- **Too large** — the loss bounces, or overshoots so badly it goes to infinity.
+
+<Callout type="tip">
+Plot the loss on a log scale from the very first run. A smooth downward line means the rate is
+sane; a flat line means it is too small; anything jagged or rising means it is too large. You can
+diagnose in ten seconds what would otherwise be an afternoon.
+</Callout>
+
+## Scaling changes the geometry
+
+Gradient descent follows the steepest direction, which is only the *right* direction when the
+features are on comparable scales:
+
+<Run id="ml-gd-4" code={`import numpy as np
+
+rng = np.random.default_rng(0)
+n = 300
+raw = np.column_stack([
+    rng.normal(0, 1, n),        # already small
+    rng.normal(0, 500, n),      # a thousand times larger
+])
+y = raw @ np.array([3.0, 0.01]) + rng.normal(0, 0.1, n)
+
+def descend(X, steps=300, learning_rate=1e-3):
+    w = np.zeros(X.shape[1])
+    for _ in range(steps):
+        grad = X.T @ (2 * (X @ w - y) / len(y))
+        if not np.all(np.isfinite(grad)):
+            return None
+        w = w - learning_rate * grad
+    return np.mean((X @ w - y) ** 2)
+
+scaled = (raw - raw.mean(axis=0)) / raw.std(axis=0)
+
+print("unscaled features:", descend(raw))
+print("scaled features:  ", round(descend(scaled), 8))`} />
+
+With wildly different scales, a learning rate small enough to be stable for the large feature is
+far too small for the small one — so one weight barely moves. Standardising the features makes a
+single learning rate work for all of them.
+
+## Stochastic and mini-batch
+
+Full-batch descent uses every row for each step, which is exact and, on a million rows, slow.
+**Stochastic** descent uses one row; **mini-batch** uses a handful, and is what everything
+actually does:
+
+<Run id="ml-gd-5" code={`import numpy as np
+
+rng = np.random.default_rng(0)
+n, features = 2000, 4
+X = rng.normal(size=(n, features))
+true_w = np.array([2.0, -1.0, 0.5, 1.5])
+y = X @ true_w + rng.normal(0, 0.1, n)
+
+def loss(w):
+    return np.mean((X @ w - y) ** 2)
+
+def minibatch_descent(batch_size, epochs=10, learning_rate=0.05, seed=0):
+    local = np.random.default_rng(seed)
+    w = np.zeros(features)
+    updates = 0
+    for _ in range(epochs):
+        order = local.permutation(n)             # reshuffle every epoch
+        for start in range(0, n, batch_size):
+            rows = order[start:start + batch_size]
+            Xb, yb = X[rows], y[rows]
+            w = w - learning_rate * (Xb.T @ (2 * (Xb @ w - yb) / len(rows)))
+            updates += 1
+    return w, updates
+
+print(f"{'batch size':>11} {'updates':>8} {'final loss':>12}")
+for batch_size in [1, 16, 128, n]:
+    w, updates = minibatch_descent(batch_size)
+    label = "full batch" if batch_size == n else str(batch_size)
+    print(f"{label:>11} {updates:>8} {loss(w):>12.6f}")`} />
+
+A small batch gives many cheap, noisy steps; a large batch gives few expensive, accurate ones.
+The noise is not purely a cost — it helps the optimiser escape narrow valleys.
+
+<Callout type="ai" title="Why this matters for AI">
+This is literally how a language model is trained, at a different scale: sample a batch of
+sequences, compute the loss, backpropagate, step the optimiser, repeat for a few hundred
+thousand steps. Batch size and learning rate are the two knobs that dominate whether training
+converges at all, and they interact — doubling the batch size roughly justifies increasing the
+learning rate. Everything else, from Adam to warmup schedules to gradient clipping, is a
+refinement of the loop you just wrote.
+</Callout>
+
+## Momentum
+
+Plain descent zig-zags across a narrow valley. Momentum keeps a running average of recent
+gradients, which cancels the zig-zag and accelerates along the floor of the valley:
+
+<Run id="ml-gd-6" code={`import numpy as np
+
+rng = np.random.default_rng(0)
+n = 400
+# A deliberately ill-conditioned problem: one direction far steeper than the other.
+X = np.column_stack([rng.normal(0, 1, n), rng.normal(0, 0.05, n)])
+y = X @ np.array([1.0, 3.0]) + rng.normal(0, 0.01, n)
+
+def loss(w):
+    return np.mean((X @ w - y) ** 2)
+
+def gradient(w):
+    return X.T @ (2 * (X @ w - y) / n)
+
+def plain(steps, learning_rate=0.3):
+    w = np.zeros(2)
+    for _ in range(steps):
+        w = w - learning_rate * gradient(w)
+    return w
+
+def with_momentum(steps, learning_rate=0.3, beta=0.9):
+    w = np.zeros(2)
+    velocity = np.zeros(2)
+    for _ in range(steps):
+        velocity = beta * velocity + (1 - beta) * gradient(w)
+        w = w - learning_rate * velocity
+    return w
+
+for steps in [50, 200, 1000]:
+    print(f"after {steps:5} steps:  plain {loss(plain(steps)):.6f}   "
+          f"momentum {loss(with_momentum(steps)):.6f}")`} />
+
+## Logistic regression by hand
+
+The same loop, with a different loss. For classification the loss is cross-entropy, and its
+gradient is remarkably tidy — the prediction minus the truth:
+
+<Run id="ml-gd-7" code={`import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=500, n_features=4, n_informative=3,
+                           n_redundant=0, n_clusters_per_class=1, random_state=0)
+X = np.column_stack([X, np.ones(len(X))])          # a column of ones for the intercept
+
+def sigmoid(z):
+    return 1 / (1 + np.exp(-np.clip(z, -500, 500)))
+
+def cross_entropy(w):
+    p = np.clip(sigmoid(X @ w), 1e-12, 1 - 1e-12)
+    return -np.mean(y * np.log(p) + (1 - y) * np.log(1 - p))
+
+w = np.zeros(X.shape[1])
+for step in range(1, 2001):
+    p = sigmoid(X @ w)
+    w = w - 0.5 * (X.T @ (p - y) / len(y))         # the whole gradient
+    if step % 500 == 0:
+        accuracy = ((p >= 0.5).astype(int) == y).mean()
+        print(f"step {step:4}  loss {cross_entropy(w):.4f}  accuracy {accuracy:.4f}")
+
+print()
+reference = LogisticRegression(max_iter=5000, C=1e6).fit(X[:, :-1], y)
+print("ours:     ", w[:-1].round(3))
+print("sklearn:  ", reference.coef_[0].round(3))`} />
+
+<Callout type="warning">
+`sigmoid` clips its input before the exponential for the same reason softmax subtracts its
+maximum: `np.exp(800)` overflows to infinity, and the loss becomes `nan` for the rest of
+training. Clamping the logits and the probabilities is not optional in a hand-written loop.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="ml-gd-ex1"
+  title="Exercise 1"
+  brief="Write <code>descend(X, y, learning_rate, steps)</code>: start from zeros, take that many full-batch gradient-descent steps on the mean squared error, and return the weights."
+  code={`import numpy as np
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(200, 3))
+true_w = np.array([1.5, -2.0, 0.5])
+y = X @ true_w + rng.normal(0, 0.05, 200)
+
+def descend(X, y, learning_rate=0.1, steps=200):
+    # Start at zeros. Each step: gradient of mean((X @ w - y) ** 2),
+    # then w = w - learning_rate * gradient.
+    ...
+
+
+w = descend(X, y)
+print(w.round(3))
+print("loss:", round(float(np.mean((X @ w - y) ** 2)), 8))`}
+  hint="The gradient is X.T @ (2 * (X @ w - y) / len(y)). Loop steps times, updating w each time."
+  solution={`import numpy as np
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(200, 3))
+true_w = np.array([1.5, -2.0, 0.5])
+y = X @ true_w + rng.normal(0, 0.05, 200)
+
+def descend(X, y, learning_rate=0.1, steps=200):
+    w = np.zeros(X.shape[1])
+    for _ in range(steps):
+        w = w - learning_rate * (X.T @ (2 * (X @ w - y) / len(y)))
+    return w
+
+
+w = descend(X, y)
+print(w.round(3))
+print("loss:", round(float(np.mean((X @ w - y) ** 2)), 8))`}
+  tests={`import numpy as np
+
+result = descend(X, y)
+assert isinstance(result, np.ndarray), "Return the weight vector as a NumPy array."
+assert result.shape == (3,), f"One weight per feature — expected shape (3,), got {result.shape}."
+assert np.allclose(result, true_w, atol=0.02), (
+    f"After 200 steps the weights should be close to {true_w}, got {result.round(4)}."
+)
+
+# Fewer steps must get further from the answer, proving it really is iterating.
+early = descend(X, y, steps=5)
+assert np.linalg.norm(early - true_w) > np.linalg.norm(result - true_w), (
+    "Five steps should be further from the solution than 200 — check the loop runs steps times."
+)
+
+# A smaller learning rate should progress more slowly.
+slow = descend(X, y, learning_rate=0.001, steps=200)
+assert np.linalg.norm(slow - true_w) > np.linalg.norm(result - true_w), (
+    "A much smaller learning rate should get less far in the same number of steps — "
+    "make sure learning_rate is actually used."
+)
+
+# It must start from zeros rather than a random point.
+assert np.allclose(descend(X, y, steps=0), np.zeros(3)), (
+    "With zero steps the weights should still be all zeros."
+)`}
+/>
+
+<Exercise
+  id="ml-gd-ex2"
+  title="Exercise 2"
+  brief="Write <code>minibatch(X, y, batch_size, epochs, learning_rate, seed)</code>: reshuffle the rows each epoch and take one gradient step per batch."
+  code={`import numpy as np
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(600, 3))
+true_w = np.array([1.0, -1.5, 2.0])
+y = X @ true_w + rng.normal(0, 0.05, 600)
+
+def minibatch(X, y, batch_size=32, epochs=20, learning_rate=0.1, seed=0):
+    # Each epoch: permute the row indices with np.random.default_rng(seed),
+    # walk them in blocks of batch_size, and take one step per block using
+    # only that block's rows.
+    ...
+
+
+w = minibatch(X, y)
+print(w.round(3))
+print("loss:", round(float(np.mean((X @ w - y) ** 2)), 8))`}
+  hint="local = np.random.default_rng(seed) once, then for each epoch: order = local.permutation(len(X)), and for start in range(0, len(X), batch_size) take rows = order[start:start + batch_size]."
+  solution={`import numpy as np
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(600, 3))
+true_w = np.array([1.0, -1.5, 2.0])
+y = X @ true_w + rng.normal(0, 0.05, 600)
+
+def minibatch(X, y, batch_size=32, epochs=20, learning_rate=0.1, seed=0):
+    local = np.random.default_rng(seed)
+    w = np.zeros(X.shape[1])
+    for _ in range(epochs):
+        order = local.permutation(len(X))
+        for start in range(0, len(X), batch_size):
+            rows = order[start:start + batch_size]
+            Xb, yb = X[rows], y[rows]
+            w = w - learning_rate * (Xb.T @ (2 * (Xb @ w - yb) / len(rows)))
+    return w
+
+
+w = minibatch(X, y)
+print(w.round(3))
+print("loss:", round(float(np.mean((X @ w - y) ** 2)), 8))`}
+  tests={`import numpy as np
+
+result = minibatch(X, y)
+assert isinstance(result, np.ndarray) and result.shape == (3,), (
+    f"Expected a weight vector of shape (3,), got {getattr(result, 'shape', type(result))}."
+)
+assert np.allclose(result, true_w, atol=0.05), (
+    f"Twenty epochs should converge close to {true_w}, got {result.round(4)}."
+)
+
+# Seeded, it must be reproducible.
+assert np.allclose(minibatch(X, y, seed=1), minibatch(X, y, seed=1)), (
+    "The same seed must give the same answer — build the generator from the seed argument."
+)
+assert not np.allclose(minibatch(X, y, seed=1), minibatch(X, y, seed=2)), (
+    "Different seeds should shuffle differently, so the results should differ slightly."
+)
+
+# One epoch should be measurably worse than twenty.
+one = minibatch(X, y, epochs=1)
+assert np.linalg.norm(one - true_w) > np.linalg.norm(result - true_w), (
+    "One epoch should land further from the solution than twenty."
+)
+
+# Every row must be used: a batch size equal to the whole dataset is full-batch descent.
+full = minibatch(X, y, batch_size=len(X), epochs=1, learning_rate=0.1)
+expected = np.zeros(3) - 0.1 * (X.T @ (2 * (X @ np.zeros(3) - y) / len(X)))
+assert np.allclose(full, expected), (
+    "With batch_size = len(X) and one epoch you should get exactly one full-batch step."
+)`}
+/>
+
+<Quiz
+  question="Your training loss drops for twenty steps and then jumps to nan. What is the most likely cause?"
+  choices={[
+    { text: "The learning rate is too large, so a step overshot and the weights blew up", correct: true, why: "Divergence compounds: one oversized step makes the next gradient bigger, and a few rounds of that overflow to infinity, then nan." },
+    { text: "The learning rate is too small", why: "Too small makes progress slow, never explosive." },
+    { text: "The dataset has missing values", why: "Possible in general, but a clean drop followed by a blow-up is the classic divergence signature." },
+    { text: "Too few training steps", why: "The steps taken were the problem, not their number." },
+  ]}
+/>
+
+<Quiz
+  question="Why is mini-batch descent preferred over full-batch on a large dataset?"
+  choices={[
+    { text: "It makes many cheap updates per pass instead of one expensive one, and the noise helps escape narrow valleys", correct: true, why: "Progress per unit of computation is far better, and the gradient noise is a mild, useful regulariser." },
+    { text: "It computes a more accurate gradient", why: "A batch gradient is a noisier estimate than the full one — that is the trade being made." },
+    { text: "It removes the need for a learning rate", why: "The learning rate matters just as much, and interacts with the batch size." },
+    { text: "It guarantees convergence to the global minimum", why: "No first-order method guarantees that on a non-convex problem." },
+  ]}
+/>
+
+## Recap
+
+- Gradient descent is three lines: predict, measure the error, step against the gradient.
+- Diagnose the learning rate from a log-scale loss curve — flat means too small, jagged or rising
+  means too large.
+- Standardise features before descending, or one learning rate cannot suit them all.
+- Mini-batch descent reshuffles each epoch and steps per batch; small batches mean many noisy
+  steps, large batches few accurate ones.
+- Momentum averages recent gradients, cancelling the zig-zag across a narrow valley.
+- The cross-entropy gradient for logistic regression is `X.T @ (prediction - truth) / n`, and
+  the logits must be clipped or the loss becomes `nan`.

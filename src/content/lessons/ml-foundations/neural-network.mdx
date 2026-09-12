@@ -1,0 +1,530 @@
+---
+title: A neural network in pure NumPy
+description: Build a two-layer classifier — forward pass, cross-entropy loss, backpropagation and a training loop — in about forty lines, with no framework involved.
+module: ml-foundations
+order: 8
+level: advanced
+minutes: 24
+objectives:
+  - Write the forward pass of a two-layer network
+  - Compute a stable softmax and cross-entropy loss
+  - Derive and implement the backward pass
+  - Initialise weights so signal survives the first layer
+  - Train the network and watch the decision boundary form
+---
+
+A neural network is a chain of matrix multiplications with a non-linearity between them. There is
+no magic in it, and building one by hand is the fastest way to stop finding autograd mysterious.
+
+## The problem
+
+Two interleaving half-moons: not separable by any straight line, so a linear model cannot do it.
+
+<Run id="ml-nn-1" code={`import matplotlib.pyplot as plt
+from sklearn.datasets import make_moons
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_moons(n_samples=600, noise=0.2, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25,
+                                                     random_state=0, stratify=y)
+
+print("linear model accuracy:",
+      round(LogisticRegression().fit(X_train, y_train).score(X_test, y_test), 4))
+
+fig, ax = plt.subplots(figsize=(5.5, 3.5))
+ax.scatter(X[y == 0, 0], X[y == 0, 1], s=12, alpha=0.7, label="class 0")
+ax.scatter(X[y == 1, 0], X[y == 1, 1], s=12, alpha=0.7, label="class 1")
+ax.set_title("Two moons")
+ax.legend()`} />
+
+## The architecture
+
+```text
+X  (n, 2)
+  -> Z1 = X @ W1 + b1     (n, hidden)
+  -> A1 = relu(Z1)        (n, hidden)
+  -> Z2 = A1 @ W2 + b2    (n, classes)     the logits
+  -> P  = softmax(Z2)     (n, classes)     the probabilities
+```
+
+Without the ReLU, two stacked linear layers collapse into one linear layer — the non-linearity is
+what buys the extra capacity.
+
+<Run id="ml-nn-2" code={`import numpy as np
+
+def relu(z):
+    return np.maximum(z, 0.0)
+
+def softmax(z):
+    shifted = z - z.max(axis=1, keepdims=True)     # stable, as in module 3
+    exponentiated = np.exp(shifted)
+    return exponentiated / exponentiated.sum(axis=1, keepdims=True)
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(4, 2))
+W1, b1 = rng.normal(size=(2, 5)), np.zeros(5)
+W2, b2 = rng.normal(size=(5, 2)), np.zeros(2)
+
+Z1 = X @ W1 + b1
+A1 = relu(Z1)
+Z2 = A1 @ W2 + b2
+P = softmax(Z2)
+
+for name, array in [("X", X), ("Z1", Z1), ("A1", A1), ("Z2", Z2), ("P", P)]:
+    print(f"{name:3} {str(array.shape):10}")
+
+print()
+print("probabilities per row sum to:", P.sum(axis=1).round(6))`} />
+
+## Initialisation
+
+Start every weight at zero and every hidden unit computes the same thing for ever — there is
+nothing to break the symmetry. Start them too large and the activations explode.
+
+<Run id="ml-nn-3" code={`import numpy as np
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(1000, 64))
+
+def forward_through(layers, scale_fn, depth=6, width=64):
+    activations = X
+    sizes = []
+    local = np.random.default_rng(0)
+    for _ in range(depth):
+        W = local.normal(0, scale_fn(activations.shape[1]), (activations.shape[1], width))
+        activations = np.maximum(activations @ W, 0.0)
+        sizes.append(activations.std())
+    return sizes
+
+print("std of activations, layer by layer")
+print("too small (0.01):", np.round(forward_through(6, lambda n: 0.01), 6))
+print("too large (1.0): ", np.round(forward_through(6, lambda n: 1.0), 3))
+print("He (sqrt(2/n)):  ", np.round(forward_through(6, lambda n: np.sqrt(2 / n)), 3))`} />
+
+He initialisation — a normal distribution scaled by the square root of 2 over the number of
+inputs — keeps the signal roughly the same size at every depth. That factor of 2 is there because
+ReLU throws away half of it.
+
+## The loss
+
+Cross-entropy measures how surprised the model is by the true label:
+
+<Run id="ml-nn-4" code={`import numpy as np
+
+def cross_entropy(P, y):
+    n = len(y)
+    return -np.mean(np.log(np.clip(P[np.arange(n), y], 1e-12, 1.0)))
+
+y = np.array([0, 1, 1])
+print("confident and right:", round(cross_entropy(np.array([[0.99, 0.01], [0.02, 0.98], [0.05, 0.95]]), y), 4))
+print("unsure:             ", round(cross_entropy(np.array([[0.5, 0.5], [0.5, 0.5], [0.5, 0.5]]), y), 4))
+print("confident and wrong:", round(cross_entropy(np.array([[0.01, 0.99], [0.98, 0.02], [0.95, 0.05]]), y), 4))`} />
+
+`P[np.arange(n), y]` picks each row's probability for that row's true class — integer-array
+indexing from module 3, doing real work.
+
+## The backward pass
+
+Each line is the chain rule applied to one operation:
+
+```text
+dZ2 = (P - onehot(y)) / n        the softmax + cross-entropy gradient, together
+dW2 = A1.T @ dZ2                 (hidden, classes)
+db2 = dZ2.sum(axis=0)            (classes,)
+dA1 = dZ2 @ W2.T                 (n, hidden)
+dZ1 = dA1 * (Z1 > 0)             ReLU passes the gradient only where it was active
+dW1 = X.T @ dZ1                  (features, hidden)
+db1 = dZ1.sum(axis=0)            (hidden,)
+```
+
+The first line is the pleasant surprise: differentiating softmax and cross-entropy separately is
+messy, and together they collapse to *prediction minus truth*, exactly as in logistic regression.
+
+<Run id="ml-nn-5" code={`import numpy as np
+
+def relu(z):
+    return np.maximum(z, 0.0)
+
+def softmax(z):
+    shifted = z - z.max(axis=1, keepdims=True)
+    return np.exp(shifted) / np.exp(shifted).sum(axis=1, keepdims=True)
+
+def forward(X, params):
+    Z1 = X @ params["W1"] + params["b1"]
+    A1 = relu(Z1)
+    Z2 = A1 @ params["W2"] + params["b2"]
+    return {"Z1": Z1, "A1": A1, "Z2": Z2, "P": softmax(Z2)}
+
+def backward(X, y, params, cache):
+    n = len(y)
+    onehot = np.zeros_like(cache["P"])
+    onehot[np.arange(n), y] = 1.0
+
+    dZ2 = (cache["P"] - onehot) / n
+    dW2 = cache["A1"].T @ dZ2
+    db2 = dZ2.sum(axis=0)
+
+    dA1 = dZ2 @ params["W2"].T
+    dZ1 = dA1 * (cache["Z1"] > 0)
+    dW1 = X.T @ dZ1
+    db1 = dZ1.sum(axis=0)
+    return {"W1": dW1, "b1": db1, "W2": dW2, "b2": db2}
+
+# Check it against a numerical gradient, exactly as in module 3.
+rng = np.random.default_rng(0)
+X = rng.normal(size=(20, 3))
+y = rng.integers(0, 2, 20)
+params = {
+    "W1": rng.normal(0, 0.5, (3, 6)), "b1": np.zeros(6),
+    "W2": rng.normal(0, 0.5, (6, 2)), "b2": np.zeros(2),
+}
+
+def loss_of(params):
+    P = forward(X, params)["P"]
+    return -np.mean(np.log(np.clip(P[np.arange(len(y)), y], 1e-12, 1.0)))
+
+analytic = backward(X, y, params, forward(X, params))
+
+for name in ["W1", "b1", "W2", "b2"]:
+    # Two-sided differences, element by element.
+    numeric = np.zeros_like(params[name])
+    original = params[name].copy()
+    it = np.nditer(original, flags=["multi_index"])
+    while not it.finished:
+        index = it.multi_index
+        params[name][index] = original[index] + 1e-6
+        up = loss_of(params)
+        params[name][index] = original[index] - 1e-6
+        down = loss_of(params)
+        params[name][index] = original[index]
+        numeric[index] = (up - down) / 2e-6
+        it.iternext()
+    print(f"{name}: max difference {np.abs(numeric - analytic[name]).max():.3e}")`} />
+
+Differences around `1e-10` mean the hand-written gradients are right. This check is worth running
+on any network you write yourself.
+
+## Training
+
+<Run id="ml-nn-6" code={`import numpy as np
+from sklearn.datasets import make_moons
+from sklearn.model_selection import train_test_split
+
+def relu(z):
+    return np.maximum(z, 0.0)
+
+def softmax(z):
+    shifted = z - z.max(axis=1, keepdims=True)
+    return np.exp(shifted) / np.exp(shifted).sum(axis=1, keepdims=True)
+
+def initialise(features, hidden, classes, seed=0):
+    rng = np.random.default_rng(seed)
+    return {
+        "W1": rng.normal(0, np.sqrt(2 / features), (features, hidden)),
+        "b1": np.zeros(hidden),
+        "W2": rng.normal(0, np.sqrt(2 / hidden), (hidden, classes)),
+        "b2": np.zeros(classes),
+    }
+
+def forward(X, p):
+    Z1 = X @ p["W1"] + p["b1"]
+    A1 = relu(Z1)
+    Z2 = A1 @ p["W2"] + p["b2"]
+    return Z1, A1, softmax(Z2)
+
+def train(X, y, hidden=16, epochs=400, learning_rate=0.5, seed=0):
+    p = initialise(X.shape[1], hidden, int(y.max()) + 1, seed)
+    n = len(y)
+    onehot = np.zeros((n, int(y.max()) + 1))
+    onehot[np.arange(n), y] = 1.0
+    history = []
+
+    for epoch in range(epochs):
+        Z1, A1, P = forward(X, p)
+        history.append(-np.mean(np.log(np.clip(P[np.arange(n), y], 1e-12, 1.0))))
+
+        dZ2 = (P - onehot) / n
+        dW2, db2 = A1.T @ dZ2, dZ2.sum(axis=0)
+        dZ1 = (dZ2 @ p["W2"].T) * (Z1 > 0)
+        dW1, db1 = X.T @ dZ1, dZ1.sum(axis=0)
+
+        for name, grad in [("W1", dW1), ("b1", db1), ("W2", dW2), ("b2", db2)]:
+            p[name] -= learning_rate * grad
+
+    return p, history
+
+X, y = make_moons(n_samples=600, noise=0.2, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25,
+                                                     random_state=0, stratify=y)
+
+params, history = train(X_train, y_train)
+accuracy = (forward(X_test, params)[2].argmax(axis=1) == y_test).mean()
+
+print(f"loss at the start: {history[0]:.4f}")
+print(f"loss at the end:   {history[-1]:.4f}")
+print(f"test accuracy:     {accuracy:.4f}")`} />
+
+Around 0.97 — from a linear model's 0.87, using forty lines and no framework.
+
+<Run id="ml-nn-7" code={`import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.datasets import make_moons
+from sklearn.model_selection import train_test_split
+
+def relu(z): return np.maximum(z, 0.0)
+def softmax(z):
+    s = z - z.max(axis=1, keepdims=True)
+    return np.exp(s) / np.exp(s).sum(axis=1, keepdims=True)
+
+def forward(X, p):
+    Z1 = X @ p["W1"] + p["b1"]
+    A1 = relu(Z1)
+    return Z1, A1, softmax(A1 @ p["W2"] + p["b2"])
+
+def train(X, y, hidden=16, epochs=400, learning_rate=0.5, seed=0):
+    rng = np.random.default_rng(seed)
+    classes = int(y.max()) + 1
+    p = {
+        "W1": rng.normal(0, np.sqrt(2 / X.shape[1]), (X.shape[1], hidden)), "b1": np.zeros(hidden),
+        "W2": rng.normal(0, np.sqrt(2 / hidden), (hidden, classes)), "b2": np.zeros(classes),
+    }
+    n = len(y)
+    onehot = np.zeros((n, classes))
+    onehot[np.arange(n), y] = 1.0
+    losses = []
+    for _ in range(epochs):
+        Z1, A1, P = forward(X, p)
+        losses.append(-np.mean(np.log(np.clip(P[np.arange(n), y], 1e-12, 1.0))))
+        dZ2 = (P - onehot) / n
+        dZ1 = (dZ2 @ p["W2"].T) * (Z1 > 0)
+        p["W2"] -= learning_rate * (A1.T @ dZ2)
+        p["b2"] -= learning_rate * dZ2.sum(axis=0)
+        p["W1"] -= learning_rate * (X.T @ dZ1)
+        p["b1"] -= learning_rate * dZ1.sum(axis=0)
+    return p, losses
+
+X, y = make_moons(n_samples=600, noise=0.2, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=0, stratify=y)
+params, losses = train(X_train, y_train)
+
+fig, axes = plt.subplots(1, 2, figsize=(9, 3.4))
+
+axes[0].plot(losses, linewidth=2)
+axes[0].set_title("Training loss")
+axes[0].set_xlabel("epoch")
+axes[0].grid(True, alpha=0.3)
+
+# The decision boundary, evaluated over a grid.
+padding = 0.5
+xx, yy = np.meshgrid(
+    np.linspace(X[:, 0].min() - padding, X[:, 0].max() + padding, 200),
+    np.linspace(X[:, 1].min() - padding, X[:, 1].max() + padding, 200),
+)
+grid = np.column_stack([xx.ravel(), yy.ravel()])
+zz = forward(grid, params)[2][:, 1].reshape(xx.shape)
+
+axes[1].contourf(xx, yy, zz, levels=20, alpha=0.5)
+axes[1].scatter(X_test[y_test == 0, 0], X_test[y_test == 0, 1], s=12)
+axes[1].scatter(X_test[y_test == 1, 0], X_test[y_test == 1, 1], s=12)
+axes[1].set_title("Decision boundary")`} />
+
+<Callout type="ai" title="Why this matters for AI">
+Scale this up and it is a transformer. The pieces are identical — matrix multiplications,
+non-linearities between them, a softmax at the end, cross-entropy against the true next token,
+and gradients flowing back through the chain rule. What a framework adds is bookkeeping: it
+records the forward operations and replays them backwards so you never write `dZ1` by hand. It
+does not add any idea that is not in these forty lines.
+</Callout>
+
+<Callout type="warning">
+ReLU's gradient is exactly zero for any unit whose input was negative. A unit that gets pushed
+firmly negative therefore receives no gradient ever again — a "dead" unit. Too high a learning
+rate can kill a large fraction of a layer in a few steps, which shows up as a loss that stops
+improving well short of where it should.
+</Callout>
+
+## Try it yourself
+
+<Exercise
+  id="ml-nn-ex1"
+  title="Exercise 1"
+  brief="Implement <code>relu(z)</code> and <code>relu_backward(grad, z)</code>, which passes the incoming gradient through only where <code>z</code> was positive."
+  code={`import numpy as np
+
+def relu(z):
+    # Every negative value becomes 0; positives pass through.
+    ...
+
+
+def relu_backward(grad, z):
+    # The gradient flows only where z was positive.
+    ...
+
+
+z = np.array([[-2.0, -0.5, 0.0, 0.5, 3.0]])
+grad = np.array([[1.0, 1.0, 1.0, 1.0, 1.0]])
+print(relu(z))
+print(relu_backward(grad, z))`}
+  hint="np.maximum(z, 0.0) for the forward pass; grad * (z > 0) for the backward one."
+  solution={`import numpy as np
+
+def relu(z):
+    return np.maximum(z, 0.0)
+
+
+def relu_backward(grad, z):
+    return grad * (z > 0)
+
+
+z = np.array([[-2.0, -0.5, 0.0, 0.5, 3.0]])
+grad = np.array([[1.0, 1.0, 1.0, 1.0, 1.0]])
+print(relu(z))
+print(relu_backward(grad, z))`}
+  tests={`import numpy as np
+
+z = np.array([[-2.0, -0.5, 0.0, 0.5, 3.0]])
+assert np.allclose(relu(z), [[0.0, 0.0, 0.0, 0.5, 3.0]]), (
+    f"relu should clamp negatives to zero, got {relu(z)}."
+)
+assert relu(z).shape == z.shape, "relu is elementwise, so the shape is unchanged."
+
+grad = np.array([[1.0, 2.0, 3.0, 4.0, 5.0]])
+back = relu_backward(grad, z)
+assert np.allclose(back, [[0.0, 0.0, 0.0, 4.0, 5.0]]), (
+    f"The gradient should pass only where z was strictly positive, got {back}."
+)
+assert np.asarray(back).shape == grad.shape, "The backward pass preserves the shape."
+
+# It must depend on z, not on the sign of the incoming gradient.
+negative_grad = np.array([[-1.0, -1.0, -1.0, -1.0, -1.0]])
+assert np.allclose(relu_backward(negative_grad, z), [[0.0, 0.0, 0.0, -1.0, -1.0]]), (
+    "A negative incoming gradient should still pass through where z was positive."
+)
+
+# And it must match a numerical derivative.
+point = np.array([[-1.0, 2.0]])
+eps = 1e-6
+numeric = (relu(point + eps) - relu(point - eps)) / (2 * eps)
+assert np.allclose(relu_backward(np.ones_like(point), point), numeric, atol=1e-4), (
+    "The backward pass disagrees with a numerical derivative of relu."
+)`}
+/>
+
+<Exercise
+  id="ml-nn-ex2"
+  title="Exercise 2"
+  brief="Implement <code>forward(X, params)</code>: linear, ReLU, linear, softmax. Return the tuple <code>(Z1, A1, P)</code>."
+  code={`import numpy as np
+
+def softmax(z):
+    shifted = z - z.max(axis=1, keepdims=True)
+    return np.exp(shifted) / np.exp(shifted).sum(axis=1, keepdims=True)
+
+
+def forward(X, params):
+    # Z1 = X @ W1 + b1, A1 = relu(Z1), Z2 = A1 @ W2 + b2, P = softmax(Z2).
+    # Return (Z1, A1, P).
+    ...
+
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(5, 3))
+params = {
+    "W1": rng.normal(size=(3, 4)), "b1": np.zeros(4),
+    "W2": rng.normal(size=(4, 2)), "b2": np.zeros(2),
+}
+
+Z1, A1, P = forward(X, params)
+print(Z1.shape, A1.shape, P.shape)
+print(P.sum(axis=1).round(6))`}
+  hint="Four lines, in order. Use np.maximum(Z1, 0.0) for the ReLU and the softmax already defined above."
+  solution={`import numpy as np
+
+def softmax(z):
+    shifted = z - z.max(axis=1, keepdims=True)
+    return np.exp(shifted) / np.exp(shifted).sum(axis=1, keepdims=True)
+
+
+def forward(X, params):
+    Z1 = X @ params["W1"] + params["b1"]
+    A1 = np.maximum(Z1, 0.0)
+    Z2 = A1 @ params["W2"] + params["b2"]
+    return Z1, A1, softmax(Z2)
+
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(5, 3))
+params = {
+    "W1": rng.normal(size=(3, 4)), "b1": np.zeros(4),
+    "W2": rng.normal(size=(4, 2)), "b2": np.zeros(2),
+}
+
+Z1, A1, P = forward(X, params)
+print(Z1.shape, A1.shape, P.shape)
+print(P.sum(axis=1).round(6))`}
+  tests={`import numpy as np
+
+assert Z1.shape == (5, 4), f"Z1 should be (5, 4), got {Z1.shape}."
+assert A1.shape == (5, 4), f"A1 should be (5, 4), got {A1.shape}."
+assert P.shape == (5, 2), f"P should be (5, 2) — one probability per class, got {P.shape}."
+
+expected_Z1 = X @ params["W1"] + params["b1"]
+assert np.allclose(Z1, expected_Z1), "Z1 should be X @ W1 + b1."
+assert np.allclose(A1, np.maximum(expected_Z1, 0.0)), "A1 should be the ReLU of Z1."
+assert (A1 >= 0).all(), "A ReLU output can never be negative."
+
+expected_P = np.exp(
+    (np.maximum(expected_Z1, 0.0) @ params["W2"] + params["b2"])
+    - (np.maximum(expected_Z1, 0.0) @ params["W2"] + params["b2"]).max(axis=1, keepdims=True)
+)
+expected_P = expected_P / expected_P.sum(axis=1, keepdims=True)
+assert np.allclose(P, expected_P), "P should be the softmax of Z2."
+assert np.allclose(P.sum(axis=1), 1.0), (
+    f"Each row of probabilities must sum to 1, got {P.sum(axis=1)}."
+)
+
+# It must generalise to a different batch size and width.
+other = {
+    "W1": np.ones((3, 2)), "b1": np.array([1.0, -100.0]),
+    "W2": np.ones((2, 2)), "b2": np.zeros(2),
+}
+z1, a1, p = forward(np.zeros((2, 3)), other)
+assert np.allclose(a1, [[1.0, 0.0], [1.0, 0.0]]), (
+    "With zero input the hidden layer is just the bias, ReLU'd — the second unit should be dead."
+)
+assert np.allclose(p, 0.5), "Equal logits should give a uniform distribution."`}
+/>
+
+<Quiz
+  question="Why does the network need the ReLU between the two linear layers?"
+  choices={[
+    { text: "Without it the two matrix multiplications collapse into a single linear transformation", correct: true, why: "(X @ W1) @ W2 is X @ (W1 @ W2) — one linear layer, whatever the depth. The non-linearity is what adds capacity." },
+    { text: "It keeps the probabilities between 0 and 1", why: "That is the softmax's job at the output, not the ReLU's in the middle." },
+    { text: "It makes the gradients larger", why: "It zeroes gradients for inactive units, which is if anything the opposite." },
+    { text: "It normalises the activations", why: "That is layer or batch normalisation — a different mechanism entirely." },
+  ]}
+/>
+
+<Quiz
+  question="Why does the backward pass start with (P - onehot(y)) / n rather than something more complicated?"
+  choices={[
+    { text: "Softmax and cross-entropy differentiate together into prediction minus truth", correct: true, why: "Their separate derivatives are messy, and almost everything cancels when composed — the same tidy result as logistic regression." },
+    { text: "It is an approximation that happens to work well enough", why: "It is exact, which a numerical gradient check confirms." },
+    { text: "Because the loss is mean squared error", why: "It is cross-entropy; MSE would give a different, less convenient gradient." },
+    { text: "Because the network has only two layers", why: "The identity holds at the output of any network ending in softmax with cross-entropy." },
+  ]}
+/>
+
+## Recap
+
+- A network is linear, non-linear, linear, softmax — and without the non-linearity the layers
+  collapse into one.
+- Initialise with He scaling, `sqrt(2 / fan_in)`, so activations neither vanish nor explode with
+  depth.
+- Cross-entropy is `-log` of the probability assigned to the true class; index it with
+  `P[np.arange(n), y]`.
+- The softmax-plus-cross-entropy gradient is `(P - onehot) / n`; from there the backward pass is
+  one transposed matrix multiplication per layer.
+- ReLU's backward pass is `grad * (Z > 0)`, which is also why units can die.
+- Check every hand-written gradient against a numerical one before trusting it.
